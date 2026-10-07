@@ -75,6 +75,13 @@ pub(crate) enum RuntimeCommand {
     Clear {
         slot: usize,
     },
+    /// Begin forwarding one listener slot's frames to the local monitor output.
+    SetMonitor {
+        slot: usize,
+        monitor: Arc<dyn crate::monitor::MonitorPort>,
+    },
+    /// Stop forwarding to the local monitor output.
+    ClearMonitor,
 }
 
 /// A cloneable handle for sending mix changes into the DSP worker.
@@ -105,6 +112,19 @@ impl RuntimeHandle {
     /// Remove a listener slot.
     pub fn clear_listener(&self, slot: usize) {
         let _ = self.commands.send(RuntimeCommand::Clear { slot });
+    }
+
+    /// Forward one listener slot's frames to the local monitor output.
+    ///
+    /// This is the operator's own listening path. It taps already-produced stereo, so it can never
+    /// create a return path into the mixer; the monitor drops frames when it falls behind.
+    pub fn set_monitor(&self, slot: usize, monitor: Arc<dyn crate::monitor::MonitorPort>) {
+        let _ = self.commands.send(RuntimeCommand::SetMonitor { slot, monitor });
+    }
+
+    /// Stop forwarding to the local monitor output.
+    pub fn clear_monitor(&self) {
+        let _ = self.commands.send(RuntimeCommand::ClearMonitor);
     }
 }
 
@@ -182,20 +202,31 @@ impl HostRuntime {
             .spawn(move || {
                 let mut pipeline = Pipeline::new(sample_rate_hz, &channel_map);
                 let mut snapshots: [Option<MixSnapshot>; MAX_SESSIONS] = [None, None, None, None];
+                let mut monitor: Option<(usize, Arc<dyn crate::monitor::MonitorPort>)> = None;
                 let mut ready_rx = ready_rx;
                 let mut free_tx = free_tx;
 
                 while !worker_stopped.load(Ordering::Acquire) {
                     // Apply any pending control changes before touching audio.
                     while let Ok(command) = commands_rx.try_recv() {
-                        apply_command(&mut pipeline, &mut snapshots, command);
+                        apply_command(&mut pipeline, &mut snapshots, &mut monitor, command);
                     }
 
                     let mut processed = false;
                     while let Ok(block) = ready_rx.pop() {
                         processed = true;
                         let mut outputs = std::array::from_fn(ListenerOutput::empty);
-                        if pipeline.process(&block, &snapshots, &mut outputs).is_ok() {
+                        // The local monitor is tapped inside `process`, at the point the mix is
+                        // still plain stereo PCM — that is what the operator actually hears. It
+                        // cannot block the worker (the monitor drops frames when it falls behind)
+                        // and it never creates a return path into the mixer.
+                        let monitor_ref = monitor
+                            .as_ref()
+                            .map(|(slot, port)| (*slot, port.as_ref() as &dyn crate::monitor::MonitorPort));
+                        if pipeline
+                            .process(&block, &snapshots, &mut outputs, monitor_ref)
+                            .is_ok()
+                        {
                             sink.on_block(&outputs);
                         }
                         // Return the slot to the callback. Dropping on a full queue would leak the
@@ -277,6 +308,7 @@ impl Drop for HostRuntime {
 fn apply_command(
     pipeline: &mut Pipeline,
     snapshots: &mut [Option<MixSnapshot>; MAX_SESSIONS],
+    monitor: &mut Option<(usize, Arc<dyn crate::monitor::MonitorPort>)>,
     command: RuntimeCommand,
 ) {
     match command {
@@ -295,6 +327,16 @@ fn apply_command(
         RuntimeCommand::Clear { slot } => {
             pipeline.unregister(slot);
             snapshots[slot] = None;
+            // If the monitored slot is gone, stop monitoring rather than tapping a dead slot.
+            if monitor.as_ref().is_some_and(|(s, _)| *s == slot) {
+                *monitor = None;
+            }
+        }
+        RuntimeCommand::SetMonitor { slot, monitor: port } => {
+            *monitor = Some((slot, port));
+        }
+        RuntimeCommand::ClearMonitor => {
+            *monitor = None;
         }
     }
 }

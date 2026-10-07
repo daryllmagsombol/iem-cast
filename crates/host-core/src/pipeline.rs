@@ -119,11 +119,16 @@ impl Pipeline {
     /// `snapshots` must be indexed by slot; a slot with no encoder, no session, or no snapshot
     /// produces nothing. Each output frame carries the listener's exact [`SessionContext`] so the
     /// transport safety gate can reject anything produced before a disarm.
+    ///
+    /// When `monitor` is set, that slot's produce-time **stereo PCM** (before encoding) is handed to
+    /// the tap. Monitoring the pre-encode stereo is what the operator actually hears; it is also the
+    /// last point where the mix is still a plain float buffer.
     pub fn process(
         &mut self,
         block: &CaptureBlock,
         snapshots: &[Option<MixSnapshot>; MAX_SESSIONS],
         out: &mut [ListenerOutput; MAX_SESSIONS],
+        monitor: Option<(usize, &dyn crate::monitor::MonitorPort)>,
     ) -> Result<(), AudioFault> {
         for slot in 0..MAX_SESSIONS {
             let mut listener = ListenerOutput {
@@ -145,6 +150,13 @@ impl Pipeline {
             let mut stereo: [StereoFrame; MAX_OUT_FRAMES_PER_BLOCK] =
                 [StereoFrame::zeroed(snapshot.context); MAX_OUT_FRAMES_PER_BLOCK];
             let produced = self.engine.process_block(slot, block, snapshot, &mut stereo)?;
+
+            // Tap the monitored slot's stereo before it is encoded.
+            if let Some((monitored, port)) = monitor {
+                if monitored == slot && produced > 0 {
+                    port.on_frames(&stereo[..produced]);
+                }
+            }
 
             for (index, frame) in stereo.iter().take(produced).enumerate() {
                 let mut encoded = EncodedFrame::zeroed();
@@ -240,7 +252,7 @@ mod tests {
         snapshots[0] = Some(snapshot(session, -6.0));
 
         let mut out = empty_outputs();
-        pipeline.process(&block(0.25, 256), &snapshots, &mut out).unwrap();
+        pipeline.process(&block(0.25, 256), &snapshots, &mut out, None).unwrap();
 
         assert_eq!(out[0].count, 2, "256 input frames yield two 120-frame packets");
         assert_eq!(out[0].session, session);
@@ -266,7 +278,7 @@ mod tests {
         snapshots[1] = Some(snapshot(b, -12.0));
 
         let mut out = empty_outputs();
-        pipeline.process(&block(0.5, 120), &snapshots, &mut out).unwrap();
+        pipeline.process(&block(0.5, 120), &snapshots, &mut out, None).unwrap();
 
         assert_eq!(out[0].count, 1);
         assert_eq!(out[1].count, 1);
@@ -284,7 +296,7 @@ mod tests {
         let mut pipeline = Pipeline::new(48_000, &channel_map());
         let snapshots = empty_snapshots();
         let mut out = empty_outputs();
-        pipeline.process(&block(0.5, 120), &snapshots, &mut out).unwrap();
+        pipeline.process(&block(0.5, 120), &snapshots, &mut out, None).unwrap();
         assert!(out.iter().all(|o| o.count == 0));
     }
 
@@ -298,7 +310,7 @@ mod tests {
         let mut snapshots = empty_snapshots();
         snapshots[0] = Some(snapshot(session, -6.0));
         let mut out = empty_outputs();
-        pipeline.process(&block(0.5, 120), &snapshots, &mut out).unwrap();
+        pipeline.process(&block(0.5, 120), &snapshots, &mut out, None).unwrap();
         assert_eq!(out[0].count, 0);
         assert!(pipeline.session_at(0).is_none());
     }
