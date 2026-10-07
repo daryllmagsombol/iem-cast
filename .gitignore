@@ -1,0 +1,29 @@
+# Rust
+/target
+**/target
+
+# Node
+node_modules
+.npm
+npm-debug.log*
+
+# Build output
+apps/web/dist
+apps/desktop/src-tauri/target
+
+# Tauri generated schemas are regenerated at build time
+apps/desktop/src-tauri/gen
+
+# Test artifacts
+test-results
+playwright-report
+*.png.tmp
+
+# Local tooling state
+.serena
+.DS_Store
+
+# Local TLS material must never be committed
+*.pem
+*.key
+local-certs/

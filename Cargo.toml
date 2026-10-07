@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+# host-core is the default member so bare `cargo test`/`cargo clippy` never build the Tauri
+# desktop crate (which requires built frontend assets) unless explicitly requested.
+members = ["crates/host-core", "apps/desktop/src-tauri"]
+default-members = ["crates/host-core"]

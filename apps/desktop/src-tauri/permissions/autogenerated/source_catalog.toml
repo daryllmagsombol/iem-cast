@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-catalog"
+description = "Enables the source_catalog command without any pre-configured scope."
+commands.allow = ["source_catalog"]
+
+[[permission]]
+identifier = "deny-source-catalog"
+description = "Denies the source_catalog command without any pre-configured scope."
+commands.deny = ["source_catalog"]

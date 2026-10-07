@@ -1,0 +1,13 @@
+[[permission]]
+identifier = "operator-control"
+description = "Allows the bundled operator window to drive host setup and the musician catalog."
+commands.allow = [
+  "list_devices",
+  "list_interfaces",
+  "start_host",
+  "stop_host",
+  "source_catalog",
+  "set_available_sources",
+  "set_source_label",
+  "issue_pairing_credential",
+]

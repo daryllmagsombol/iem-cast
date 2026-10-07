@@ -1,0 +1,9 @@
+/*
+ * Shared application stylesheet (INT-owned).
+ *
+ * Tailwind CSS is generated and bundled at build time via @tailwindcss/vite; no runtime CDN.
+ * tokens.css is imported AFTER tailwindcss so its @theme block feeds Tailwind utilities.
+ * The canonical token values are owned by the designer lane (docs/DESIGN-SYSTEM.md §2/§4).
+ */
+@import "tailwindcss";
+@import "./tokens.css";

@@ -1,0 +1,18 @@
+{
+  "appliedRevision": "120",
+  "audioEpoch": "55555555-5555-4555-8555-555555555555",
+  "startSample": "9600",
+  "settings": {
+    "catalogRevision": "34",
+    "mixRevision": "120",
+    "sources": [
+      {
+        "sourceId": "33333333-3333-4333-8333-333333333333",
+        "gainDb": -12,
+        "muted": false
+      }
+    ],
+    "masterDb": -6,
+    "masterMuted": false
+  }
+}

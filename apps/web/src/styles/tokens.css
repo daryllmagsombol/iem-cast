@@ -1,0 +1,181 @@
+/*
+ * IEM Cast canonical design tokens.
+ * Source of truth: docs/DESIGN-SYSTEM.md §2 (values), §4 (component contract), §6 (motion).
+ *
+ * Integration wiring (INT-owned app.css):
+ *   @import "tailwindcss";
+ *   @import "./tokens.css";
+ * tokens.css must be imported AFTER tailwindcss so the @theme block feeds utilities.
+ *
+ * The :root values are dark (default). :root[data-theme="light"] overrides the palette.
+ * `@theme inline` maps the runtime variables into Tailwind utilities, so theme changes
+ * take effect without rebuilding. Components must use these utilities, never raw hex.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Color — dark */
+  --iem-color-canvas: #11161c;
+  --iem-color-surface: #1b232d;
+  --iem-color-surface-raised: #26313d;
+  --iem-color-text: #f2f5f8;
+  --iem-color-text-secondary: #b5c0cc;
+  --iem-color-boundary: #8795a5;
+  --iem-color-accent: #8cbfff;
+  --iem-color-on-accent: #11161c;
+  --iem-color-success: #7cd6a3;
+  --iem-color-warning: #f1c66d;
+  --iem-color-danger: #ff9a9a;
+
+  /* Spacing 1..8 = 4,8,12,16,24,32,48,64 */
+  --iem-space-1: 4px;
+  --iem-space-2: 8px;
+  --iem-space-3: 12px;
+  --iem-space-4: 16px;
+  --iem-space-5: 24px;
+  --iem-space-6: 32px;
+  --iem-space-7: 48px;
+  --iem-space-8: 64px;
+
+  /* Targets */
+  --iem-size-target: 48px;
+  --iem-size-target-compact: 44px;
+  --iem-size-icon: 20px;
+
+  /* Safe areas */
+  --iem-safe-top: env(safe-area-inset-top, 0px);
+  --iem-safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* Motion (§6) */
+  --iem-motion-feedback: 100ms;
+  --iem-motion-dialog: 180ms;
+
+  /* Overlay scrim */
+  --iem-scrim: #00000099;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --iem-color-canvas: #f3f5f7;
+  --iem-color-surface: #ffffff;
+  --iem-color-surface-raised: #e8edf2;
+  --iem-color-text: #18232f;
+  --iem-color-text-secondary: #4b5b6b;
+  --iem-color-boundary: #667586;
+  --iem-color-accent: #194f90;
+  --iem-color-on-accent: #ffffff;
+  --iem-color-success: #17633d;
+  --iem-color-warning: #795100;
+  --iem-color-danger: #a12432;
+}
+
+@theme inline {
+  --color-canvas: var(--iem-color-canvas);
+  --color-surface: var(--iem-color-surface);
+  --color-surface-raised: var(--iem-color-surface-raised);
+  --color-text: var(--iem-color-text);
+  --color-text-secondary: var(--iem-color-text-secondary);
+  --color-boundary: var(--iem-color-boundary);
+  --color-accent: var(--iem-color-accent);
+  --color-on-accent: var(--iem-color-on-accent);
+  --color-success: var(--iem-color-success);
+  --color-warning: var(--iem-color-warning);
+  --color-danger: var(--iem-color-danger);
+  --color-scrim: var(--iem-scrim);
+
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* type-caption 14/20 w400, body 16/24 w400, label 16/24 w600,
+     section 20/28 w600, title 28/36 w600, readout 18/24 w600 */
+  --text-caption: 0.875rem;
+  --text-caption--line-height: 1.25rem;
+  --text-caption--font-weight: 400;
+  --text-body: 1rem;
+  --text-body--line-height: 1.5rem;
+  --text-body--font-weight: 400;
+  --text-label: 1rem;
+  --text-label--line-height: 1.5rem;
+  --text-label--font-weight: 600;
+  --text-section: 1.25rem;
+  --text-section--line-height: 1.75rem;
+  --text-section--font-weight: 600;
+  --text-title: 1.75rem;
+  --text-title--line-height: 2.25rem;
+  --text-title--font-weight: 600;
+  --text-readout: 1.125rem;
+  --text-readout--line-height: 1.5rem;
+  --text-readout--font-weight: 600;
+
+  --radius-control: 4px;
+  --radius-panel: 8px;
+  --radius-badge: 4px;
+
+  --shadow-elevation-overlay: 0 8px 24px #00000033;
+
+  /* DESIGN-SYSTEM space-1..8 = 4,8,12,16,24,32,48,64. Override Tailwind's default
+     numeric spacing scale so gap-1..8 / p-3 / etc. match the canonical values exactly. */
+  --spacing-1: 4px;
+  --spacing-2: 8px;
+  --spacing-3: 12px;
+  --spacing-4: 16px;
+  --spacing-5: 24px;
+  --spacing-6: 32px;
+  --spacing-7: 48px;
+  --spacing-8: 64px;
+}
+
+/* Target-size and safe-area utilities (not values Tailwind's numeric scale can express). */
+@utility min-h-target {
+  min-height: var(--iem-size-target);
+}
+@utility min-h-target-compact {
+  min-height: var(--iem-size-target-compact);
+}
+@utility min-w-target {
+  min-width: var(--iem-size-target);
+}
+@utility min-w-target-compact {
+  min-width: var(--iem-size-target-compact);
+}
+@utility pt-safe {
+  padding-top: var(--iem-safe-top);
+}
+@utility pb-safe {
+  padding-bottom: var(--iem-safe-bottom);
+}
+
+@layer base {
+  body {
+    background-color: var(--iem-color-canvas);
+    color: var(--iem-color-text);
+    font-family: var(--font-sans);
+  }
+
+  /* Focus: 2px accent outline, 2px offset gap (surface shows through). */
+  :focus-visible {
+    outline: 2px solid var(--iem-color-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Reduced motion removes nonessential transitions/animations. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Preserve platform visibility in forced-colors mode. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight;
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "catalogRevision": "34",
+  "sources": [
+    {
+      "sourceId": "33333333-3333-4333-8333-333333333333",
+      "physicalIndex": 6,
+      "label": "Lead vocal",
+      "role": "inputChannel",
+      "authorized": true,
+      "available": true,
+      "stereoPair": null
+    },
+    {
+      "sourceId": "44444444-4444-4444-8444-444444444444",
+      "physicalIndex": 22,
+      "label": "Master L/R",
+      "role": "masterLr",
+      "authorized": true,
+      "available": true,
+      "stereoPair": null
+    }
+  ]
+}

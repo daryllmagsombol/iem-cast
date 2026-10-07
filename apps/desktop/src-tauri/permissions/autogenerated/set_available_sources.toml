@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-available-sources"
+description = "Enables the set_available_sources command without any pre-configured scope."
+commands.allow = ["set_available_sources"]
+
+[[permission]]
+identifier = "deny-set-available-sources"
+description = "Denies the set_available_sources command without any pre-configured scope."
+commands.deny = ["set_available_sources"]

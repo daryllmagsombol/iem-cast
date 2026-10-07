@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-host"
+description = "Enables the start_host command without any pre-configured scope."
+commands.allow = ["start_host"]
+
+[[permission]]
+identifier = "deny-start-host"
+description = "Denies the start_host command without any pre-configured scope."
+commands.deny = ["start_host"]

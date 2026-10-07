@@ -1,0 +1,22 @@
+[package]
+name = "iem-cast-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "IEM Cast operator shell (Tauri) composing host-core"
+publish = false
+
+[lib]
+name = "iem_cast_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+rust-embed = { version = "8.12", features = ["debug-embed"] }
+uuid = { version = "1.27.0", features = ["v4"] }
+if-addrs = "0.14.0"
+host-core = { path = "../../../crates/host-core" }
