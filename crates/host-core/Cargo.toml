@@ -19,3 +19,6 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"] }
 if-addrs = "0.14.0"
 getrandom = "0.4.3"
+
+[dev-dependencies]
+rcgen = "0.14.10"

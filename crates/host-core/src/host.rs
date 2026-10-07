@@ -502,20 +502,25 @@ impl HostSession {
 
         let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
         let bind_handle = handle.clone();
-        let server = axum_server::from_tcp_rustls(listener, config).map_err(HostFault::Socket)?;
-        let serve = server.handle(bind_handle);
+
+        // Build the runtime first, then construct the server *inside* that runtime's context.
+        // `from_tcp_rustls` converts the std listener with `TcpListener::from_std`, which panics
+        // with "there is no reactor running" when called outside a Tokio runtime. Entering the
+        // runtime here fixes that while still letting construction errors propagate to the caller
+        // (instead of being swallowed on the server thread).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(HostFault::Socket)?;
+        let serve = {
+            let _guard = runtime.enter();
+            let server = axum_server::from_tcp_rustls(listener, config).map_err(HostFault::Socket)?;
+            server.handle(bind_handle)
+        };
 
         let server_thread = thread::Builder::new()
             .name("iem-control-server".to_string())
             .spawn(move || {
-                // A single-threaded runtime keeps the server independent of the caller's runtime.
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(_) => return,
-                };
                 let _ = runtime.block_on(serve.serve(router.into_make_service()));
             })
             .map_err(HostFault::Socket)?;
@@ -1057,6 +1062,73 @@ mod tests {
                 reason: InterruptReason::UserDisarm,
             } if session_epoch == session
         ));
+    }
+
+    /// Write a fresh self-signed localhost certificate/key pair and return their paths.
+    ///
+    /// Generated offline with `rcgen` so the server-start regression test never touches the
+    /// network, the operator's real `local-certs/`, or `mkcert`.
+    fn generated_tls_files() -> (PathBuf, PathBuf) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed certificate");
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("iem-cast-test-{}-cert.pem", std::process::id()));
+        let key_path = dir.join(format!("iem-cast-test-{}-key.pem", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).expect("write test certificate");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write test key");
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn starting_the_control_server_binds_without_an_ambient_tokio_runtime() {
+        // Regression: `axum_server::from_tcp_rustls` converts the std listener with
+        // `TcpListener::from_std`, which panics with "there is no reactor running" when the server
+        // is constructed outside a Tokio runtime. This test calls that path from a plain test
+        // thread (no ambient runtime) with a REAL rustls config, so the previous bug aborts the
+        // process here instead of only on a developer's machine.
+        let (cert_path, key_path) = generated_tls_files();
+        let tls = TlsIdentity::new(cert_path, key_path);
+
+        // Build the rustls config exactly as production does, in its own runtime.
+        let config = load_rustls_config(&tls).expect("loads the generated certificate");
+
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 0,
+        };
+        let session = HostSession::start(
+            &backend,
+            tls.clone(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let bundle = ServerConfig {
+            tls,
+            // Port 0 lets the OS pick a free port so the test never collides with a running host.
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            origin: OriginPolicy::new(vec!["https://localhost".to_string()]),
+            assets: Arc::new(OneAsset),
+            catalog: catalog_from_channel_map(&default_channel_map(1), CatalogRevision(0)),
+        };
+
+        let server = session
+            .start_server_with_config(config, bundle)
+            .expect("control server starts without an ambient runtime");
+        // A real bound port and a real single-use join URL are the observable proof it started.
+        assert!(server.local_addr().port() != 0);
+        assert!(server.join_url().starts_with("https://"));
+
+        // A freshly minted credential must be a real token, and must differ each time (single-use).
+        let first = server.issue_pairing_credential().expect("mints a credential");
+        let second = server.issue_pairing_credential().expect("mints another credential");
+        assert!(first.join_url.contains("t="));
+        assert_ne!(first.join_url, second.join_url, "tokens must be single-use");
+
+        drop(server);
     }
 
     /// A minimal asset provider with one real asset and no entry for unknown paths.
