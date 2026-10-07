@@ -19,44 +19,66 @@ does not prove that mixer audio reaches a phone. See [the qualification record](
 **Project site:** <https://daryllmagsombol.github.io/iem-cast/> — documentation plus a clearly
 labeled silent, simulated mix demo (no host connection, no audio).
 
-## Run the UI
+## Run the app
 
-From the repository root, with Node.js 24.15 or newer:
+Prerequisites: Node.js 24.15+, Rust (stable), CMake, and the Xcode Command Line Tools. `mkcert` is
+used to create the local certificate.
+
+### 1. Certificate (already created on this machine)
+
+A development certificate covering your LAN IP, `localhost`, and `127.0.0.1` is generated with:
+
+```bash
+LAN_IP="$(ipconfig getifaddr en0)"   # your Mac's LAN address
+mkdir -p local-certs
+mkcert -cert-file "$PWD/local-certs/cert.pem" -key-file "$PWD/local-certs/key.pem" \
+  "$LAN_IP" localhost 127.0.0.1 ::1
+chmod 600 local-certs/key.pem
+```
+
+`local-certs/` is gitignored. Regenerate it if your LAN IP changes. To let this Mac trust the CA,
+run `mkcert -install` once. Phones need **only** the public `rootCA.pem` from `mkcert -CAROOT`
+installed and fully trusted manually; never share or commit `rootCA-key.pem`.
+
+### 2. Launch the desktop host
 
 ```bash
 npm ci
-npm run dev:admin --workspace apps/web
-```
-
-Open the address Vite prints (normally <http://127.0.0.1:5173/>). The operator dashboard shows
-setup values and current build limitations. Choose **Open simulated preview** to try fictional
-device selection and mix controls. Preview mode is silent, uses in-memory fixtures, and never
-connects to hardware or a host.
-
-For the native operator window, with Rust and the macOS development prerequisites installed,
-run these in two terminals:
-
-```bash
-# Terminal 1: keep the admin development server running
-npm run dev:admin --workspace apps/web
-```
-
-```bash
-# Terminal 2: build the web assets and launch the Tauri window
 npm run dev:desktop
 ```
 
-The desktop context can enumerate devices through IPC. It does not make the disabled live-casting
-features operational. The standalone browser view has no native device access.
+In the operator window:
 
-To run the public documentation/demo site locally:
+1. **Capture device** → Rescan → select your input (the Soundcraft 22 MTK, or a loopback device
+   such as BlackHole for a stereo test) → **Select device**.
+2. **Network & certificates** → choose the LAN interface and enter the absolute certificate and
+   key paths from step 1.
+3. **Host controls** → **Start host**. The summary shows the join service running and a join URL.
+4. **Pairing & local monitor** → **Generate pairing code** and scan the QR with the phone.
+
+### 3. Join from the phone
+
+Open the join link on the phone (Safari on iPhone, Chrome on Android), with the CA trusted and
+wired earphones connected. Tap to start listening. The phone page must stay visible with the
+screen on.
+
+### Browser and demo modes
+
+With no native access (plain browser), the operator dashboard explains what is unavailable. The
+admin dev server alone is only a frontend preview:
+
+```bash
+npm run dev:admin --workspace apps/web      # http://127.0.0.1:5173/
+```
+
+The public documentation/demo site is separate and always silent:
 
 ```bash
 npm run build:site --workspace apps/web
-npm run preview:site --workspace apps/web
+npm run preview:site --workspace apps/web    # http://127.0.0.1:4173/iem-cast/
 ```
 
-Open <http://127.0.0.1:4173/iem-cast/>. This is a separate silent demo, not a hosted audio server.
+Live casting is functional but **unproven on real hardware**; see the qualification record.
 
 ## Documentation
 
