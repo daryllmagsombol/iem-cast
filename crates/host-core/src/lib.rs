@@ -13,5 +13,6 @@ pub mod diagnostics;
 pub mod encoder;
 pub mod fixtures;
 pub mod ids;
+pub mod pipeline;
 pub mod server;
 pub mod transport;
