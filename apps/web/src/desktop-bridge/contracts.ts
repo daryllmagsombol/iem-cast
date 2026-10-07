@@ -23,9 +23,17 @@ export interface PairingCredential {
   expiresInSeconds: number;
 }
 
+/** A local monitor output destination on the host machine. */
+export interface OutputDeviceInfo {
+  /** Stable output device id passed back to `startMonitor`. */
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
 /**
  * Operator-only host bridge. Implemented over Tauri `invoke`; command identifiers are snake_case
- * on the Rust side (`list_devices`, ..., `issue_pairing_credential`).
+ * on the Rust side (`list_devices`, ..., `stop_monitor`).
  */
 export interface HostBridge {
   listDevices(): Promise<DeviceInfo[]>;
@@ -36,4 +44,13 @@ export interface HostBridge {
   setAvailableSources(ids: string[]): Promise<CatalogSnapshot>;
   setSourceLabel(id: string, label: string): Promise<CatalogSnapshot>;
   issuePairingCredential(): Promise<PairingCredential>;
+  /** Enumerate the host machine's output devices for the local monitor. */
+  listOutputDevices(): Promise<OutputDeviceInfo[]>;
+  /**
+   * Tap one active listener slot's mix onto a local output. `deviceId` of `null` requests the
+   * system default output. Requires a running host.
+   */
+  startMonitor(slot: number, deviceId: string | null): Promise<void>;
+  /** Stop the local monitor. Idempotent. */
+  stopMonitor(): Promise<void>;
 }

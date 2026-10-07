@@ -27,3 +27,6 @@ playwright-report
 *.pem
 *.key
 local-certs/
+
+# Local agent/session state
+.opencode/

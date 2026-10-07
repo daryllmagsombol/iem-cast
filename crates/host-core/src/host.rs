@@ -27,8 +27,8 @@ use axum_server::tls_rustls::RustlsConfig;
 use crate::audio::engine::MAX_SESSIONS;
 use crate::capture::service::{CaptureBackend, SystemCaptureBackend};
 use crate::contract::{
-    AssetProvider, CaptureFault, CatalogSnapshot, ChannelMapEntry, Clock, ControlError, MixSnapshot,
-    SourceInfo, SourceRole, StartHostRequest, SystemClock,
+    AssetProvider, AudioEvent, CaptureFault, CatalogSnapshot, ChannelMapEntry, Clock, ControlError,
+    InterruptReason, MixSnapshot, SourceInfo, SourceRole, StartHostRequest, SystemClock,
 };
 use crate::control::actor::ControlActor;
 use crate::control::auth::{OriginPolicy, OsEntropy};
@@ -45,6 +45,8 @@ use crate::transport::{MediaHub, SelectedInterface};
 const PUMP_IDLE: Duration = Duration::from_millis(1);
 /// Maximum inbound datagram accepted by the pump (a bounded RTP packet fits well within).
 const MAX_DATAGRAM_BYTES: usize = 2048;
+/// Bound on the DSP→server audio-event queue; overflow drops rather than stalling audio.
+const AUDIO_EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Composition/lifecycle failure for [`HostSession`].
 #[derive(Debug, thiserror::Error)]
@@ -76,16 +78,35 @@ impl EncodedSink for MediaHubSink {
     }
 }
 
+/// Non-blocking bridge from the DSP path to the server's audio-event queue.
+///
+/// The audio/DSP path must never block on the server lock, so this is a bounded `try_send`: a full
+/// queue (a stalled consumer) drops the event rather than stalling audio.
+struct ChannelAudioEventSink {
+    tx: std::sync::mpsc::SyncSender<AudioEvent>,
+}
+
+impl crate::contract::AudioEventSink for ChannelAudioEventSink {
+    fn try_publish(&self, ev: AudioEvent) -> bool {
+        self.tx.try_send(ev).is_ok()
+    }
+}
+
 /// Forwards the control actor's DSP commands into the running runtime and media hub.
 ///
 /// A mix may arrive before the listener's media slot exists (e.g. a patch before `rtc.offer`).
 /// Those snapshots are held in `pending` and flushed when the session arms, so ordering between
 /// signaling and control cannot silently drop a mix.
+///
+/// After forwarding a command, the bridge publishes the corresponding [`AudioEvent`] to the
+/// server's outbound path (when a sink is installed), which is what lets `mix.applied` and
+/// `listen.armed` reach the phone. The publish is non-blocking.
 struct DspBridge {
     handle: crate::runtime::RuntimeHandle,
     hub: Arc<Mutex<MediaHub>>,
     audio_epoch: AudioEpoch,
     pending: Mutex<std::collections::HashMap<SessionEpoch, MixSnapshot>>,
+    events: Option<Arc<dyn crate::contract::AudioEventSink>>,
 }
 
 impl DspBridge {
@@ -94,13 +115,30 @@ impl DspBridge {
         let hub = self.hub.lock().ok()?;
         (0..MAX_SESSIONS).find(|&slot| hub.session_at(slot) == Some(session))
     }
+
+    /// Publish one event to the server's outbound path, if a sink is installed. Never blocks.
+    fn publish(&self, ev: AudioEvent) {
+        if let Some(sink) = &self.events {
+            let _ = sink.try_publish(ev);
+        }
+    }
 }
 
 impl crate::contract::DspControl for DspBridge {
     fn install_snapshot(&self, snapshot: MixSnapshot) -> Result<(), ControlError> {
         let session = snapshot.context.session_epoch;
         match self.slot_for(session) {
-            Some(slot) => self.handle.set_mix(slot, session, snapshot),
+            Some(slot) => {
+                let context = snapshot.context;
+                let applied_revision = snapshot.mix_revision;
+                self.handle.set_mix(slot, session, snapshot);
+                self.publish(AudioEvent::MixApplied {
+                    applied_revision,
+                    context,
+                    start_sample: 0,
+                    snapshot,
+                });
+            }
             None => {
                 // No media session yet; remember it so arming can apply it.
                 if let Ok(mut pending) = self.pending.lock() {
@@ -120,7 +158,15 @@ impl crate::contract::DspControl for DspBridge {
             .ok()
             .and_then(|mut map| map.remove(&session));
         if let (Some(slot), Some(snapshot)) = (self.slot_for(session), pending) {
+            let context = snapshot.context;
+            let applied_revision = snapshot.mix_revision;
             self.handle.set_mix(slot, session, snapshot);
+            self.publish(AudioEvent::MixApplied {
+                applied_revision,
+                context,
+                start_sample: 0,
+                snapshot,
+            });
         }
         // Open the per-session media gate with the exact context the actor assigned.
         if let Some(slot) = self.slot_for(session) {
@@ -128,6 +174,11 @@ impl crate::contract::DspControl for DspBridge {
                 hub.arm(slot, arm.context);
             }
         }
+        // The gate is open for the exact tuple the actor assigned; confirm it.
+        self.publish(AudioEvent::ArmApplied {
+            context: arm.context,
+            arm_nonce: arm.arm_nonce,
+        });
         Ok(())
     }
 
@@ -145,6 +196,10 @@ impl crate::contract::DspControl for DspBridge {
                 hub.disarm(slot, context);
             }
         }
+        self.publish(AudioEvent::Interrupted {
+            session_epoch: session,
+            reason: InterruptReason::UserDisarm,
+        });
     }
 }
 
@@ -234,17 +289,34 @@ impl HostSession {
     /// session to its media slot, forwards mixes to the runtime, and opens/closes the per-session
     /// media gate on arm/disarm.
     pub fn dsp_bridge(&self) -> Arc<dyn crate::contract::DspControl> {
+        self.dsp_bridge_with_events(None)
+    }
+
+    /// A [`DspControl`] bridge that also publishes [`AudioEvent`]s to `sink`.
+    ///
+    /// The composition installs a bounded, non-blocking sink here so the DSP path's arm/mix/disarm
+    /// confirmations reach the control server's outbound push path.
+    pub fn dsp_bridge_with_events(
+        &self,
+        sink: Option<Arc<dyn crate::contract::AudioEventSink>>,
+    ) -> Arc<dyn crate::contract::DspControl> {
         Arc::new(DspBridge {
             handle: self.runtime.handle(),
             hub: Arc::clone(&self.hub),
             audio_epoch: self.audio_epoch,
             pending: Mutex::new(std::collections::HashMap::new()),
+            events: sink,
         })
     }
 
     /// The capture generation this session minted for its blocks.
     pub fn audio_epoch(&self) -> AudioEpoch {
         self.audio_epoch
+    }
+
+    /// A cloneable handle for driving the DSP worker (e.g. selecting the local monitor slot).
+    pub fn runtime_handle(&self) -> crate::runtime::RuntimeHandle {
+        self.runtime.handle()
     }
 
     /// The local address the media socket is bound to.
@@ -282,6 +354,9 @@ impl Drop for HostSession {
 pub struct HostServerHandle {
     addr: SocketAddr,
     join_url: String,
+    /// The one authoritative server the router serves, kept so the operator can mint fresh pairing
+    /// credentials against the same actor (never a second, divergent instance).
+    shared: crate::server::http::SharedServer,
     handle: axum_server::Handle<SocketAddr>,
     server_thread: Option<JoinHandle<()>>,
 }
@@ -298,6 +373,17 @@ impl HostServerHandle {
     /// pairing-credential path for a fresh token after that.
     pub fn join_url(&self) -> &str {
         &self.join_url
+    }
+
+    /// Mint a fresh single-use pairing credential from the running host's own `PairStore`.
+    ///
+    /// Returns `None` only if the shared server lock is poisoned; a genuinely minted credential is
+    /// always returned otherwise. The token is never logged.
+    pub fn issue_pairing_credential(
+        &self,
+    ) -> Option<crate::server::PairingCredential> {
+        let mut guard = self.shared.lock().ok()?;
+        Some(guard.control.issue_pairing_credential())
     }
 
     /// Gracefully stop receiving, then join the server thread. Idempotent.
@@ -377,10 +463,16 @@ impl HostSession {
         let host_epoch = HostEpoch(uuid::Uuid::new_v4());
         let audio_epoch = self.audio_epoch;
 
+        // The DSP bridge publishes arm/mix/disarm confirmations over this bounded channel; the
+        // server drains it on the socket loop. `try_send` on a full queue keeps audio non-blocking.
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel(AUDIO_EVENT_QUEUE_CAPACITY);
+        let event_sink: Arc<dyn crate::contract::AudioEventSink> =
+            Arc::new(ChannelAudioEventSink { tx: audio_tx });
+
         let mut actor = ControlActor::new(
             clock.clone(),
-            self.dsp_bridge(),
-            catalog,
+            self.dsp_bridge_with_events(Some(event_sink)),
+            catalog.clone(),
             host_epoch,
             audio_epoch,
         );
@@ -389,18 +481,24 @@ impl HostSession {
         actor.set_join_base(format!("https://{addr}"));
         let join_url = actor.issue_pairing_credential().join_url;
 
-        let plane = HostServer::with_media(
+        let mut plane = HostServer::with_media_and_catalog(
             actor,
             clock,
             Arc::new(OsEntropy),
             origin,
             assets,
             self.media_hub(),
+            catalog,
         );
+        plane.set_audio_events(audio_rx);
+        // Keep the authoritative server reachable from the returned handle so the operator can
+        // mint fresh pairing credentials against the SAME actor the router serves. Without this
+        // the actor would be unreachable and credential minting could only be faked.
+        let shared = plane.into_shared();
         // The control router serves `/join` but not the bundle's referenced `/assets/*` files.
         // Compose the embedded assets as a fallback so the musician page actually loads in a
         // browser; this wraps the router without changing any `server` internals.
-        let router = with_static_assets(plane.router(), asset_provider);
+        let router = with_static_assets(HostServer::router_from_shared(Arc::clone(&shared)), asset_provider);
 
         let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
         let bind_handle = handle.clone();
@@ -425,6 +523,7 @@ impl HostSession {
         Ok(HostServerHandle {
             addr,
             join_url,
+            shared,
             handle,
             server_thread: Some(server_thread),
         })
@@ -874,6 +973,90 @@ mod tests {
 
         // Disarm is priority and must not panic.
         crate::contract::DspControl::disarm(&*bridge, session, crate::ids::SafetyGeneration(2));
+    }
+
+    /// Records every event the DSP bridge publishes.
+    #[derive(Default)]
+    struct RecordingEvents {
+        events: Mutex<Vec<AudioEvent>>,
+    }
+
+    impl crate::contract::AudioEventSink for RecordingEvents {
+        fn try_publish(&self, ev: AudioEvent) -> bool {
+            self.events.lock().expect("events").push(ev);
+            true
+        }
+    }
+
+    #[test]
+    fn dsp_bridge_publishes_arm_mix_and_disarm_events_to_its_sink() {
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 5,
+        };
+        let session = SessionEpoch::from_bytes([0x44; 16]);
+        let host = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let sink = Arc::new(RecordingEvents::default());
+        let bridge = host.dsp_bridge_with_events(Some(sink.clone()));
+
+        // A media slot exists, so an install routes straight to the runtime and publishes.
+        host.media_hub().lock().unwrap().open_slot(0, session).unwrap();
+        let snapshot = crate::contract::MixSnapshot {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(0),
+            },
+            catalog_revision: crate::ids::CatalogRevision(1),
+            mix_revision: crate::ids::MixRevision(1),
+            sources: crate::contract::SourceGainMatrix::from_slice(&[]),
+            master_db: 0.0,
+            master_muted: true,
+        };
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, snapshot).is_ok());
+
+        let arm = crate::contract::ListenArm {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(1),
+            },
+            applied_revision: crate::ids::MixRevision(1),
+            arm_nonce: crate::ids::ArmNonce::from_bytes([0x66; 16]),
+        };
+        assert!(crate::contract::DspControl::request_arm(&*bridge, arm).is_ok());
+        crate::contract::DspControl::disarm(&*bridge, session, crate::ids::SafetyGeneration(2));
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            AudioEvent::MixApplied {
+                applied_revision: crate::ids::MixRevision(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            AudioEvent::ArmApplied { arm_nonce, .. }
+                if arm_nonce == crate::ids::ArmNonce::from_bytes([0x66; 16])
+        ));
+        assert!(matches!(
+            events[2],
+            AudioEvent::Interrupted {
+                session_epoch,
+                reason: InterruptReason::UserDisarm,
+            } if session_epoch == session
+        ));
     }
 
     /// A minimal asset provider with one real asset and no entry for unknown paths.

@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::contract::{
-    AssetProvider, CatalogSnapshot, Clock, ControlError, DspControl, EnvelopeV1, ListenArm,
-    MixPatch, MixSnapshot, SourceGain, SourceGainMatrix, SourceInfo, SourceRole,
+    AssetProvider, AudioEvent, CatalogSnapshot, Clock, ControlError, DspControl, EnvelopeV1,
+    ListenArm, MixPatch, MixSnapshot, SessionContext, SourceGain, SourceGainMatrix, SourceInfo,
+    SourceRole,
 };
 use crate::control::auth::OriginPolicy;
 use crate::control::ControlActor;
 use crate::ids::{
-    AudioEpoch, CatalogRevision, HostEpoch, MixRevision, RequestId, SafetyGeneration, SessionEpoch,
-    SourceId,
+    ArmNonce, AudioEpoch, CatalogRevision, HostEpoch, MixRevision, RequestId, SafetyGeneration,
+    SessionEpoch, SourceId,
 };
 use crate::server::http::{HostServer, PairRequest};
 use crate::server::pairing::PairStore;
@@ -499,5 +500,217 @@ fn ws_cross_session_rtc_message_is_rejected() {
     let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["payload"]["code"], "UNAUTHORIZED");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Outbound push: initial snapshots and audio-event delivery
+// ---------------------------------------------------------------------------------------------
+
+/// Build a server whose catalog is the fixture catalog (for `catalog.snapshot` assertions).
+fn build_server_with_catalog() -> HostServer {
+    let clock: Arc<dyn Clock> = TestClock::new();
+    let dsp = Arc::new(RecordingDsp::default());
+    let control = control_actor_with(clock.clone(), dsp);
+    let entropy: Arc<dyn crate::contract::Entropy> = TestEntropy::new();
+    let origin = OriginPolicy::new(["https://host.local:8443".to_string()]);
+    let hub = Arc::new(Mutex::new(crate::transport::MediaHub::new(
+        crate::transport::SelectedInterface {
+            name: "loopback".to_string(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            prefix: 8,
+        },
+    )));
+    HostServer::with_media_and_catalog(
+        control,
+        clock,
+        entropy,
+        origin,
+        Arc::new(FixtureAssets),
+        hub,
+        test_catalog(),
+    )
+}
+
+/// Drain all currently queued outbound envelopes, parsed as JSON.
+fn drain_all(
+    receiver: &mut tokio::sync::mpsc::Receiver<String>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    while let Ok(text) = receiver.try_recv() {
+        out.push(serde_json::from_str(&text).expect("outbound envelope is json"));
+    }
+    out
+}
+
+#[test]
+fn connect_session_pushes_session_and_catalog_snapshots_in_order() {
+    let mut server = build_server_with_catalog();
+    let session = test_session_a();
+    let (mut rx, _tx) = server.connect_session(session);
+
+    let messages = drain_all(&mut rx);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["type"], "session.snapshot");
+    assert_eq!(
+        messages[0]["payload"]["sessionEpoch"],
+        test_session_a().to_string()
+    );
+    assert_eq!(messages[0]["payload"]["phase"], "paired");
+    assert!(messages[0]["payload"]["acceptedMix"].is_null());
+
+    assert_eq!(messages[1]["type"], "catalog.snapshot");
+    assert_eq!(messages[1]["payload"]["catalogRevision"], "1");
+    assert_eq!(messages[1]["payload"]["sources"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn publish_mix_applied_reaches_only_the_owning_session() {
+    let (mut server, _clock) = build_server();
+    let session = test_session_a();
+    let other = SessionEpoch::from_bytes([0x77; 16]);
+
+    // Give the actor a known installed revision for `session`.
+    server
+        .control
+        .apply_patch(session, patch_source_gain(shared_source(), -3.0))
+        .expect("patch");
+
+    let (mut rx_a, _tx_a) = server.connect_session(session);
+    let (mut rx_b, _tx_b) = server.connect_session(other);
+    drain_all(&mut rx_a);
+    drain_all(&mut rx_b);
+
+    let snapshot = server.control.accepted_snapshot(session).expect("accepted");
+    server.publish_audio_event(AudioEvent::MixApplied {
+        applied_revision: MixRevision(1),
+        context: SessionContext {
+            session_epoch: session,
+            audio_epoch: test_audio_epoch(),
+            safety_generation: SafetyGeneration(0),
+        },
+        start_sample: 0,
+        snapshot,
+    });
+
+    let pushed = drain_all(&mut rx_a);
+    assert_eq!(pushed.len(), 1);
+    assert_eq!(pushed[0]["type"], "mix.applied");
+    assert_eq!(pushed[0]["payload"]["appliedRevision"], "1");
+    // The other registered session must not receive the owner's push.
+    assert!(drain_all(&mut rx_b).is_empty());
+}
+
+#[test]
+fn publish_arm_applied_reaches_only_the_owning_session() {
+    let (mut server, _clock) = build_server();
+    let session = test_session_a();
+    let other = SessionEpoch::from_bytes([0x77; 16]);
+    let nonce = ArmNonce::from_bytes([0x66; 16]);
+
+    server
+        .control
+        .arm(
+            session,
+            ListenArm {
+                context: SessionContext {
+                    session_epoch: session,
+                    audio_epoch: test_audio_epoch(),
+                    safety_generation: SafetyGeneration(0),
+                },
+                applied_revision: MixRevision(0),
+                arm_nonce: nonce,
+            },
+        )
+        .expect("arm");
+
+    let (mut rx_a, _tx_a) = server.connect_session(session);
+    let (mut rx_b, _tx_b) = server.connect_session(other);
+    drain_all(&mut rx_a);
+    drain_all(&mut rx_b);
+
+    server.publish_audio_event(AudioEvent::ArmApplied {
+        context: SessionContext {
+            session_epoch: session,
+            audio_epoch: test_audio_epoch(),
+            safety_generation: SafetyGeneration(1),
+        },
+        arm_nonce: nonce,
+    });
+
+    let pushed = drain_all(&mut rx_a);
+    assert_eq!(pushed.len(), 1);
+    assert_eq!(pushed[0]["type"], "listen.armed");
+    assert_eq!(pushed[0]["payload"]["armNonce"], nonce.to_string());
+    assert!(drain_all(&mut rx_b).is_empty());
+}
+
+#[test]
+fn stale_and_wrong_session_audio_events_are_never_pushed() {
+    let (mut server, _clock) = build_server();
+    let session = test_session_a();
+    let other = SessionEpoch::from_bytes([0x77; 16]);
+
+    let (mut rx_a, _tx_a) = server.connect_session(session);
+    let (mut rx_b, _tx_b) = server.connect_session(other);
+    drain_all(&mut rx_a);
+    drain_all(&mut rx_b);
+
+    // An event naming a session the actor has never seen is dropped.
+    server.publish_audio_event(AudioEvent::ArmApplied {
+        context: SessionContext {
+            session_epoch: other,
+            audio_epoch: test_audio_epoch(),
+            safety_generation: SafetyGeneration(1),
+        },
+        arm_nonce: ArmNonce::from_bytes([0x66; 16]),
+    });
+    assert!(drain_all(&mut rx_a).is_empty());
+    assert!(drain_all(&mut rx_b).is_empty());
+
+    // A stale (uninstalled) revision for a known session is dropped.
+    let nonce = ArmNonce::from_bytes([0x33; 16]);
+    server
+        .control
+        .apply_patch(session, patch_source_gain(shared_source(), -3.0))
+        .expect("patch");
+    server
+        .control
+        .arm(
+            session,
+            ListenArm {
+                context: SessionContext {
+                    session_epoch: session,
+                    audio_epoch: test_audio_epoch(),
+                    safety_generation: SafetyGeneration(0),
+                },
+                applied_revision: MixRevision(1),
+                arm_nonce: nonce,
+            },
+        )
+        .expect("arm");
+
+    let snapshot = server.control.accepted_snapshot(session).expect("accepted");
+    server.publish_audio_event(AudioEvent::MixApplied {
+        applied_revision: MixRevision(9999),
+        context: SessionContext {
+            session_epoch: session,
+            audio_epoch: test_audio_epoch(),
+            safety_generation: SafetyGeneration(1),
+        },
+        start_sample: 0,
+        snapshot,
+    });
+    // A confirm with the wrong nonce for the pending arm is dropped too.
+    server.publish_audio_event(AudioEvent::ArmApplied {
+        context: SessionContext {
+            session_epoch: session,
+            audio_epoch: test_audio_epoch(),
+            safety_generation: SafetyGeneration(1),
+        },
+        arm_nonce: ArmNonce::from_bytes([0x99; 16]),
+    });
+
+    assert!(drain_all(&mut rx_a).is_empty());
+    assert!(drain_all(&mut rx_b).is_empty());
 }
 

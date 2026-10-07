@@ -9,7 +9,7 @@ import type {
   StartHostRequest,
   StartHostResult,
 } from '../../protocol';
-import type { PairingCredential } from '../../desktop-bridge/contracts';
+import type { OutputDeviceInfo, PairingCredential } from '../../desktop-bridge/contracts';
 
 /**
  * Test fixtures for Lane D UI tests. These are private test helpers, never
@@ -70,6 +70,9 @@ export function fakeBridge(credential: PairingCredential): FakeBridge {
       bridge.logged.push('[pairing-credential-issued]');
       return credential;
     },
+    listOutputDevices: async (): Promise<OutputDeviceInfo[]> => [],
+    startMonitor: async (): Promise<void> => {},
+    stopMonitor: async (): Promise<void> => {},
   };
   return bridge;
 }

@@ -13,7 +13,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
-import type { HostBridge, PairingCredential } from './contracts';
+import type { HostBridge, OutputDeviceInfo, PairingCredential } from './contracts';
 import type {
   CatalogSnapshot,
   CounterString,
@@ -232,6 +232,23 @@ export function createTauriHostBridge(): HostBridge {
 
     async issuePairingCredential() {
       return callInvoke<PairingCredential>('issue_pairing_credential', { windowLabel: label });
+    },
+
+    async listOutputDevices() {
+      const raw = await callInvoke<OutputDeviceInfo[]>('list_output_devices', {
+        windowLabel: label,
+      });
+      return raw;
+    },
+
+    async startMonitor(slot: number, deviceId: string | null) {
+      // The Rust command takes `slot` (u32) and `device_id: Option<String>`. `null` is the system
+      // default output request; the key is always sent so omitting it can never be misread.
+      await callInvoke<void>('start_monitor', { windowLabel: label, slot, deviceId });
+    },
+
+    async stopMonitor() {
+      await callInvoke<void>('stop_monitor', { windowLabel: label });
     },
   };
 }

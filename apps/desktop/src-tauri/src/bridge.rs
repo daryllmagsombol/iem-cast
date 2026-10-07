@@ -34,6 +34,19 @@ pub struct StartHostRequest {
     pub interface_ip: String,
     pub certificate_path: String,
     pub key_path: String,
+    /// HTTPS/WSS port to bind on the selected interface. Defaults to 8443 when omitted so existing
+    /// callers remain valid.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+/// A local monitor output device offered to the operator.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
 }
 
 /// Result of starting the local host.

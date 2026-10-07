@@ -26,6 +26,9 @@ pub fn run() {
             commands::set_available_sources,
             commands::set_source_label,
             commands::issue_pairing_credential,
+            commands::list_output_devices,
+            commands::start_monitor,
+            commands::stop_monitor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running IEM Cast desktop");

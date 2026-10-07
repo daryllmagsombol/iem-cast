@@ -8,7 +8,8 @@
 use serde::Serialize;
 
 use crate::contract::{
-    ControlError, EnvelopeV1, ListenArmed, MixAck, MixApplied, RtcAnswer, RtcCandidate,
+    CatalogSnapshot, ControlError, EnvelopeV1, ListenArmed, MixAck, MixApplied, RtcAnswer,
+    RtcCandidate, SessionSnapshot,
 };
 use crate::ids::{HostEpoch, RequestId, SessionEpoch};
 
@@ -46,6 +47,10 @@ impl ProtocolError {
 }
 
 /// A complete server message ready for envelope serialization.
+// `SessionSnapshot` carries the full session view and is much larger than the signaling variants.
+// A `ServerMessage` is built, serialized, and dropped immediately, so the extra stack size is not
+// worth an indirection that all callers would have to unwrap.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum ServerMessage {
     /// Acknowledgement of an accepted mix patch.
@@ -54,6 +59,10 @@ pub enum ServerMessage {
     MixApplied(MixApplied),
     /// Host confirmation that a listener is armed.
     ListenArmed(ListenArmed),
+    /// Full server-side view of the connecting listener's session.
+    SessionSnapshot(SessionSnapshot),
+    /// Versioned source catalog the listener patches against.
+    CatalogSnapshot(CatalogSnapshot),
     /// Host SDP answer to a listener's RTC offer.
     RtcAnswer(RtcAnswer),
     /// Host trickle ICE candidate (`candidate: None` = end-of-candidates).
@@ -69,6 +78,8 @@ impl ServerMessage {
             ServerMessage::MixAck(_) => "mix.ack",
             ServerMessage::MixApplied(_) => "mix.applied",
             ServerMessage::ListenArmed(_) => "listen.armed",
+            ServerMessage::SessionSnapshot(_) => "session.snapshot",
+            ServerMessage::CatalogSnapshot(_) => "catalog.snapshot",
             ServerMessage::RtcAnswer(_) => "rtc.answer",
             ServerMessage::RtcCandidate(_) => "rtc.candidate",
             ServerMessage::ProtocolError(_) => "error",
@@ -84,7 +95,8 @@ impl ServerMessage {
         match self {
             ServerMessage::MixApplied(m) => Some(m.context.session_epoch),
             ServerMessage::ListenArmed(m) => Some(m.session_epoch),
-            ServerMessage::MixAck(_)
+            ServerMessage::SessionSnapshot(m) => Some(m.session_epoch),
+            ServerMessage::CatalogSnapshot(_) | ServerMessage::MixAck(_)
             | ServerMessage::RtcAnswer(_)
             | ServerMessage::RtcCandidate(_)
             | ServerMessage::ProtocolError(_) => None,
@@ -96,6 +108,8 @@ impl ServerMessage {
             ServerMessage::MixAck(m) => serde_json::to_value(m),
             ServerMessage::MixApplied(m) => serde_json::to_value(m),
             ServerMessage::ListenArmed(m) => serde_json::to_value(m),
+            ServerMessage::SessionSnapshot(m) => serde_json::to_value(m),
+            ServerMessage::CatalogSnapshot(m) => serde_json::to_value(m),
             ServerMessage::RtcAnswer(m) => serde_json::to_value(m),
             ServerMessage::RtcCandidate(m) => serde_json::to_value(m),
             ServerMessage::ProtocolError(m) => serde_json::to_value(m),

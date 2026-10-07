@@ -5,6 +5,7 @@
 //! are dispatched to the actor; the socket holds at most one patch in flight.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 
@@ -18,29 +19,81 @@ use super::protocol::ServerMessage;
 /// Maximum inbound control frame accepted from a musician.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
+/// How often an idle socket re-checks the audio-event queue.
+const AUDIO_EVENT_POLL: Duration = Duration::from_millis(25);
+
+/// One iteration of the socket loop, resolved by whichever of recv/push/tick is ready.
+enum Step {
+    Inbound(Message),
+    Push(String),
+    Tick,
+}
+
 /// Drain one websocket control session until close or error.
+///
+/// The loop serves both directions: inbound control frames are dispatched to the actor, while
+/// unsolicited server messages (initial snapshots, `listen.armed`, `mix.applied`) are forwarded
+/// from this session's bounded outbound channel. Audio events published by the DSP bridge are
+/// applied between frames, so a phone that never sends anything still receives its pushes.
 pub async fn serve_socket(mut socket: WebSocket, state: SharedServer, session: SessionEpoch) {
-    while let Some(Ok(message)) = socket.recv().await {
-        let text = match message {
-            Message::Text(text) => text.to_string(),
-            Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
-                Ok(text) => text,
-                Err(_) => continue,
+    // Register the push channel and queue the initial catalog/session snapshots before serving.
+    let (mut outbound_rx, outbound_tx) = lock(&state).connect_session(session);
+
+    let mut ticker = tokio::time::interval(AUDIO_EVENT_POLL);
+    // The first tick fires immediately; consume it so the loop does not spin.
+    ticker.tick().await;
+
+    loop {
+        let step = tokio::select! {
+            maybe = socket.recv() => match maybe {
+                Some(Ok(message)) => Step::Inbound(message),
+                _ => break,
             },
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
+            maybe = outbound_rx.recv() => match maybe {
+                Some(envelope) => Step::Push(envelope),
+                None => break,
+            },
+            _ = ticker.tick() => Step::Tick,
         };
-        if text.len() > MAX_CONTROL_FRAME_BYTES {
-            continue;
-        }
-        if let Some(reply) = dispatch(&state, session, &text) {
-            if socket.send(Message::Text(reply.into())).await.is_err() {
-                break;
+
+        match step {
+            Step::Inbound(message) => {
+                let text = match message {
+                    Message::Text(text) => text.to_string(),
+                    Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+                        Ok(text) => text,
+                        Err(_) => continue,
+                    },
+                    Message::Close(_) => break,
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                };
+                if text.len() > MAX_CONTROL_FRAME_BYTES {
+                    continue;
+                }
+                if let Some(reply) = dispatch(&state, session, &text) {
+                    if socket.send(Message::Text(reply.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // A dispatch may have queued an audio event (e.g. an accepted patch); apply it now
+                // so `mix.applied`/`listen.armed` are pushed on the next loop turn.
+                lock(&state).drain_audio_events();
+            }
+            Step::Push(envelope) => {
+                if socket.send(Message::Text(envelope.into())).await.is_err() {
+                    break;
+                }
+            }
+            Step::Tick => {
+                lock(&state).drain_audio_events();
             }
         }
     }
-    // The socket ended: disarm the authenticated session so audio does not continue silently.
+
+    // The socket ended: stop routing pushes to it and disarm the session so audio does not
+    // continue silently.
     let mut guard = lock(&state);
+    guard.unregister_outbound(session, &outbound_tx);
     let generation = guard.control.current_generation(session);
     let _ = guard.control.disarm(
         session,

@@ -260,3 +260,64 @@ describe('isOperatorShell', () => {
     expect(isOperatorShell()).toBe(false);
   });
 });
+
+describe('listOutputDevices', () => {
+  test('calls list_output_devices with the window label and maps the DTO verbatim', async () => {
+    const raw = [
+      { id: 'out-default', name: 'MacBook Speakers', isDefault: true },
+      { id: 'out-usb', name: 'USB Monitor Out', isDefault: false },
+    ];
+    invokeMock.mockResolvedValueOnce(raw);
+
+    const devices = await createTauriHostBridge().listOutputDevices();
+
+    expect(invokeMock).toHaveBeenCalledWith('list_output_devices', { windowLabel: 'operator' });
+    expect(devices).toEqual(raw);
+  });
+});
+
+describe('startMonitor', () => {
+  test('sends the 0-based slot and the device id, preserving an explicit null', async () => {
+    const bridge = createTauriHostBridge();
+
+    invokeMock.mockResolvedValueOnce(undefined);
+    await bridge.startMonitor(0, 'out-usb');
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'start_monitor', {
+      windowLabel: 'operator',
+      slot: 0,
+      deviceId: 'out-usb',
+    });
+
+    // A `null` device id is the "system default output" request; never drop the key.
+    invokeMock.mockResolvedValueOnce(undefined);
+    await bridge.startMonitor(3, null);
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'start_monitor', {
+      windowLabel: 'operator',
+      slot: 3,
+      deviceId: null,
+    });
+  });
+
+  test('preserves a typed monitor error code', async () => {
+    invokeMock.mockRejectedValueOnce({
+      code: 'MONITOR_SLOT_INVALID',
+      message: 'slot is out of range',
+    });
+
+    const error = await createTauriHostBridge()
+      .startMonitor(9, null)
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(IpcInvokeError);
+    expect((error as IpcInvokeError).code).toBe('MONITOR_SLOT_INVALID');
+  });
+});
+
+describe('stopMonitor', () => {
+  test('calls stop_monitor with only the window label', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await createTauriHostBridge().stopMonitor();
+    expect(invokeMock).toHaveBeenCalledWith('stop_monitor', { windowLabel: 'operator' });
+  });
+});

@@ -49,6 +49,8 @@
 .iem-hint { border-left: 2px solid var(--iem-color-boundary); padding-left: var(--iem-space-3); color: var(--iem-color-text-secondary); }
 .iem-device-option { display: flex; gap: var(--iem-space-3); align-items: center; padding: var(--iem-space-3); min-height: 3rem; border: 1px solid var(--iem-color-boundary); border-radius: var(--radius-control); background: var(--iem-color-surface-raised); cursor: pointer; }
 .iem-device-option input { accent-color: var(--iem-color-accent); }
+.iem-qr { display: inline-flex; padding: var(--iem-space-3); border: 1px solid var(--iem-color-boundary); border-radius: var(--radius-control); background: #ffffff; align-self: flex-start; }
+.iem-qr svg { display: block; max-width: 100%; height: auto; }
 .iem-review { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: var(--iem-space-2) var(--iem-space-4); }
 .iem-review dt { color: var(--iem-color-text-secondary); }
 .iem-review dd { overflow-wrap: anywhere; }

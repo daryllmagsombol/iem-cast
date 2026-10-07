@@ -5,6 +5,7 @@
 //! `sessionEpoch` must equal that authenticated session. A caller-supplied session is never
 //! trusted.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -14,17 +15,27 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
-use crate::contract::{AssetProvider, Clock, ControlError, Entropy, EnvelopeV1, MixPatch};
+use crate::contract::{
+    AssetProvider, AudioEvent, CatalogSnapshot, Clock, ControlError, Entropy, EnvelopeV1,
+    ListenerPhase, MixPatch, SessionContext, SessionSnapshot,
+};
 use crate::control::auth::{
     set_cookie_value, session_cookie_value, OriginPolicy, OsEntropy, SessionStore, SESSION_TTL,
 };
 use crate::control::ControlActor;
-use crate::ids::{HostEpoch, RequestId, SessionEpoch, SourceId};
+use crate::ids::{CatalogRevision, HostEpoch, RequestId, SessionEpoch, SourceId};
 use crate::transport::{MediaHub, SelectedInterface};
 
 /// Inclusive POC cap on concurrently active receivers.
 pub const POC_ACTIVE_RECEIVER_CAP: usize = 2;
+
+/// Bound on a single session's outbound push queue.
+///
+/// A slow or dead socket causes the oldest queued pushes to be dropped rather than the control
+/// plane stalling: the sender uses `try_send` and never blocks the caller holding the server lock.
+pub const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 
 use super::protocol::ServerMessage;
 
@@ -55,6 +66,15 @@ pub struct HostServer {
     /// Shared media hub the WSS signaling path reaches (never audio; only per-listener sessions).
     pub hub: Arc<Mutex<MediaHub>>,
     assets: Arc<dyn AssetProvider>,
+    /// The versioned source catalog, sent to a listener as an initial `catalog.snapshot`.
+    catalog: CatalogSnapshot,
+    /// Per-authenticated-session outbound push channels (unsolicited server messages).
+    outbound: HashMap<SessionEpoch, mpsc::Sender<String>>,
+    /// Bounded receiver for [`AudioEvent`]s published by the DSP bridge.
+    ///
+    /// The bridge owns the matching non-blocking `SyncSender`; the server drains this on the
+    /// socket loop so a stalled audio path can never block on the server lock.
+    audio_events: Option<std::sync::mpsc::Receiver<AudioEvent>>,
 }
 
 impl HostServer {
@@ -80,6 +100,10 @@ impl HostServer {
     ///
     /// The hub is owned by [`crate::host::HostSession`] and shared here; [`HostServer::new`] wraps
     /// an inert loopback hub for tests and callers without a media path.
+    ///
+    /// The source `catalog` is empty here for backward compatibility with callers (including the
+    /// server-boundary tests) that predate catalog snapshots; use
+    /// [`with_media_and_catalog`](Self::with_media_and_catalog) to supply the real catalog.
     pub fn with_media(
         control: ControlActor,
         clock: Arc<dyn Clock>,
@@ -88,18 +112,190 @@ impl HostServer {
         assets: Arc<dyn AssetProvider>,
         hub: Arc<Mutex<MediaHub>>,
     ) -> Self {
+        Self::with_media_and_catalog(
+            control,
+            clock,
+            entropy,
+            origin,
+            assets,
+            hub,
+            CatalogSnapshot {
+                catalog_revision: CatalogRevision(0),
+                sources: Vec::new(),
+            },
+        )
+    }
+
+    /// Compose a server over an explicit source catalog.
+    ///
+    /// This is the production constructor used by [`crate::host::HostSession`]; the catalog is sent
+    /// to each connecting listener as its initial `catalog.snapshot`.
+    pub fn with_media_and_catalog(
+        control: ControlActor,
+        clock: Arc<dyn Clock>,
+        entropy: Arc<dyn Entropy>,
+        origin: OriginPolicy,
+        assets: Arc<dyn AssetProvider>,
+        hub: Arc<Mutex<MediaHub>>,
+        catalog: CatalogSnapshot,
+    ) -> Self {
         Self {
             control,
             sessions: SessionStore::new(clock, entropy, SESSION_TTL),
             origin,
             hub,
             assets,
+            catalog,
+            outbound: HashMap::new(),
+            audio_events: None,
+        }
+    }
+
+    /// Install the receiver for [`AudioEvent`]s published by the DSP bridge.
+    ///
+    /// The matching non-blocking sender is held by the bridge, which calls `try_send`, so the
+    /// audio path never blocks on the server lock.
+    pub fn set_audio_events(&mut self, receiver: std::sync::mpsc::Receiver<AudioEvent>) {
+        self.audio_events = Some(receiver);
+    }
+
+    /// Drain and apply every queued audio event. Called by the socket loop with a short cadence;
+    /// returns how many events were applied.
+    pub fn drain_audio_events(&mut self) -> usize {
+        let mut applied = 0;
+        loop {
+            let event = match self.audio_events.as_ref() {
+                Some(receiver) => receiver.try_recv(),
+                None => return applied,
+            };
+            match event {
+                Ok(event) => {
+                    self.publish_audio_event(event);
+                    applied += 1;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return applied,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return applied,
+            }
         }
     }
 
     /// The shared media hub, for wiring the UDP pump and the encoded-frame sink.
     pub fn media_hub(&self) -> Arc<Mutex<MediaHub>> {
         Arc::clone(&self.hub)
+    }
+
+    /// The source catalog listeners patch against.
+    pub fn catalog(&self) -> &CatalogSnapshot {
+        &self.catalog
+    }
+
+    /// Register the outbound push channel for an authenticated session.
+    ///
+    /// Returns the receiver the socket loop selects on and a clone of the sender, which the socket
+    /// loop keeps solely to prove ownership when it later unregisters. A previous registration for
+    /// the same session (a reconnect) is replaced; its sender is dropped, ending the stale socket.
+    pub fn register_outbound(
+        &mut self,
+        session: SessionEpoch,
+    ) -> (mpsc::Receiver<String>, mpsc::Sender<String>) {
+        let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        self.outbound.insert(session, sender.clone());
+        (receiver, sender)
+    }
+
+    /// Unregister a session's outbound channel once its socket ends.
+    ///
+    /// Only removes the entry when `sender` is still the registered channel for `session`, so a
+    /// newer reconnect cannot have its channel torn down by the old socket's cleanup.
+    pub fn unregister_outbound(
+        &mut self,
+        session: SessionEpoch,
+        sender: &mpsc::Sender<String>,
+    ) {
+        if let Some(existing) = self.outbound.get(&session) {
+            if existing.same_channel(sender) {
+                self.outbound.remove(&session);
+            }
+        }
+    }
+
+    /// Queue an envelope to a session's socket. Non-blocking: a full queue drops the message
+    /// (oldest-effort push) rather than stalling the control plane, and a closed receiver is
+    /// simply ignored.
+    pub fn push_outbound(&mut self, session: SessionEpoch, envelope: String) {
+        if let Some(sender) = self.outbound.get(&session) {
+            let _ = sender.try_send(envelope);
+        }
+    }
+
+    /// The initial `session.snapshot` for a connecting session.
+    ///
+    /// The live phase and accepted/applied mixes come from the actor; requested mix is not tracked
+    /// separately from accepted at this boundary, so it is `None`.
+    pub fn session_snapshot(&self, session: SessionEpoch) -> SessionSnapshot {
+        let accepted = self.control.accepted_snapshot(session);
+        let accepted_mix = accepted;
+        SessionSnapshot {
+            session_epoch: session,
+            context: SessionContext {
+                session_epoch: session,
+                audio_epoch: self.control.audio_epoch(),
+                safety_generation: self.control.current_generation(session),
+            },
+            phase: if accepted_mix.is_some() {
+                ListenerPhase::ReadyMuted
+            } else {
+                ListenerPhase::Paired
+            },
+            catalog_revision: self.catalog.catalog_revision,
+            requested_mix: None,
+            accepted_mix,
+            applied_mix: None,
+        }
+    }
+
+    /// Register a newly connected session's outbound channel and enqueue its initial snapshots.
+    ///
+    /// This is the exact connect sequence [`crate::server::ws::serve_socket`] performs immediately
+    /// after the authenticated upgrade, factored out so it is testable without a live socket.
+    pub fn connect_session(
+        &mut self,
+        session: SessionEpoch,
+    ) -> (mpsc::Receiver<String>, mpsc::Sender<String>) {
+        let (receiver, sender) = self.register_outbound(session);
+        for envelope in self.initial_snapshots(session) {
+            self.push_outbound(session, envelope);
+        }
+        (receiver, sender)
+    }
+
+    /// Build the initial snapshots pushed immediately after a socket upgrade.
+    pub fn initial_snapshots(&self, session: SessionEpoch) -> Vec<String> {
+        let host_epoch = self.control.host_epoch();
+        let session_snapshot = ServerMessage::SessionSnapshot(self.session_snapshot(session))
+            .to_envelope_json(host_epoch, RequestId(String::new()));
+        let catalog_snapshot = ServerMessage::CatalogSnapshot(self.catalog.clone())
+            .to_envelope_json(host_epoch, RequestId(String::new()));
+        vec![session_snapshot, catalog_snapshot]
+    }
+
+    /// Feed an audio event through the actor and push any resulting server message to the owning
+    /// session's socket. This is the only path by which `listen.armed`/`mix.applied` reach a phone.
+    ///
+    /// A message is routed to exactly the session named by the actor's validated output; an event
+    /// whose session has no registered socket is dropped.
+    pub fn publish_audio_event(&mut self, ev: AudioEvent) {
+        let message = match self.control.on_audio_event(ev) {
+            Some(message) => message,
+            None => return,
+        };
+        let session = match message.session_epoch() {
+            Some(session) => session,
+            None => return,
+        };
+        let host_epoch = self.control.host_epoch();
+        let envelope = message.to_envelope_json(host_epoch, RequestId(String::new()));
+        self.push_outbound(session, envelope);
     }
 
     /// The global host identity.
@@ -281,7 +477,20 @@ impl HostServer {
 
     /// Build the production axum router with shared state.
     pub fn router(self) -> Router {
-        let state = Arc::new(Mutex::new(self));
+        Self::router_from_shared(self.into_shared())
+    }
+
+    /// Move this server into shared state so the running router and an external handle (e.g. the
+    /// desktop's pairing-credential command) can both reach the same authoritative actor.
+    pub fn into_shared(self) -> SharedServer {
+        Arc::new(Mutex::new(self))
+    }
+
+    /// Build the production axum router over an existing shared state.
+    ///
+    /// This lets a composition keep a handle to the same server the router serves, so operator
+    /// actions (minting a pairing credential) are applied by the one authoritative actor.
+    pub fn router_from_shared(state: SharedServer) -> Router {
         Router::new()
             .route("/join", get(join_handler))
             .route("/api/v1/pair", post(pair_handler))

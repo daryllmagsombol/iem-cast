@@ -10,7 +10,7 @@ function container() { document.getElementById('root')?.remove(); const node = d
 export function mountOperator() {
   const calls: string[] = [];
   const unavailable = async () => { calls.push('FORBIDDEN'); throw new Error('Unsupported operation invoked'); };
-  const bridge: HostBridge = { listDevices: async () => { calls.push('devices'); return [{ deviceId: 'fixture', name: 'Browser-test USB fixture', isDefault: false, inputChannels: 4, sampleFormats: ['F32'], sampleRateHz: 48000, bufferMinFrames: null, bufferMaxFrames: null }]; }, listInterfaces: async () => { calls.push('interfaces'); return [{ name: 'Fixture Ethernet', ipAddress: '192.0.2.10', prefix: 24 }]; }, startHost: unavailable, stopHost: unavailable, sourceCatalog: unavailable, setAvailableSources: unavailable, setSourceLabel: unavailable, issuePairingCredential: unavailable };
+  const bridge: HostBridge = { listDevices: async () => { calls.push('devices'); return [{ deviceId: 'fixture', name: 'Browser-test USB fixture', isDefault: false, inputChannels: 4, sampleFormats: ['F32'], sampleRateHz: 48000, bufferMinFrames: null, bufferMaxFrames: null }]; }, listInterfaces: async () => { calls.push('interfaces'); return [{ name: 'Fixture Ethernet', ipAddress: '192.0.2.10', prefix: 24 }]; }, startHost: unavailable, stopHost: unavailable, sourceCatalog: unavailable, setAvailableSources: unavailable, setSourceLabel: unavailable, issuePairingCredential: unavailable, listOutputDevices: unavailable, startMonitor: unavailable, stopMonitor: unavailable };
   createRoot(container()).render(<AdminRoot bridge={bridge} />);
   return calls;
 }

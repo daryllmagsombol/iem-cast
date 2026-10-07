@@ -30,6 +30,11 @@ export function AdminRoot({ bridge }: AdminRootProps) {
   const [certificate, setCertificate] = useState('');
   const [key, setKey] = useState('');
   const [currentStep, setCurrentStep] = useState(0);
+  const [host, setHost] = useState<{ joinUrl: string; hostEpoch: string; audioEpoch: string } | null>(
+    null,
+  );
+  const [hostBusy, setHostBusy] = useState(false);
+  const [hostError, setHostError] = useState<string | null>(null);
   useEffect(() => {
     if (!bridge) return;
     let current = true;
@@ -56,6 +61,50 @@ export function AdminRoot({ bridge }: AdminRootProps) {
   }, [bridge, scan]);
 
   if (preview) return <SimulatedPreview onExit={() => setPreview(false)} />;
+
+  const selectedInterface = interfaces.find(i => i.ipAddress === interfaceIp) ?? null;
+  const pathsEntered = certificate.trim() !== '' && key.trim() !== '';
+  const hostRunning = host !== null;
+  const canStartHost =
+    Boolean(bridge) && device !== null && selectedInterface !== null && pathsEntered && !hostRunning && !hostBusy;
+
+  async function startHost() {
+    if (!bridge || !device || !selectedInterface || !pathsEntered) return;
+    setHostBusy(true);
+    setHostError(null);
+    try {
+      const result = await bridge.startHost({
+        capture: { deviceId: device.deviceId, sampleRateHz: 48000, bufferFrames: 128 },
+        interface: selectedInterface,
+        certificatePath: certificate.trim(),
+        keyPath: key.trim(),
+      });
+      setHost({
+        joinUrl: result.joinUrl,
+        hostEpoch: result.hostEpoch,
+        audioEpoch: result.audioEpoch,
+      });
+    } catch (e) {
+      setHost(null);
+      setHostError(e instanceof Error ? e.message : 'Could not start the host.');
+    } finally {
+      setHostBusy(false);
+    }
+  }
+
+  async function stopHost() {
+    if (!bridge) return;
+    setHostBusy(true);
+    setHostError(null);
+    try {
+      await bridge.stopHost();
+      setHost(null);
+    } catch (e) {
+      setHostError(e instanceof Error ? e.message : 'Could not stop the host.');
+    } finally {
+      setHostBusy(false);
+    }
+  }
 
   return (
     <div className="iem-shell">
@@ -102,9 +151,9 @@ export function AdminRoot({ bridge }: AdminRootProps) {
             <h2 id="host-summary" className="text-section">Host summary</h2>
             <div className="iem-summary-grid">
               {[
-                ['Capture', 'Not confirmed'],
-                ['HTTPS join service', 'Unavailable'],
-                ['Phone audio', 'Unavailable'],
+                ['Capture', device ? `${device.name} · setup only` : 'Not confirmed'],
+                ['HTTPS join service', hostRunning ? 'Running' : 'Not running'],
+                ['Phone audio', hostRunning ? 'Ready for a listener' : 'Unavailable'],
               ].map(([label, value]) => (
                 <div key={label}>
                   <p className="text-caption text-text-secondary">{label}</p>
@@ -112,7 +161,11 @@ export function AdminRoot({ bridge }: AdminRootProps) {
                 </div>
               ))}
             </div>
-            <p className="text-caption text-text-secondary">IPC availability is not a running capture, server, or audio connection. No operation is reported running.</p>
+            {hostRunning ? (
+              <p className="text-caption text-text-secondary">Host is running. The join service is listening; no phone audio is connected until a listener pairs.</p>
+            ) : (
+              <p className="text-caption text-text-secondary">IPC availability is not a running capture, server, or audio connection. No operation is reported running.</p>
+            )}
           </section>
           <section id="setup-1" className="iem-panel">
             <DeviceView bridge={bridge} onSelect={setDevice} />
@@ -177,30 +230,73 @@ export function AdminRoot({ bridge }: AdminRootProps) {
               <dt>Network address</dt>
               <dd>{interfaceIp || 'Not selected'}</dd>
               <dt>Certificate paths</dt>
-              <dd>{certificate && key ? 'Entered · Not validated' : 'Not entered'}</dd>
+              <dd>{pathsEntered ? 'Entered · Not validated' : 'Not entered'}</dd>
             </dl>
+            {!bridge && (
+              <p className="text-caption text-text-secondary">
+                Unavailable — start the host from the desktop app. A browser has no native host.
+              </p>
+            )}
             <div className="iem-row">
               <Button
                 variant="primary"
-                disabled
-                explanation="Host startup is incomplete in this build."
+                disabled={!canStartHost}
+                pending={hostBusy && !hostRunning}
+                explanation={
+                  !bridge
+                    ? 'Native host access is required.'
+                    : hostRunning
+                      ? 'The host is already running.'
+                      : !device
+                        ? 'Select a capture device first.'
+                        : !selectedInterface
+                          ? 'Select a network interface first.'
+                          : !pathsEntered
+                            ? 'Enter both a certificate path and a key path.'
+                            : undefined
+                }
+                onClick={startHost}
               >
                 Start host
               </Button>
               <Button
                 variant="destructive"
-                disabled
-                explanation="No operation is reported running."
+                disabled={!hostRunning || hostBusy}
+                pending={hostBusy && hostRunning}
+                explanation={!hostRunning ? 'No host is reported running.' : undefined}
+                onClick={stopHost}
               >
                 Stop host
               </Button>
             </div>
+            {hostError && <p role="alert" className="text-danger">{hostError}</p>}
+            {hostRunning && (
+              <div role="status" className="iem-stack">
+                <p className="text-success text-label">Host running</p>
+                <label className="iem-field">
+                  Join URL
+                  <input
+                    readOnly
+                    value={host.joinUrl}
+                    onFocus={e => e.currentTarget.select()}
+                    spellCheck={false}
+                  />
+                </label>
+                <p className="iem-hint">
+                  This URL carries a single-use pairing token. It is shown here for the running host
+                  and is not saved.
+                </p>
+                <p className="text-caption text-text-secondary">
+                  host epoch {host.hostEpoch} · audio epoch {host.audioEpoch}
+                </p>
+              </div>
+            )}
           </section>
           <section id="setup-4" className="iem-panel">
             <SourcesView bridge={bridge} />
           </section>
           <section id="setup-5" className="iem-panel">
-            <PairingView bridge={bridge} />
+            <PairingView bridge={bridge} hostRunning={hostRunning} />
           </section>
           <p className="text-caption text-text-secondary">POC work in progress · Not stage qualified. Network statistics cannot establish hearing safety or full-path audio latency.</p>
         </main>

@@ -16,6 +16,9 @@ fn main() {
             "set_available_sources",
             "set_source_label",
             "issue_pairing_credential",
+            "list_output_devices",
+            "start_monitor",
+            "stop_monitor",
         ])),
     )
     .expect("failed to run tauri-build");
