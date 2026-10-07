@@ -62,7 +62,7 @@ where
 }
 
 /// Commands sent from the owning thread to the runtime worker.
-enum RuntimeCommand {
+pub(crate) enum RuntimeCommand {
     SetMix {
         slot: usize,
         session: SessionEpoch,
@@ -77,12 +77,43 @@ enum RuntimeCommand {
     },
 }
 
+/// A cloneable handle for sending mix changes into the DSP worker.
+///
+/// The bridge from the control plane to the DSP holds one of these instead of the whole
+/// [`HostRuntime`], so control changes can arrive from the server thread while the runtime stays
+/// owned by the host composition.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    commands: mpsc::Sender<RuntimeCommand>,
+}
+
+impl RuntimeHandle {
+    /// Register (or replace) a listener slot's session and mix.
+    pub fn set_mix(&self, slot: usize, session: SessionEpoch, mix: MixSnapshot) {
+        let _ = self.commands.send(RuntimeCommand::SetMix {
+            slot,
+            session,
+            mix,
+        });
+    }
+
+    /// Update only the mix for an already-registered slot.
+    pub fn update_mix(&self, slot: usize, mix: MixSnapshot) {
+        let _ = self.commands.send(RuntimeCommand::UpdateMix { slot, mix });
+    }
+
+    /// Remove a listener slot.
+    pub fn clear_listener(&self, slot: usize) {
+        let _ = self.commands.send(RuntimeCommand::Clear { slot });
+    }
+}
+
 /// A running host: capture plus its DSP/encode worker.
 pub struct HostRuntime {
     stop: StopHandle,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    commands: mpsc::Sender<RuntimeCommand>,
+    handle: RuntimeHandle,
     telemetry: Arc<CaptureTelemetry>,
     sample_rate_hz: u32,
     configured_channels: u16,
@@ -183,30 +214,33 @@ impl HostRuntime {
             stop,
             stopped,
             worker: Some(worker),
-            commands: commands_tx,
+            handle: RuntimeHandle {
+                commands: commands_tx,
+            },
             telemetry,
             sample_rate_hz,
             configured_channels,
         })
     }
 
+    /// A cloneable handle for driving mix changes from another thread (e.g. the control plane).
+    pub fn handle(&self) -> RuntimeHandle {
+        self.handle.clone()
+    }
+
     /// Register (or replace) the mix and session for a listener slot.
     pub fn set_mix(&self, slot: usize, session: SessionEpoch, mix: MixSnapshot) {
-        let _ = self.commands.send(RuntimeCommand::SetMix {
-            slot,
-            session,
-            mix,
-        });
+        self.handle.set_mix(slot, session, mix);
     }
 
     /// Update only the mix for an already-registered slot (gain/mute changes).
     pub fn update_mix(&self, slot: usize, mix: MixSnapshot) {
-        let _ = self.commands.send(RuntimeCommand::UpdateMix { slot, mix });
+        self.handle.update_mix(slot, mix);
     }
 
     /// Remove a listener slot.
     pub fn clear_listener(&self, slot: usize) {
-        let _ = self.commands.send(RuntimeCommand::Clear { slot });
+        self.handle.clear_listener(slot);
     }
 
     /// The capture rate in use.
