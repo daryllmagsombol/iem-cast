@@ -1,21 +1,62 @@
 # IEM Cast
 
-**Status: POC implemented — not stage validated.**
+**Status: prototype in progress — UI preview available; live casting is not wired end to end.**
 
-IEM Cast is a live-performance in-ear monitor (IEM) system for bands and musicians.
-It takes multichannel audio from a Soundcraft Signature 22 MTK connected
+IEM Cast is a prototype for a live-performance in-ear monitor (IEM) system for bands and musicians.
+The intended path takes multichannel audio from a Soundcraft Signature 22 MTK connected
 by USB to a Rust desktop host, mixes personal monitor feeds on that host, and delivers one
 independent stereo stream per musician over a local network to a phone browser. It is
 audio only; video is out of scope.
 
-The reusable macOS POC is built: a Rust `host-core` (capture, DSP, Opus, control/safety,
-HTTPS/WSS, WebRTC transport), a minimal Tauri operator shell, and React + TypeScript + Tailwind
-admin/musician interfaces. **Real-hardware qualification has not been performed** — no real
-mixer, phones, or electrical latency measurement yet. Automated checks are software evidence
-only. See [the qualification record](docs/qualification/macos-poc.md).
+The repository contains Rust `host-core` building blocks (capture, DSP, Opus, control/safety,
+HTTPS/WSS, WebRTC transport), a Tauri operator shell, and React + TypeScript + Tailwind
+interfaces. These do **not yet form a working live-casting application**. Native host startup,
+secure pairing, source-setting persistence, monitor IPC, and the live phone connection remain
+incomplete; the UI marks unsupported actions unavailable rather than reporting success.
+**Real-hardware qualification has not been performed.** Rendering a screen or passing unit tests
+does not prove that mixer audio reaches a phone. See [the qualification record](docs/qualification/macos-poc.md).
 
 **Project site:** <https://daryllmagsombol.github.io/iem-cast/> — documentation plus a clearly
 labeled silent, simulated mix demo (no host connection, no audio).
+
+## Run the UI
+
+From the repository root, with Node.js 24.15 or newer:
+
+```bash
+npm ci
+npm run dev:admin --workspace apps/web
+```
+
+Open the address Vite prints (normally <http://127.0.0.1:5173/>). The operator dashboard shows
+setup values and current build limitations. Choose **Open simulated preview** to try fictional
+device selection and mix controls. Preview mode is silent, uses in-memory fixtures, and never
+connects to hardware or a host.
+
+For the native operator window, with Rust and the macOS development prerequisites installed,
+run these in two terminals:
+
+```bash
+# Terminal 1: keep the admin development server running
+npm run dev:admin --workspace apps/web
+```
+
+```bash
+# Terminal 2: build the web assets and launch the Tauri window
+npm run dev:desktop
+```
+
+The desktop context can enumerate devices through IPC. It does not make the disabled live-casting
+features operational. The standalone browser view has no native device access.
+
+To run the public documentation/demo site locally:
+
+```bash
+npm run build:site --workspace apps/web
+npm run preview:site --workspace apps/web
+```
+
+Open <http://127.0.0.1:4173/iem-cast/>. This is a separate silent demo, not a hosted audio server.
 
 ## Documentation
 
@@ -209,5 +250,5 @@ unverified workflow versions are avoided.
 - MDN `AudioWorklet`: <https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet>
 - RFC 7874 (Opus interoperability): <https://www.rfc-editor.org/rfc/rfc7874.html>
 
-_This document is planning and roadmap material. It does not describe implemented product
-code, and no tests, builds, or hardware qualification have been performed._
+_This document describes the intended architecture and the prototype's current limits. Software
+checks have been run; real-device playback, electrical latency, and stage qualification remain unverified._

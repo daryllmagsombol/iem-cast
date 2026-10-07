@@ -15,6 +15,7 @@
     "preview:site": "vite preview --config vite.site.config.ts --port 4173 --strictPort"
   },
   "dependencies": {
+    "@tauri-apps/api": "2.12.1",
     "qrcode.react": "4.2.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"

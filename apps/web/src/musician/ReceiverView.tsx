@@ -1,166 +1,192 @@
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { ListenerPhase, SourceInfo } from '../protocol';
 import type { DiagnosticsSnapshot } from '../receiver-ports';
 import { Button } from '../ui/Button';
 import { ChannelStrip, type ChannelStripState } from '../ui/ChannelStrip';
 import { LatencyDiagnostics } from '../ui/LatencyDiagnostics';
-import { Notice } from '../ui/Notice';
-import { StatusBadge } from '../ui/StatusBadge';
-import { Toggle } from '../ui/Toggle';
+import { GainControl } from '../ui/GainControl';
+import { ThemeChoice } from '../ui/ThemeChoice';
 
 export interface ReceiverViewProps {
   phase: ListenerPhase;
   catalog: SourceInfo[];
   channels: ChannelStripState[];
   masterRequestedDb: number;
-  masterAppliedDb: number;
+  masterAppliedDb?: number;
   masterMuted: boolean;
-  /** Local master mute; acts immediately without confirmation. */
+  masterPending?: boolean;
   onMasterMuteChange(muted: boolean): void;
   onMasterGainChange(db: number): void;
   onChannelGainChange(sourceId: string, db: number): void;
   onChannelMuteChange(sourceId: string, muted: boolean): void;
   onStop(): void;
+  onStart?(): void;
+  onPrepare?(): void;
+  starting?: boolean;
+  hasSources?: boolean;
   diagnostics: DiagnosticsSnapshot;
-  /** Meter values keyed by sourceId, in dBFS. Missing entries render Unavailable. */
   meters: Record<string, number | undefined>;
   error: string | null;
   wakeLockWarning: string | null;
 }
 
-export function ReceiverView({
-  phase,
-  catalog,
-  channels,
-  masterRequestedDb,
-  masterAppliedDb,
-  masterMuted,
-  onMasterMuteChange,
-  onMasterGainChange,
-  onChannelGainChange,
-  onChannelMuteChange,
-  onStop,
-  diagnostics,
-  meters,
-  error,
-  wakeLockWarning,
-}: ReceiverViewProps) {
+export function ReceiverView(props: ReceiverViewProps) {
+  const {
+    phase,
+    catalog,
+    channels,
+    masterRequestedDb,
+    masterAppliedDb,
+    masterMuted,
+    onMasterMuteChange,
+    onMasterGainChange,
+    onStop,
+    diagnostics,
+    error,
+  } = props;
   const armed = phase === 'armed';
-  const availableIds = new Set(catalog.filter((source) => source.available).map((source) => source.sourceId));
+  const editable = armed || phase === 'ready-muted';
+  const dock = useRef<HTMLDivElement>(null);
+  const [clearance, setClearance] = useState(160);
+  useLayoutEffect(() => {
+    if (!dock.current || typeof ResizeObserver === 'undefined') return;
+    const measure = () => {
+      const height = dock.current?.getBoundingClientRect().height ?? 160;
+      setClearance(height);
+      document.documentElement.style.setProperty('--iem-dock-clearance', `${height}px`);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(dock.current);
+    return () => {
+      observer.disconnect();
+      document.documentElement.style.removeProperty('--iem-dock-clearance');
+    };
+  }, []);
 
   return (
     <div
-      className="mx-auto flex w-full max-w-xl flex-col gap-6 px-3 sm:px-4"
-      style={{
-        paddingTop: 'calc(var(--iem-safe-top) + var(--iem-space-5))',
-        paddingBottom: 'calc(var(--iem-size-target) * 2 + var(--iem-safe-bottom) + var(--iem-space-5))',
+      className="iem-receiver"
+      style={{ paddingBottom: `calc(${clearance}px + var(--iem-space-5))` }}
+      onFocusCapture={event => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || dock.current?.contains(target)) return;
+        const details = dock.current?.querySelector('details');
+        if (details?.open && window.innerHeight < 480) details.open = false;
+        requestAnimationFrame(() => {
+          const bottom = target.getBoundingClientRect().bottom;
+          const top = dock.current?.getBoundingClientRect().top ?? window.innerHeight;
+          if (bottom > top - 16) window.scrollBy(0, bottom - top + 16);
+        });
       }}
     >
-      <header className="flex flex-col gap-2">
-        <h1 className="text-title text-text">Personal monitor</h1>
-        <StatusBadge tone={armed ? 'success' : 'warning'}>
-          {armed ? 'Listening' : 'Connected \u00b7 Not listening'}
-        </StatusBadge>
-        <p className="text-body text-text-secondary">Keep this page visible and the screen on.</p>
+      <header className="iem-row">
+        <div>
+          <p className="text-caption text-text-secondary">IEM Cast · Personal mix</p>
+          <h1 className="text-title">Personal monitor</h1>
+          <span className="iem-environment">Browser receiver</span>
+        </div>
+        <ThemeChoice />
       </header>
-
-      {error ? (
-        <Notice tone="error" title="Connection lost \u00b7 Output silenced" live="alert">
-          <p>{error}</p>
-        </Notice>
-      ) : null}
-
-      {wakeLockWarning ? (
-        <Notice tone="warning" title="Screen wake lock unavailable">
-          <p>{wakeLockWarning}</p>
-        </Notice>
-      ) : null}
-
-      <section aria-labelledby="channels-heading" className="flex flex-col gap-4">
-        <h2 id="channels-heading" className="text-section text-text">
-          Channels
-        </h2>
-        {channels.length === 0 ? (
-          <Notice tone="empty" title="No channels assigned">
-            <p>Your personal mix has no channels yet. Ask the operator to authorize a source.</p>
-          </Notice>
-        ) : (
-          <ul className="flex list-none flex-col gap-4 p-0">
-            {channels.map((channel) => (
-              <li key={channel.sourceId}>
-                <ChannelStrip
-                  state={channel}
-                  linkLabel={linkLabelFor(catalog, channel.sourceId)}
-                  meterValueDbfs={meters[channel.sourceId]}
-                  onGainChange={(db) => onChannelGainChange(channel.sourceId, db)}
-                  onMuteChange={(muted) => onChannelMuteChange(channel.sourceId, muted)}
-                />
-                {!availableIds.has(channel.sourceId) ? (
-                  <p className="mt-1 text-caption text-warning">
-                    This source is currently unavailable on the host.
-                  </p>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        )}
+      <p role="status" className="iem-hint">
+        {armed
+          ? (masterMuted ? 'Session armed · Personal output muted' : 'Listening')
+          : phase === 'interrupted'
+            ? 'Connection interrupted · Not listening'
+            : 'Connected · Not listening'}
+      </p>
+      <p className="text-caption text-text-secondary">Keep this page visible and the screen on. Wired earphones only.</p>
+      {error && (
+        <p role="alert" className="iem-hint text-danger">
+          {error} · Listening state must be checked before restarting.
+        </p>
+      )}
+      {props.wakeLockWarning && (
+        <p className="iem-hint text-warning">{props.wakeLockWarning}</p>
+      )}
+      {phase === 'interrupted' && (
+        <Button
+          onClick={props.onPrepare}
+          pending={props.starting}
+          disabled={!props.onPrepare}
+        >
+          Prepare connection
+        </Button>
+      )}
+      {!armed && (
+        <Button
+          variant="primary"
+          pending={props.starting}
+          disabled={!props.hasSources || !props.onStart || phase !== 'ready-muted'}
+          explanation={
+            !props.hasSources
+              ? 'An available source and synchronized mix are required.'
+              : phase === 'interrupted'
+                ? 'Prepare the connection again before listening.'
+                : undefined
+          }
+          onClick={props.onStart}
+        >
+          Start listening
+        </Button>
+      )}
+      <section className="iem-stack" aria-labelledby="channels-heading">
+        <h2 id="channels-heading" className="text-section">Channels</h2>
+        {!channels.length && <p className="iem-hint">No channels assigned</p>}
+        {channels.map(channel => {
+          const source = catalog.find(s => s.sourceId === channel.sourceId);
+          const unavailable = !source?.available || !source.authorized;
+          return (
+            <div key={channel.sourceId}>
+              <ChannelStrip
+                state={channel}
+                disabled={!editable || unavailable}
+                canUnmute={armed}
+                linkLabel={source?.stereoPair ? 'Linked stereo pair' : 'Mono source, centered'}
+                meterValueDbfs={props.meters[channel.sourceId]}
+                onGainChange={db => props.onChannelGainChange(channel.sourceId, db)}
+                onMuteChange={m => props.onChannelMuteChange(channel.sourceId, m)}
+              />
+              {unavailable && (
+                <p className="text-warning">Source unavailable — edits disabled.</p>
+              )}
+            </div>
+          );
+        })}
       </section>
-
       <LatencyDiagnostics snapshot={diagnostics} />
-
-      {/* Master dock: immediate local mute and Stop listening. */}
-      <div
-        className="sticky bottom-0 z-10 -mx-3 mt-2 border-t border-boundary bg-surface px-3 sm:-mx-4 sm:px-4"
-        style={{ paddingBottom: 'calc(var(--iem-safe-bottom) + var(--iem-space-3))' }}
-      >
-        <div className="flex flex-col gap-3 pt-3">
-          <div className="flex items-center justify-between gap-3">
-            <label htmlFor="master-attenuation" className="text-label text-text">
-              Master
-            </label>
-            <span className="font-mono text-readout tabular-nums text-text">
-              {masterMuted ? 'Muted (\u2212\u221E dB)' : `${Math.round(masterRequestedDb)} dB`}
+      <div ref={dock} className="iem-master-dock">
+        <div className="iem-dock-inner">
+          <div className="iem-row">
+            <strong className="text-label">Master</strong>
+            <span className="font-mono text-caption">
+              {masterMuted ? 'Muted (−∞ dB)' : `${masterRequestedDb} dB`}
             </span>
           </div>
-          <input
-            id="master-attenuation"
-            type="range"
-            className="h-2 w-full cursor-pointer accent-accent"
-            min={-60}
-            max={0}
-            step={1}
-            value={Math.min(0, Math.max(-60, masterRequestedDb))}
-            onChange={(event) => onMasterGainChange(Number(event.target.value))}
-            aria-valuetext={`Personal master, ${
-              masterRequestedDb < 0 ? `minus ${Math.abs(Math.round(masterRequestedDb))} decibels` : '0 decibels'
-            }`}
-          />
-          <p className="font-mono text-caption tabular-nums text-text-secondary">
-            {masterRequestedDb !== masterAppliedDb
-              ? `Requested ${Math.round(masterRequestedDb)} dB \u00b7 Pending`
-              : `Applied ${Math.round(masterAppliedDb)} dB`}
-          </p>
-          <Toggle
-            label="Personal master mute"
-            checked={masterMuted}
-            onChange={onMasterMuteChange}
-            onLabel="Muted"
-            offLabel="Not muted"
-          />
-          <Button variant="destructive" onClick={onStop} disabled={phase === 'unpaired' || phase === 'revoked'}>
-            Stop listening
-          </Button>
+          <div className="iem-dock-actions">
+            <Button
+              onClick={() => onMasterMuteChange(!masterMuted)}
+              disabled={masterMuted && !armed}
+            >
+              {masterMuted ? 'Unmute personal output' : 'Mute personal output'}
+            </Button>
+            <Button variant="destructive" onClick={onStop}>Stop listening</Button>
+          </div>
+          <details className="iem-master-details">
+            <summary>Master attenuation & details</summary>
+            <GainControl
+              label="Personal Master attenuation"
+              valueDb={masterRequestedDb}
+              onChange={onMasterGainChange}
+              muted={masterMuted}
+              disabled={!editable}
+            />
+            <p className="text-caption">
+              {masterAppliedDb === undefined ? 'Not applied' : `Applied ${masterAppliedDb} dB`}{props.masterPending ? ' · Pending' : ''}
+            </p>
+          </details>
         </div>
       </div>
     </div>
   );
-}
-
-function linkLabelFor(catalog: SourceInfo[], sourceId: string): string | undefined {
-  const entry = catalog.find((source) => source.sourceId === sourceId);
-  if (!entry) return undefined;
-  if (entry.stereoPair) {
-    const pair = catalog.find((source) => source.sourceId === entry.stereoPair);
-    return `Linked stereo pair with ${pair?.label ?? 'paired channel'}`;
-  }
-  return 'Mono source, centered';
 }

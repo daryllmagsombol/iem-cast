@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { SourcesView } from '../SourcesView';
 import type { SourceInfo } from '../../protocol';
 import type { HostBridge } from '../../desktop-bridge/contracts';
@@ -30,10 +30,17 @@ function bridgeWith(list: SourceInfo[]): HostBridge {
   } as unknown as HostBridge;
 }
 
-test('sources_view_lists_published_channels_with_stable_identity', async () => {
-  render(<SourcesView bridge={bridgeWith(sources)} />);
-  expect(await screen.findByDisplayValue('Lead vocal')).toBeInTheDocument();
-  expect(screen.getByLabelText(/^label$/i)).toBeInTheDocument();
+test('synthetic_catalog_is_not_presented_as_verified_sources_and_mutations_are_disabled', () => {
+  const bridge = bridgeWith(sources);
+  bridge.sourceCatalog = vi.fn(); bridge.setAvailableSources = vi.fn(); bridge.setSourceLabel = vi.fn();
+  render(<SourcesView bridge={bridge} />);
+  expect(screen.queryByDisplayValue('Lead vocal')).not.toBeInTheDocument();
+  const save = screen.getByRole('button', { name: 'Save label' });
+  const publish = screen.getByRole('button', { name: 'Publish sources' });
+  expect(save).toBeDisabled(); expect(publish).toBeDisabled();
+  fireEvent.click(save); fireEvent.click(publish);
+  expect(bridge.sourceCatalog).not.toHaveBeenCalled();
+  expect(bridge.setAvailableSources).not.toHaveBeenCalled(); expect(bridge.setSourceLabel).not.toHaveBeenCalled();
 });
 
 test('sources_view_shows_empty_guidance_without_sources', async () => {

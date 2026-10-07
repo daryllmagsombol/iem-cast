@@ -55,7 +55,7 @@ test('receiver_keeps_master_stop_available_while_listening', () => {
   expect(screen.getByRole('button', { name: /stop listening/i })).toBeEnabled();
 });
 
-test('disconnected_state_is_announced_as_output_silenced_alert', () => {
+test('disconnection_error_is_visible_without_an_unconfirmed_silence_claim', () => {
   render(
     <ReceiverView
       phase="interrupted"
@@ -75,7 +75,8 @@ test('disconnected_state_is_announced_as_output_silenced_alert', () => {
       wakeLockWarning={null}
     />,
   );
-  expect(screen.getByRole('alert')).toHaveTextContent(/output silenced/i);
+  expect(screen.getByRole('alert')).toHaveTextContent(/peer disconnected/i);
+  expect(screen.getByRole('alert')).not.toHaveTextContent(/output silenced/i);
 });
 
 test('missing_telemetry_meters_render_unavailable', () => {

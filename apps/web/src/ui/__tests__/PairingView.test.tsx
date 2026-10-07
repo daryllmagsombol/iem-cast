@@ -1,20 +1,16 @@
 import '@testing-library/jest-dom/vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, expect, test } from 'vitest';
 import { PairingView } from '../../admin/PairingView';
 import { fakeBridge } from './helpers';
-
-test('pairing_view_issues_a_fresh_single_use_credential_and_never_logs_it', async () => {
-  const bridge = fakeBridge({ joinUrl: 'https://host.local:8443/join#t=SECRET', expiresInSeconds: 120 });
+afterEach(cleanup);
+test('unsupported pairing never issues a placeholder credential or renders a fake QR', () => {
+  const bridge = fakeBridge({ joinUrl: 'https://host.local/#SECRET', expiresInSeconds: 120 });
   render(<PairingView bridge={bridge} />);
-  fireEvent.click(screen.getByRole('button', { name: /generate pairing/i }));
-  expect(await screen.findByText(/expires in 120 s/i)).toBeInTheDocument();
-  expect(bridge.issueCalls).toBe(1); // fresh credential per phone
-  expect(bridge.logged).not.toContain('SECRET'); // private token never written to logs
-});
-
-test('pairing_view_renders_a_qr_for_the_join_url', async () => {
-  const bridge = fakeBridge({ joinUrl: 'https://host.local:8443/join#t=ONCE', expiresInSeconds: 90 });
-  render(<PairingView bridge={bridge} />);
-  fireEvent.click(screen.getByRole('button', { name: /generate pairing/i }));
-  expect(await screen.findByLabelText(/pairing qr code/i)).toBeInTheDocument();
+  const button = screen.getByRole('button', { name: 'Generate pairing code' });
+  expect(button).toBeDisabled();
+  fireEvent.click(button);
+  expect(bridge.issueCalls).toBe(0);
+  expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  expect(screen.getByText('Pairing requires the host’s secure join service.')).toBeInTheDocument();
 });

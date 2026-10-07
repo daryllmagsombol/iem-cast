@@ -17,15 +17,28 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
+
 use crate::audio::engine::MAX_SESSIONS;
 use crate::capture::service::{CaptureBackend, SystemCaptureBackend};
 use crate::contract::{
-    CaptureFault, ChannelMapEntry, ControlError, MixSnapshot, SourceRole, StartHostRequest,
+    AssetProvider, CaptureFault, CatalogSnapshot, ChannelMapEntry, Clock, ControlError, MixSnapshot,
+    SourceInfo, SourceRole, StartHostRequest, SystemClock,
 };
-use crate::ids::{AudioEpoch, ChannelMapRevision, SessionEpoch, SourceId};
+use crate::control::actor::ControlActor;
+use crate::control::auth::{OriginPolicy, OsEntropy};
+use crate::ids::{
+    AudioEpoch, CatalogRevision, ChannelMapRevision, HostEpoch, SessionEpoch, SourceId,
+};
 use crate::pipeline::ListenerOutput;
 use crate::runtime::{EncodedSink, HostRuntime};
 use crate::server::tls::TlsIdentity;
+use crate::server::HostServer;
 use crate::transport::{MediaHub, SelectedInterface};
 
 /// How long the pump sleeps when no datagram is ready before re-checking timers and the stop flag.
@@ -42,7 +55,7 @@ pub enum HostFault {
     /// The TLS identity is missing, unreadable, or invalid.
     #[error("tls: {0}")]
     Tls(#[from] ControlError),
-    /// The UDP media socket could not be bound or configured.
+    /// The media socket could not be bound or configured.
     #[error("media socket: {0}")]
     Socket(#[from] std::io::Error),
 }
@@ -252,6 +265,292 @@ impl HostSession {
 impl Drop for HostSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// A running HTTPS/WSS control server composed over a [`HostSession`].
+///
+/// This is the missing piece that turns the capture-only [`HostSession`] into something a phone can
+/// actually join: it builds the authoritative [`ControlActor`] with the session's DSP bridge,
+/// composes [`HostServer::with_media`] over the **same** [`MediaHub`], and serves the router over
+/// TLS on a dedicated background tokio runtime.
+///
+/// The server runs on its own single-threaded runtime thread so it does not depend on the caller
+/// having (or being inside) a tokio runtime and can be embedded in a synchronous Tauri command.
+/// [`stop`](Self::stop) performs a bounded graceful shutdown and joins that thread; dropping the
+/// handle also stops it.
+pub struct HostServerHandle {
+    addr: SocketAddr,
+    join_url: String,
+    handle: axum_server::Handle<SocketAddr>,
+    server_thread: Option<JoinHandle<()>>,
+}
+
+impl HostServerHandle {
+    /// The bound local address (useful when binding port 0).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The operator-facing join URL carrying the initial single-use pairing credential.
+    ///
+    /// The token in this URL expires after the pairing TTL (120 s); use the operator's
+    /// pairing-credential path for a fresh token after that.
+    pub fn join_url(&self) -> &str {
+        &self.join_url
+    }
+
+    /// Gracefully stop receiving, then join the server thread. Idempotent.
+    ///
+    /// A bounded grace period avoids hanging on a wedged connection; dropping the background
+    /// runtime (when the thread exits) cancels any remaining tasks.
+    pub fn stop(&mut self) {
+        self.handle.graceful_shutdown(Some(Duration::from_secs(1)));
+        if let Some(thread) = self.server_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for HostServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The composition inputs for [`HostSession::start_server`], so callers do not pass a long
+/// positional argument list.
+pub struct ServerConfig {
+    /// TLS certificate + key (used by [`HostSession::start_server`] to load the rustls config).
+    pub tls: TlsIdentity,
+    /// Address to bind the HTTPS listener on.
+    pub bind: SocketAddr,
+    /// Exact-match origin allowlist for the WS upgrade.
+    pub origin: OriginPolicy,
+    /// Embedded musician assets served from `/join`.
+    pub assets: Arc<dyn AssetProvider>,
+    /// The versioned source catalog the actor validates patches against.
+    pub catalog: CatalogSnapshot,
+}
+
+impl HostSession {
+    /// Start the HTTPS/WSS control server over this session. See [`HostServerHandle`].
+    ///
+    /// `bundle` provides the TLS identity, bind address, origin policy, assets, and catalog. Every
+    /// piece needed to accept a phone is derived here: the actor gets this session's
+    /// [`dsp_bridge`](Self::dsp_bridge), and the server shares this session's
+    /// [`media_hub`](Self::media_hub), so WS signaling reaches the live media sessions.
+    pub fn start_server(&self, bundle: ServerConfig) -> Result<HostServerHandle, HostFault> {
+        let config = load_rustls_config(&bundle.tls)?;
+        self.start_server_with_config(config, bundle)
+    }
+
+    /// Start the control server with an already-loaded [`RustlsConfig`].
+    ///
+    /// This is the testable seam: it does not require real certificate/key files on disk. The
+    /// production path is [`start_server`](Self::start_server), which loads the config from the
+    /// TLS identity's PEM paths.
+    pub fn start_server_with_config(
+        &self,
+        config: RustlsConfig,
+        bundle: ServerConfig,
+    ) -> Result<HostServerHandle, HostFault> {
+        let ServerConfig {
+            tls,
+            bind,
+            origin,
+            assets,
+            catalog,
+        } = bundle;
+        // `tls` paths are only needed to load `config`; `start_server` already validated them.
+        let _ = tls;
+
+        // Bind synchronously so `local_addr` is known before we compose the join URL, then hand the
+        // listener to the background runtime. `from_tcp_rustls` rejects a blocking listener, so
+        // clear the blocking flag first.
+        let listener = std::net::TcpListener::bind(bind).map_err(HostFault::Socket)?;
+        listener.set_nonblocking(true).map_err(HostFault::Socket)?;
+        let addr = listener.local_addr().map_err(HostFault::Socket)?;
+
+        let asset_provider = Arc::clone(&assets);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let host_epoch = HostEpoch(uuid::Uuid::new_v4());
+        let audio_epoch = self.audio_epoch;
+
+        let mut actor = ControlActor::new(
+            clock.clone(),
+            self.dsp_bridge(),
+            catalog,
+            host_epoch,
+            audio_epoch,
+        );
+        // Point the actor's pairing links at the real bound address, then mint the operator's first
+        // single-use credential so the returned join URL is immediately usable by a phone.
+        actor.set_join_base(format!("https://{addr}"));
+        let join_url = actor.issue_pairing_credential().join_url;
+
+        let plane = HostServer::with_media(
+            actor,
+            clock,
+            Arc::new(OsEntropy),
+            origin,
+            assets,
+            self.media_hub(),
+        );
+        // The control router serves `/join` but not the bundle's referenced `/assets/*` files.
+        // Compose the embedded assets as a fallback so the musician page actually loads in a
+        // browser; this wraps the router without changing any `server` internals.
+        let router = with_static_assets(plane.router(), asset_provider);
+
+        let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
+        let bind_handle = handle.clone();
+        let server = axum_server::from_tcp_rustls(listener, config).map_err(HostFault::Socket)?;
+        let serve = server.handle(bind_handle);
+
+        let server_thread = thread::Builder::new()
+            .name("iem-control-server".to_string())
+            .spawn(move || {
+                // A single-threaded runtime keeps the server independent of the caller's runtime.
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => return,
+                };
+                let _ = runtime.block_on(serve.serve(router.into_make_service()));
+            })
+            .map_err(HostFault::Socket)?;
+
+        Ok(HostServerHandle {
+            addr,
+            join_url,
+            handle,
+            server_thread: Some(server_thread),
+        })
+    }
+}
+
+/// Load a [`RustlsConfig`] from a TLS identity, surfacing a missing/invalid identity loudly.
+fn load_rustls_config(tls: &TlsIdentity) -> Result<RustlsConfig, HostFault> {
+    tls.validate_paths()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(HostFault::Socket)?;
+    Ok(runtime.block_on(tls.load())?)
+}
+
+/// The content type served for an embedded asset path.
+///
+/// Only a small, explicit allowlist of extensions is recognised; anything else falls back to
+/// `application/octet-stream` so an unknown path cannot be coerced into active content.
+fn asset_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Whether a requested path is a syntactically safe, single-segment asset key.
+///
+/// Rejects empty paths, `..` traversal, and any path containing a NUL or backslash. The asset
+/// provider is itself keyed by relative path, so this is defence in depth against a traversal key.
+fn is_safe_asset_path(raw: &str) -> bool {
+    let trimmed = raw.trim_start_matches('/');
+    !trimmed.is_empty()
+        && !trimmed.contains("..")
+        && !trimmed.contains('\0')
+        && !trimmed.contains('\\')
+}
+
+/// The canonical provider key for the wildcard remainder of `GET /assets/{*path}`.
+///
+/// The provider is keyed by bundle-relative paths (e.g. `assets/index-HASH.js`), but axum's
+/// wildcard extractor yields only the remainder after `/assets/` (e.g. `index-HASH.js`). Restoring
+/// the `/assets/` namespace keeps the lookup exact and stable against the provider's contract.
+///
+/// Returns `None` when the remainder is empty or would escape the namespace.
+fn canonical_asset_key(remainder: &str) -> Option<String> {
+    if remainder.is_empty() {
+        return None;
+    }
+    let key = format!("assets/{remainder}");
+    is_safe_asset_path(&key).then_some(key)
+}
+
+/// Serve one embedded asset by key, or a genuine `404` when it is absent.
+fn serve_asset(assets: &Arc<dyn AssetProvider>, path: &str) -> Response {
+    if !is_safe_asset_path(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match assets.get(path) {
+        Some(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, asset_content_type(path)),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn asset_handler(
+    State(assets): State<Arc<dyn AssetProvider>>,
+    Path(path): Path<String>,
+) -> Response {
+    match canonical_asset_key(&path) {
+        Some(key) => serve_asset(&assets, &key),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Wrap the control router so the musician bundle's referenced assets are actually served.
+///
+/// The control router owns `/join`, pairing, and the WS socket; embedding it here as a fallback
+/// keeps every existing route and its authorization untouched. Only `GET /assets/{*path}` is added,
+/// and an absent asset is a real `404`, never a fabricated success. This wraps the router instead of
+/// editing `server` internals.
+fn with_static_assets(router: Router, assets: Arc<dyn AssetProvider>) -> Router {
+    let static_routes = Router::new()
+        .route("/assets/{*path}", get(asset_handler))
+        .with_state(assets);
+    static_routes.fallback_service(router)
+}
+
+/// Build a draft catalog directly from a channel map (used by the standalone `serve` binary).
+pub fn catalog_from_channel_map(
+    channel_map: &[ChannelMapEntry],
+    revision: CatalogRevision,
+) -> CatalogSnapshot {
+    let sources = channel_map
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| SourceInfo {
+            source_id: entry.source_id,
+            physical_index: entry.physical_index,
+            label: format!("Channel {}", index + 1),
+            role: entry.role,
+            authorized: true,
+            available: true,
+            stereo_pair: entry.stereo_pair,
+        })
+        .collect();
+    CatalogSnapshot {
+        catalog_revision: revision,
+        sources,
     }
 }
 
@@ -575,5 +874,104 @@ mod tests {
 
         // Disarm is priority and must not panic.
         crate::contract::DspControl::disarm(&*bridge, session, crate::ids::SafetyGeneration(2));
+    }
+
+    /// A minimal asset provider with one real asset and no entry for unknown paths.
+    struct OneAsset;
+
+    impl AssetProvider for OneAsset {
+        fn get(&self, path: &str) -> Option<&'static [u8]> {
+            match path {
+                "assets/app.js" | "/assets/app.js" => Some(b"console.log(1);".as_slice()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn asset_route_serves_a_present_asset_and_404s_an_absent_one() {
+        let provider: Arc<dyn AssetProvider> = Arc::new(OneAsset);
+
+        let present = serve_asset(&provider, "assets/app.js");
+        assert_eq!(present.status(), StatusCode::OK);
+
+        // An absent asset is a real 404, never a fabricated success.
+        let absent = serve_asset(&provider, "assets/missing.js");
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn asset_path_traversal_and_unknown_extensions_are_rejected() {
+        assert!(!is_safe_asset_path("assets/../../etc/passwd"));
+        assert!(!is_safe_asset_path(""));
+        assert!(!is_safe_asset_path("assets\\secret"));
+        assert!(is_safe_asset_path("/assets/app.js"));
+
+        // An unknown extension still yields a defined, inert content type rather than active HTML.
+        assert_eq!(
+            asset_content_type("assets/thing.bin"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            asset_content_type("assets/app.js"),
+            "text/javascript; charset=utf-8"
+        );
+    }
+
+    /// The router composition must compile and be constructible (it is the wire-in used by
+    /// `start_server`), without asserting any server-start behavior.
+    #[test]
+    fn static_asset_router_composes_without_panicking() {
+        let _router = with_static_assets(Router::new(), Arc::new(OneAsset));
+    }
+
+    /// A provider that serves **only** the canonical namespace key `assets/app.js`, mirroring
+    /// `EmbeddedMusicianAssets`, which strips a leading slash but keeps the `assets/` prefix.
+    struct CanonicalOnlyAsset;
+
+    impl AssetProvider for CanonicalOnlyAsset {
+        fn get(&self, path: &str) -> Option<&'static [u8]> {
+            (path == "assets/app.js").then_some(b"console.log(1);".as_slice())
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn asset_handler_serves_the_canonical_namespace_key_with_js_mime() {
+        let provider: Arc<dyn AssetProvider> = Arc::new(CanonicalOnlyAsset);
+
+        // `Path` for `GET /assets/app.js` on route `/assets/{*path}` extracts the wildcard
+        // remainder exactly: `app.js` (no leading `assets/`). The handler must still resolve the
+        // canonical provider key `assets/app.js`.
+        let response = block_on(asset_handler(State(provider.clone()), Path("app.js".to_string())));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        let body = block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .expect("read body");
+        assert_eq!(&body[..], b"console.log(1);");
+
+        // A missing canonical asset is a real 404.
+        let absent = block_on(asset_handler(State(provider.clone()), Path("missing.js".to_string())));
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        // Traversal in the wildcard remainder is still rejected.
+        let traversal = block_on(asset_handler(
+            State(provider),
+            Path("../etc/passwd".to_string()),
+        ));
+        assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
     }
 }

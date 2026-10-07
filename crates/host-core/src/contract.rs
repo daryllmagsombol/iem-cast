@@ -879,6 +879,19 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
+/// Production [`Clock`] backed by the monotonic system clock.
+///
+/// This is the real composition's time source; tests inject a [`Clock`] double instead so time is
+/// fully controlled.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// Randomness source; failure is explicit.
 pub trait Entropy: Send + Sync {
     fn fill(&self, buf: &mut [u8]) -> Result<(), EntropyError>;

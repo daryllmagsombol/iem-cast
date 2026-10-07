@@ -9,6 +9,7 @@ export interface GainControlProps {
   onChange(db: number): void;
   /** Adds a visible SIMULATED badge to the readout. Only the Pages demo sets this. */
   simulated?: boolean;
+  disabled?: boolean;
 }
 
 function formatDbPhrase(db: number): string {
@@ -35,6 +36,7 @@ export function GainControl({
   muted = false,
   onChange,
   simulated = false,
+  disabled = false,
 }: GainControlProps) {
   const rangeId = useId();
   const numberId = useId();
@@ -81,7 +83,7 @@ export function GainControl({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-baseline justify-between gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
         <label htmlFor={rangeId} className="text-label text-text">
           {label}
         </label>
@@ -94,9 +96,9 @@ export function GainControl({
       <div className="flex min-h-target items-center gap-2">
         <button
           type="button"
-          className="inline-flex min-h-target-compact min-w-target-compact items-center justify-center rounded-control border border-boundary bg-surface text-text transition-colors duration-100 hover:bg-surface-raised"
+          className="inline-flex min-h-target min-w-target items-center justify-center rounded-control border border-boundary bg-surface text-text transition-colors duration-100 hover:bg-surface-raised"
           onClick={() => commit(boundedValue - step)}
-          disabled={boundedValue <= minDb}
+          disabled={disabled || boundedValue <= minDb}
           aria-label={`Decrease ${label} gain`}
         >
           <span aria-hidden="true">&minus;</span>
@@ -104,7 +106,8 @@ export function GainControl({
         <input
           id={rangeId}
           type="range"
-          className="h-2 flex-1 cursor-pointer accent-accent disabled:cursor-not-allowed"
+          className="iem-range min-w-0 flex-1 cursor-pointer accent-accent disabled:cursor-not-allowed"
+          disabled={disabled}
           min={minDb}
           max={maxDb}
           step={step}
@@ -114,9 +117,9 @@ export function GainControl({
         />
         <button
           type="button"
-          className="inline-flex min-h-target-compact min-w-target-compact items-center justify-center rounded-control border border-boundary bg-surface text-text transition-colors duration-100 hover:bg-surface-raised"
+          className="inline-flex min-h-target min-w-target items-center justify-center rounded-control border border-boundary bg-surface text-text transition-colors duration-100 hover:bg-surface-raised"
           onClick={() => commit(boundedValue + step)}
-          disabled={boundedValue >= maxDb}
+          disabled={disabled || boundedValue >= maxDb}
           aria-label={`Increase ${label} gain`}
         >
           <span aria-hidden="true">+</span>
@@ -131,7 +134,8 @@ export function GainControl({
           id={numberId}
           type="number"
           inputMode="numeric"
-          className="min-h-target-compact w-24 rounded-control border border-boundary bg-surface-raised px-2 font-mono text-readout tabular-nums text-text"
+          className="min-h-target w-24 rounded-control border border-boundary bg-surface-raised px-2 font-mono text-readout tabular-nums text-text"
+          disabled={disabled}
           min={minDb}
           max={maxDb}
           step={step}

@@ -31,7 +31,7 @@ test('device_without_reported_48k_is_rejected_in_the_ui', async () => {
   };
   render(<DeviceView bridge={bridgeWith([device])} />);
   expect(await screen.findByText(/48 khz not reported/i)).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: /use this device/i })).toBeDisabled();
+  expect(screen.getByRole('button', { name: /select device/i })).toBeDisabled();
 });
 
 test('device_over_24_channels_is_rejected_not_trimmed', async () => {
@@ -46,8 +46,8 @@ test('device_over_24_channels_is_rejected_not_trimmed', async () => {
     bufferMaxFrames: 1024,
   };
   render(<DeviceView bridge={bridgeWith([device])} />);
-  expect(await screen.findByText(/more than 24 input channels/i)).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: /use this device/i })).toBeDisabled();
+  expect(await screen.findByText('This device reports more than 24 input channels and cannot be used for the POC.')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /select device/i })).toBeDisabled();
 });
 
 test('empty_device_list_shows_guidance', async () => {

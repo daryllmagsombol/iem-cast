@@ -58,6 +58,7 @@ export function JoinView({
     <div className="mx-auto flex w-full max-w-xl flex-col gap-5 px-3 py-5 sm:px-4">
       <header className="flex flex-col gap-2">
         <h1 className="text-title text-text">Personal monitor</h1>
+        <span className="iem-environment">Browser receiver</span>
         <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
         <p className="text-body text-text-secondary">
           Keep this page visible and the screen on. Wired earphones only.
@@ -113,10 +114,10 @@ export function JoinView({
           </Button>
         ) : (
           <Button variant="secondary" onClick={onStartListening} pending={busy}>
-            {busy ? 'Connecting' : 'Connect'}
+            {busy ? 'Connecting' : 'Prepare connection'}
           </Button>
         )}
-        <Button variant="secondary" onClick={onCancel} disabled={busy}>
+        <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
       </div>

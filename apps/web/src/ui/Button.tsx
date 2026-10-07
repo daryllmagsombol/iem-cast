@@ -40,6 +40,7 @@ export function Button({
 }: ButtonProps) {
   const explanationId = useId();
   const isDisabled = disabled || pending;
+  const unavailable = disabled && !pending;
 
   const classes = [
     'inline-flex items-center justify-center gap-2 rounded-control border text-label',
@@ -47,6 +48,7 @@ export function Button({
     'disabled:cursor-not-allowed disabled:border-boundary disabled:bg-surface disabled:text-text-secondary',
     VARIANT_CLASSES[variant],
     SIZE_CLASSES[size],
+    unavailable ? 'iem-button-unavailable' : '',
     className ?? '',
   ]
     .filter(Boolean)
@@ -65,6 +67,7 @@ export function Button({
         {children}
         {pending ? <span className="font-normal">Pending</span> : null}
       </button>
+      {unavailable ? <span className="iem-unavailable-badge">Unavailable</span> : null}
       {explanation ? (
         <span id={explanationId} className="text-caption text-text-secondary">
           {explanation}

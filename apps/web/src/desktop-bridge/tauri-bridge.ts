@@ -31,6 +31,10 @@ interface RawDeviceInfo {
   name: string;
   isDefault: boolean;
   inputChannels: number;
+  /**
+   * Rust `Debug` rendering of `Option<SampleFormat>` (e.g. `"Some(F32)"`, `"None"`), because the
+   * command formats `format!("{:?}", sample_formats.first())`.
+   */
   sampleFormat: string;
   sampleRateHz: number | null;
 }
@@ -39,7 +43,9 @@ interface RawSourceInfo {
   sourceId: string;
   physicalIndex: number;
   label: string;
+  /** Physical presence reported by the capture backend. */
   available: boolean;
+  /** Operator cast flag: whether the source is published to musicians. */
   availableToMusicians: boolean;
 }
 
@@ -54,8 +60,50 @@ interface RawStartHostResult {
   joinUrl: string;
 }
 
+/**
+ * An IPC failure carrying the host's stable code and human-readable message. Wrapping preserves
+ * both instead of collapsing a typed host error into a bare `Error` or a missing response.
+ */
+export class IpcInvokeError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'IpcInvokeError';
+    this.code = code;
+  }
+}
+
+function isIpcErrorShape(value: unknown): value is { code: string; message: string } {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { code?: unknown; message?: unknown };
+  return typeof candidate.code === 'string' && typeof candidate.message === 'string';
+}
+
+/** Invoke a command, preserving typed host errors and rethrowing everything else unchanged. */
+async function callInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    if (isIpcErrorShape(error)) {
+      throw new IpcInvokeError(error.code, error.message);
+    }
+    throw error;
+  }
+}
+
+const KNOWN_SAMPLE_FORMATS: ReadonlySet<string> = new Set<SampleFormat>(['F32', 'I16', 'U16']);
+
+/**
+ * Decode the Rust `Debug` `sampleFormat` string into at most one contract sample format.
+ *
+ * The host sends `Some(F32)`/`None` (Rust `Debug` of `Option<SampleFormat>`), not the wire enum
+ * name. Only a known enum variant — bare or wrapped in `Some(...)` — is accepted; anything else
+ * (`None`, `Some(I24)`, an unknown variant) yields no formats rather than an invented one.
+ */
 function toSampleFormats(raw: string): SampleFormat[] {
-  return raw === 'F32' || raw === 'I16' || raw === 'U16' ? [raw] : [];
+  const inner = raw.startsWith('Some(') && raw.endsWith(')') ? raw.slice('Some('.length, -1) : raw;
+  return KNOWN_SAMPLE_FORMATS.has(inner) ? [inner as SampleFormat] : [];
 }
 
 function toDevice(raw: RawDeviceInfo): DeviceInfo {
@@ -72,21 +120,34 @@ function toDevice(raw: RawDeviceInfo): DeviceInfo {
   };
 }
 
+/**
+ * Map the reduced bridge source onto the full contract source.
+ *
+ * The Rust bridge omits `role`, `authorized`, and `stereoPair`; it reports physical presence
+ * (`available`) and the operator cast flag (`availableToMusicians`). We do not invent the omitted
+ * fields: `available` reflects the physical flag AND the cast flag, and authorization is the
+ * explicit cast flag only (conservative — never assumed from physical presence). Role and stereo
+ * pairing are not inferred from hardware, so they keep the contract defaults.
+ */
 function toSource(raw: RawSourceInfo): SourceInfo {
+  const castEnabled = raw.availableToMusicians === true;
   return {
     sourceId: raw.sourceId,
     physicalIndex: raw.physicalIndex,
     label: raw.label,
-    // The bridge reports availability only. Role/authorization are derived from the catalog:
-    // every listed source is an operator-authorized input channel.
     role: 'inputChannel',
-    authorized: true,
-    available: raw.available,
+    authorized: castEnabled,
+    available: raw.available === true && castEnabled,
     stereoPair: null,
   };
 }
 
 function toCatalog(raw: RawCatalogSnapshot): CatalogSnapshot {
+  // Unwrap the Rust `CatalogSnapshot.sources` exactly. A response without a real array is a host
+  // contract violation, not an empty catalog: never substitute `[]`.
+  if (typeof raw !== 'object' || raw === null || !Array.isArray(raw.sources)) {
+    throw new Error('source catalog response is missing a sources array');
+  }
   return {
     catalogRevision: raw.catalogRevision as CounterString,
     sources: raw.sources.map(toSource),
@@ -108,17 +169,19 @@ export function createTauriHostBridge(): HostBridge {
 
   return {
     async listDevices() {
-      const raw = await invoke<RawDeviceInfo[]>('list_devices', { windowLabel: label });
+      const raw = await callInvoke<RawDeviceInfo[]>('list_devices', { windowLabel: label });
       return raw.map(toDevice);
     },
 
     async listInterfaces() {
-      return invoke<InterfaceInfo[]>('list_interfaces', { windowLabel: label });
+      return callInvoke<InterfaceInfo[]>('list_interfaces', { windowLabel: label });
     },
 
     async startHost(req: StartHostRequest) {
-      const raw = await invoke<RawStartHostResult>('start_host', {
+      const raw = await callInvoke<RawStartHostResult>('start_host', {
         windowLabel: label,
+        // Flatten the contract request onto the Rust `StartHostRequest` DTO. The bridge derives its
+        // own rate/buffer, so no capture parameters are fabricated or sent.
         request: {
           deviceId: req.capture.deviceId,
           interfaceIp: req.interface.ipAddress,
@@ -128,7 +191,9 @@ export function createTauriHostBridge(): HostBridge {
       });
       // `start_host` returns the epoch/URL; the operator catalog is fetched separately so the UI
       // never displays a catalog that was never actually built.
-      const catalog = toCatalog(await invoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label }));
+      const catalog = toCatalog(
+        await callInvoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label }),
+      );
       return {
         hostEpoch: raw.hostEpoch as StartHostResult['hostEpoch'],
         audioEpoch: raw.audioEpoch as StartHostResult['audioEpoch'],
@@ -138,18 +203,18 @@ export function createTauriHostBridge(): HostBridge {
     },
 
     async stopHost() {
-      await invoke<void>('stop_host', { windowLabel: label });
+      await callInvoke<void>('stop_host', { windowLabel: label });
     },
 
     async sourceCatalog() {
       // The Rust `source_catalog` command returns a full `CatalogSnapshot`; the frozen bridge
       // contract exposes only the source list, so unwrap it here rather than reshaping the host.
-      const raw = await invoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label });
-      return (raw.sources ?? []).map(toSource);
+      const raw = await callInvoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label });
+      return toCatalog(raw).sources;
     },
 
     async setAvailableSources(ids: string[]) {
-      const raw = await invoke<RawCatalogSnapshot>('set_available_sources', {
+      const raw = await callInvoke<RawCatalogSnapshot>('set_available_sources', {
         windowLabel: label,
         ids,
       });
@@ -157,7 +222,7 @@ export function createTauriHostBridge(): HostBridge {
     },
 
     async setSourceLabel(id: string, labelText: string) {
-      const raw = await invoke<RawCatalogSnapshot>('set_source_label', {
+      const raw = await callInvoke<RawCatalogSnapshot>('set_source_label', {
         windowLabel: label,
         id,
         label: labelText,
@@ -166,7 +231,7 @@ export function createTauriHostBridge(): HostBridge {
     },
 
     async issuePairingCredential() {
-      return invoke<PairingCredential>('issue_pairing_credential', { windowLabel: label });
+      return callInvoke<PairingCredential>('issue_pairing_credential', { windowLabel: label });
     },
   };
 }

@@ -1,124 +1,127 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DeviceInfo } from '../protocol';
 import type { HostBridge } from '../desktop-bridge/contracts';
 import { Button } from '../ui/Button';
-import { Notice } from '../ui/Notice';
 
 export interface DeviceViewProps {
-  bridge: HostBridge;
+  bridge?: HostBridge;
+  onSelect?(device: DeviceInfo | null): void;
 }
 
-export function DeviceView({ bridge }: DeviceViewProps) {
-  const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+export function DeviceView({ bridge, onSelect }: DeviceViewProps) {
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [chosen, setChosen] = useState('');
+  const [selected, setSelected] = useState<DeviceInfo | null>(null);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [scan, setScan] = useState(0);
+  const callback = useRef(onSelect);
+  callback.current = onSelect;
 
   useEffect(() => {
-    let active = true;
+    if (!bridge) return;
+    let current = true;
+    setBusy(true);
+    setError(null);
+    setSelected(null);
+    callback.current?.(null);
     bridge
       .listDevices()
-      .then((list) => {
-        if (!active) return;
+      .then(list => {
+        if (!current) return;
         setDevices(list);
-        const preferred = list.find((device) => device.isDefault) ?? list[0];
-        setSelectedId(preferred?.deviceId ?? null);
+        setChosen((list.find(d => d.isDefault) ?? list[0])?.deviceId ?? '');
       })
-      .catch(() => {
-        if (active) setError('Could not list capture devices.');
+      .catch(e => {
+        if (current) {
+          setDevices([]);
+          setError(e instanceof Error ? e.message : 'Could not list capture devices.');
+        }
+      })
+      .finally(() => {
+        if (current) setBusy(false);
       });
     return () => {
-      active = false;
+      current = false;
     };
-  }, [bridge]);
+  }, [bridge, scan]);
 
-  const selected = devices?.find((device) => device.deviceId === selectedId) ?? null;
+  const candidate = devices.find(d => d.deviceId === chosen);
+  const valid =
+    candidate &&
+    candidate.sampleRateHz === 48000 &&
+    candidate.inputChannels > 0 &&
+    candidate.inputChannels <= 24;
 
   return (
-    <div className="flex flex-col gap-5">
-      <header className="flex flex-col gap-1">
-        <h1 className="text-title text-text">Capture device</h1>
-        <p className="text-body text-text-secondary">
-          Choose the Soundcraft USB input device. Rate must be actually supported; nothing is resampled.
-        </p>
-      </header>
-
-      {error ? (
-        <Notice tone="error" title="Device scan failed" live="alert">
-          <p>{error}</p>
-        </Notice>
-      ) : null}
-
-      {devices === null && !error ? (
-        <Notice tone="empty" title="Scanning for input devices">
-          <p>No progress is shown while the host enumerates CoreAudio inputs.</p>
-        </Notice>
-      ) : null}
-
-      {devices !== null && devices.length === 0 ? (
-        <Notice tone="empty" title="No input devices found">
-          <p>Connect the Soundcraft USB interface and rescan.</p>
-        </Notice>
-      ) : null}
-
-      {devices && devices.length > 0 ? (
-        <fieldset className="flex flex-col gap-2 rounded-panel border border-boundary p-4">
-          <legend className="px-1 text-label text-text">Available inputs</legend>
-          <ul className="flex list-none flex-col gap-2 p-0">
-            {devices.map((device) => (
-              <li key={device.deviceId} className="flex min-h-target items-center gap-3">
-                <input
-                  type="radio"
-                  id={`device-${device.deviceId}`}
-                  name="capture-device"
-                  checked={device.deviceId === selectedId}
-                  onChange={() => setSelectedId(device.deviceId)}
-                  className="h-5 w-5 accent-accent"
-                />
-                <label htmlFor={`device-${device.deviceId}`} className="flex flex-col">
-                  <span className="text-label text-text">
-                    {device.name}
-                    {device.isDefault ? <span className="ml-2 text-caption text-text-secondary">Default</span> : null}
-                  </span>
-                  <span className="text-caption text-text-secondary">
-                    {device.inputChannels} input channels ·{' '}
-                    {device.sampleRateHz === 48000 ? '48 kHz supported' : '48 kHz not reported'}
-                    {device.sampleRateHz === null ? ' (unknown)' : ''}
-                  </span>
-                </label>
-              </li>
-            ))}
-          </ul>
-        </fieldset>
-      ) : null}
-
-      {selected ? (
-        <Notice tone={selected.inputChannels > 24 ? 'error' : 'empty'} title="Channel mapping check">
-          {selected.inputChannels > 24 ? (
-            <p>This device reports more than 24 input channels and cannot be used for the POC.</p>
-          ) : (
-            <p>
-              {selected.inputChannels} channels will be mapped. USB master L/R is excluded from the source
-              summation by default.
-            </p>
-          )}
-        </Notice>
-      ) : null}
-
-      <div className="flex flex-wrap gap-2">
-        <Button
-          variant="primary"
-          disabled={!selected || selected.inputChannels > 24 || selected.sampleRateHz !== 48000}
-          explanation={
-            selected && selected.sampleRateHz !== 48000
-              ? 'This device does not report 48 kHz; unsupported rates are rejected, not resampled.'
-              : selected && selected.inputChannels > 24
-                ? 'Channel count above the 24-channel maximum is rejected, not trimmed.'
-                : undefined
-          }
-        >
-          Use this device
+    <div className="iem-stack">
+      <div className="iem-row">
+        <div>
+          <h2 className="text-section">Capture device</h2>
+          <p className="text-text-secondary">Select a reported USB input. Selection does not start capture.</p>
+        </div>
+        <Button disabled={!bridge || busy} onClick={() => setScan(n => n + 1)}>
+          {busy ? 'Scanning devices' : 'Rescan devices'}
         </Button>
       </div>
+      {!bridge && (
+        <p className="iem-hint">Device enumeration is unavailable in a browser. Use the desktop app, or explore the simulated preview.</p>
+      )}
+      {error && <p role="alert" className="text-danger">{error}</p>}
+      {bridge && !busy && !error && devices.length === 0 && <p>No input devices found</p>}
+      {devices.length > 0 && (
+        <fieldset className="iem-stack">
+          <legend className="text-label">Reported input devices</legend>
+          {devices.map(d => (
+            <label key={d.deviceId} className="iem-device-option">
+              <input
+                type="radio"
+                name="capture-device"
+                checked={chosen === d.deviceId}
+                onChange={() => setChosen(d.deviceId)}
+              />
+              <span>
+                <strong>{d.name}</strong>
+                <span className="block text-caption text-text-secondary">
+                  {d.inputChannels} input channels · {d.sampleRateHz === 48000 ? '48 kHz reported' : '48 kHz not reported'}{d.sampleRateHz === null ? ' (unknown)' : ''}
+                </span>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      )}
+      {candidate && (
+        <p className="text-caption text-text-secondary">
+          Buffer bounds: {candidate.bufferMinFrames === null || candidate.bufferMaxFrames === null ? 'Unavailable' : `${candidate.bufferMinFrames}–${candidate.bufferMaxFrames} frames`}. USB mapping still requires verification.
+        </p>
+      )}
+      {candidate && candidate.inputChannels > 24 && (
+        <p className="text-danger">This device reports more than 24 input channels and cannot be used for the POC.</p>
+      )}
+      <Button
+        variant="primary"
+        disabled={!valid || busy}
+        explanation={
+          !bridge
+            ? 'Native device access is required.'
+            : candidate && !valid
+              ? 'Select a device reporting 48 kHz and no more than 24 input channels.'
+              : undefined
+        }
+        onClick={() => {
+          if (candidate && valid) {
+            setSelected(candidate);
+            onSelect?.(candidate);
+          }
+        }}
+      >
+        Select device
+      </Button>
+      {selected && (
+        <p role="status" className="text-accent">
+          Selected: {selected.name} — setup only, capture has not started.
+        </p>
+      )}
     </div>
   );
 }
