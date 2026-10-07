@@ -12,6 +12,7 @@ pub mod control;
 pub mod diagnostics;
 pub mod encoder;
 pub mod fixtures;
+pub mod host;
 pub mod ids;
 pub mod pipeline;
 pub mod runtime;

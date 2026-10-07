@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket};
 
-use crate::contract::{ControlError, EnvelopeV1};
+use crate::audio::engine::MAX_SESSIONS;
+use crate::contract::{ControlError, EnvelopeV1, RtcAnswer, RtcCandidate, RtcOffer};
 use crate::ids::SessionEpoch;
 
 use super::http::SharedServer;
@@ -54,7 +55,11 @@ fn lock(state: &SharedServer) -> std::sync::MutexGuard<'_, super::http::HostServ
     state.lock().expect("server state")
 }
 
-fn dispatch(state: &SharedServer, session: SessionEpoch, text: &str) -> Option<String> {
+pub(crate) fn dispatch(
+    state: &SharedServer,
+    session: SessionEpoch,
+    text: &str,
+) -> Option<String> {
     let envelope: EnvelopeV1<serde_json::Value> = match serde_json::from_str(text) {
         Ok(envelope) => envelope,
         Err(_) => {
@@ -82,10 +87,119 @@ fn dispatch(state: &SharedServer, session: SessionEpoch, text: &str) -> Option<S
         "mix.patch" => handle_patch(state, session, host_epoch, envelope),
         "listen.arm" => handle_arm(state, session, host_epoch, envelope),
         "listen.disarm" => handle_disarm(state, session, host_epoch, envelope),
+        "rtc.offer" => handle_offer(state, session, host_epoch, envelope),
+        "rtc.candidate" => handle_candidate(state, session, host_epoch, envelope),
         _ => {
             let message = ServerMessage::from(ControlError::Internal);
             Some(message.to_envelope_json(host_epoch, envelope.request_id))
         }
+    }
+}
+
+/// Resolve the media slot bound to `session`, opening a free slot if none exists.
+///
+/// The WSS socket is already authenticated as `session`; a slot bound to a different session is
+/// never reused, so one listener can never signal into another's media path.
+fn ensure_slot(state: &SharedServer, session: SessionEpoch) -> Result<usize, ControlError> {
+    let guard = lock(state);
+    let mut hub = guard.hub.lock().expect("media hub");
+    for slot in 0..MAX_SESSIONS {
+        if hub.session_at(slot) == Some(session) {
+            return Ok(slot);
+        }
+    }
+    for slot in 0..MAX_SESSIONS {
+        if hub.session_at(slot).is_none() {
+            hub.open_slot(slot, session)
+                .map_err(|_| ControlError::Internal)?;
+            return Ok(slot);
+        }
+    }
+    Err(ControlError::Internal)
+}
+
+fn handle_offer(
+    state: &SharedServer,
+    session: SessionEpoch,
+    host_epoch: crate::ids::HostEpoch,
+    envelope: EnvelopeV1<serde_json::Value>,
+) -> Option<String> {
+    let request_id = envelope.request_id;
+    let offer: RtcOffer = match serde_json::from_value(envelope.payload) {
+        Ok(offer) => offer,
+        Err(_) => {
+            return Some(
+                ServerMessage::from(ControlError::Internal)
+                    .to_envelope_json(host_epoch, request_id),
+            )
+        }
+    };
+    let slot = match ensure_slot(state, session) {
+        Ok(slot) => slot,
+        Err(error) => {
+            return Some(ServerMessage::from(error).to_envelope_json(host_epoch, request_id))
+        }
+    };
+    let answer = {
+        let guard = lock(state);
+        let mut hub = guard.hub.lock().expect("media hub");
+        hub.handle_offer(slot, &offer.sdp)
+    };
+    match answer {
+        Ok(sdp) => Some(
+            ServerMessage::RtcAnswer(RtcAnswer { sdp }).to_envelope_json_with_session(
+                host_epoch,
+                request_id,
+                Some(session),
+            ),
+        ),
+        Err(_) => Some(
+            ServerMessage::from(ControlError::Internal).to_envelope_json(host_epoch, request_id),
+        ),
+    }
+}
+
+fn handle_candidate(
+    state: &SharedServer,
+    session: SessionEpoch,
+    host_epoch: crate::ids::HostEpoch,
+    envelope: EnvelopeV1<serde_json::Value>,
+) -> Option<String> {
+    let request_id = envelope.request_id;
+    let candidate: RtcCandidate = match serde_json::from_value(envelope.payload) {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            return Some(
+                ServerMessage::from(ControlError::Internal)
+                    .to_envelope_json(host_epoch, request_id),
+            )
+        }
+    };
+    let slot = match ensure_slot(state, session) {
+        Ok(slot) => slot,
+        Err(error) => {
+            return Some(ServerMessage::from(error).to_envelope_json(host_epoch, request_id))
+        }
+    };
+    let result = {
+        let guard = lock(state);
+        let mut hub = guard.hub.lock().expect("media hub");
+        hub.add_candidate(slot, candidate.candidate.as_deref())
+    };
+    match result {
+        // The host is a non-trickle answerer: host candidates are already in the answer SDP, so the
+        // acknowledgement is an explicit end-of-candidates for the listener's own candidate.
+        Ok(()) => Some(
+            ServerMessage::RtcCandidate(RtcCandidate {
+                candidate: None,
+                sdp_mid: candidate.sdp_mid,
+                sdp_m_line_index: candidate.sdp_m_line_index,
+            })
+            .to_envelope_json_with_session(host_epoch, request_id, Some(session)),
+        ),
+        Err(_) => Some(
+            ServerMessage::from(ControlError::Internal).to_envelope_json(host_epoch, request_id),
+        ),
     }
 }
 

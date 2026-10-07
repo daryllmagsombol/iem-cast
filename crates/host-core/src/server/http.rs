@@ -21,6 +21,7 @@ use crate::control::auth::{
 };
 use crate::control::ControlActor;
 use crate::ids::{HostEpoch, RequestId, SessionEpoch, SourceId};
+use crate::transport::{MediaHub, SelectedInterface};
 
 /// Inclusive POC cap on concurrently active receivers.
 pub const POC_ACTIVE_RECEIVER_CAP: usize = 2;
@@ -51,6 +52,8 @@ pub struct HostServer {
     pub sessions: SessionStore,
     /// Exact-match origin allowlist.
     pub origin: OriginPolicy,
+    /// Shared media hub the WSS signaling path reaches (never audio; only per-listener sessions).
+    pub hub: Arc<Mutex<MediaHub>>,
     assets: Arc<dyn AssetProvider>,
 }
 
@@ -63,12 +66,40 @@ impl HostServer {
         origin: OriginPolicy,
         assets: Arc<dyn AssetProvider>,
     ) -> Self {
+        // The shared boundary tests construct a server without a media path; the hub is bound to a
+        // loopback interface so it stays inert until a listener slot is opened over the WSS path.
+        let hub = MediaHub::new(SelectedInterface {
+            name: "loopback".to_string(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            prefix: 8,
+        });
+        Self::with_media(control, clock, entropy, origin, assets, Arc::new(Mutex::new(hub)))
+    }
+
+    /// Compose a server that routes WS signaling into an existing shared media hub.
+    ///
+    /// The hub is owned by [`crate::host::HostSession`] and shared here; [`HostServer::new`] wraps
+    /// an inert loopback hub for tests and callers without a media path.
+    pub fn with_media(
+        control: ControlActor,
+        clock: Arc<dyn Clock>,
+        entropy: Arc<dyn Entropy>,
+        origin: OriginPolicy,
+        assets: Arc<dyn AssetProvider>,
+        hub: Arc<Mutex<MediaHub>>,
+    ) -> Self {
         Self {
             control,
             sessions: SessionStore::new(clock, entropy, SESSION_TTL),
             origin,
+            hub,
             assets,
         }
+    }
+
+    /// The shared media hub, for wiring the UDP pump and the encoded-frame sink.
+    pub fn media_hub(&self) -> Arc<Mutex<MediaHub>> {
+        Arc::clone(&self.hub)
     }
 
     /// The global host identity.

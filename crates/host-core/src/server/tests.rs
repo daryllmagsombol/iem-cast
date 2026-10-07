@@ -379,3 +379,125 @@ fn join_page_serves_musician_html_not_admin() {
     let bytes = server.asset("/join").expect("join asset");
     assert!(std::str::from_utf8(bytes).unwrap().contains("musician"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// RTC signaling
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn rtc_dtos_are_camel_case_and_round_trip() {
+    let offer = crate::contract::RtcOffer {
+        sdp: "v=0".to_string(),
+    };
+    let value = serde_json::to_value(&offer).unwrap();
+    assert_eq!(value["sdp"], "v=0");
+
+    let candidate: crate::contract::RtcCandidate = serde_json::from_str(
+        r#"{"candidate":null,"sdpMid":"0","sdpMLineIndex":0}"#,
+    )
+    .unwrap();
+    assert_eq!(candidate.candidate, None);
+    assert_eq!(candidate.sdp_mid.as_deref(), Some("0"));
+    assert_eq!(candidate.sdp_m_line_index, Some(0));
+    let back = serde_json::to_value(&candidate).unwrap();
+    assert_eq!(back["sdpMid"], "0");
+    assert_eq!(back["sdpMLineIndex"], 0);
+
+    let answer = crate::contract::RtcAnswer {
+        sdp: "v=0".to_string(),
+    };
+    assert_eq!(serde_json::to_value(&answer).unwrap()["sdp"], "v=0");
+}
+
+#[test]
+fn rtc_server_message_kinds_and_session_scoping() {
+    let answer = ServerMessage::RtcAnswer(crate::contract::RtcAnswer {
+        sdp: "v=0".to_string(),
+    });
+    assert_eq!(answer.kind(), "rtc.answer");
+    assert_eq!(answer.session_epoch(), None);
+    let json = answer.to_envelope_json_with_session(
+        test_host_epoch(),
+        RequestId("r1".to_string()),
+        Some(test_session_a()),
+    );
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["type"], "rtc.answer");
+    assert_eq!(value["payload"]["sdp"], "v=0");
+    assert_eq!(value["sessionEpoch"], test_session_a().to_string());
+
+    let candidate = ServerMessage::RtcCandidate(crate::contract::RtcCandidate {
+        candidate: None,
+        sdp_mid: Some("0".to_string()),
+        sdp_m_line_index: Some(0),
+    });
+    assert_eq!(candidate.kind(), "rtc.candidate");
+}
+
+fn rtc_envelope(kind: &str, payload: serde_json::Value) -> String {
+    serde_json::to_string(&EnvelopeV1 {
+        v: 1,
+        kind: kind.to_string(),
+        request_id: RequestId("rtc-1".to_string()),
+        host_epoch: test_host_epoch(),
+        session_epoch: Some(test_session_a()),
+        payload,
+    })
+    .unwrap()
+}
+
+#[test]
+fn ws_rtc_candidate_opens_the_authenticated_slot_and_acks() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    let text = rtc_envelope(
+        "rtc.candidate",
+        serde_json::json!({"candidate": null, "sdpMid": "0", "sdpMLineIndex": 0}),
+    );
+    let reply = crate::server::ws::dispatch(&shared, test_session_a(), &text).expect("reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["type"], "rtc.candidate");
+    assert!(value["payload"]["candidate"].is_null());
+    assert_eq!(value["sessionEpoch"], test_session_a().to_string());
+
+    // The candidate opened a media slot bound to the authenticated session.
+    let guard = shared.lock().unwrap();
+    let hub = guard.hub.lock().unwrap();
+    assert_eq!(hub.session_at(0), Some(test_session_a()));
+}
+
+#[test]
+fn ws_rtc_offer_with_a_malformed_sdp_is_rejected() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    let text = rtc_envelope("rtc.offer", serde_json::json!({"sdp": "not sdp"}));
+    let reply = crate::server::ws::dispatch(&shared, test_session_a(), &text).expect("reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["payload"]["code"], "INTERNAL");
+}
+
+#[test]
+fn ws_cross_session_rtc_message_is_rejected() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    let body = serde_json::to_string(&EnvelopeV1 {
+        v: 1,
+        kind: "rtc.candidate".to_string(),
+        request_id: RequestId("rtc-2".to_string()),
+        host_epoch: test_host_epoch(),
+        session_epoch: Some(test_session_a()),
+        payload: serde_json::json!({"candidate": null}),
+    })
+    .unwrap();
+    // The socket is authenticated as a *different* session.
+    let other = SessionEpoch::from_bytes([0x77; 16]);
+    let reply = crate::server::ws::dispatch(&shared, other, &body).expect("reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["payload"]["code"], "UNAUTHORIZED");
+}
+

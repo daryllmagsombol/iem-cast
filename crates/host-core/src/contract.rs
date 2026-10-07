@@ -589,6 +589,32 @@ pub struct EnvelopeV1<T> {
     pub payload: T,
 }
 
+/// Listener RTC offer carrying the browser's SDP.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtcOffer {
+    pub sdp: String,
+}
+
+/// Listener RTC trickle candidate. `None` candidate = end-of-candidates.
+///
+/// The browser's `RTCIceCandidateInit` uses `sdpMid`/`sdpMLineIndex`; the native fields are
+/// `sdp_mid`/`sdp_m_line_index`, renamed to camelCase on the wire.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtcCandidate {
+    pub candidate: Option<String>,
+    pub sdp_mid: Option<String>,
+    pub sdp_m_line_index: Option<u16>,
+}
+
+/// Host RTC answer carrying the host's SDP.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtcAnswer {
+    pub sdp: String,
+}
+
 /// Absolute mix intent from a listener.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

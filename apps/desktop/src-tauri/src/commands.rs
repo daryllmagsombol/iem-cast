@@ -5,13 +5,39 @@
 //! catalog. The musician catalog here is a draft 22-channel mapping pending the real device
 //! capability probe; it is not a validated hardware mapping.
 
+use std::sync::Mutex;
+
+use host_core::contract::{
+    CaptureRequest as CoreCaptureRequest, InterfaceInfo as CoreInterfaceInfo,
+    StartHostRequest as CoreStartHostRequest,
+};
+use host_core::host::{default_channel_map, HostSession};
 use host_core::ids::SourceId;
+use host_core::server::TlsIdentity;
+use host_core::transport::SelectedInterface;
+use tauri::State;
 
 use crate::bridge::{
     CatalogSnapshot, DeviceInfo, InterfaceInfo, IpcError, PairingCredential, SourceInfo,
     StartHostRequest, StartHostResult,
 };
 use crate::window_guard::authorize_window;
+
+/// Tauri-managed handle to the running host, if any.
+///
+/// The session is owned here so `stop_host` can join it cleanly. A new `start_host` replaces (and
+/// therefore stops) any previous session when the old value is dropped.
+#[derive(Default)]
+pub struct HostState(pub Mutex<Option<HostSession>>);
+
+impl HostState {
+    /// Lock the inner slot, surfacing a poisoned lock as an IPC error.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Option<HostSession>>, IpcError> {
+        self.0
+            .lock()
+            .map_err(|_| ipc_err("HOST_STATE_POISONED", "host state is unavailable"))
+    }
+}
 
 fn ipc_err(code: &str, message: impl Into<String>) -> IpcError {
     IpcError {
@@ -64,17 +90,20 @@ pub fn list_interfaces(window_label: String) -> Result<Vec<InterfaceInfo>, IpcEr
     Ok(out)
 }
 
-/// Validate the operator-supplied TLS identity and return the info needed to join.
+/// Validate the operator-supplied TLS identity and start the local host session.
 ///
 /// This never falls back to plaintext: a missing or unreadable certificate/key returns a typed
-/// error so the operator reconfigures instead of serving insecure content.
+/// error so the operator reconfigures instead of serving insecure content. The started
+/// [`HostSession`] owns capture, the DSP worker, and the UDP media socket, and is stored in Tauri
+/// managed state for `stop_host`.
 #[tauri::command]
 pub fn start_host(
     window_label: String,
     request: StartHostRequest,
+    state: State<'_, HostState>,
 ) -> Result<StartHostResult, IpcError> {
     check_caller(&window_label)?;
-    let tls = host_core::server::TlsIdentity::new(
+    let tls = TlsIdentity::new(
         request.certificate_path.clone(),
         request.key_path.clone(),
     );
@@ -84,8 +113,55 @@ pub fn start_host(
             "certificate or key is missing or unreadable",
         )
     })?;
+
+    let interface_ip: std::net::IpAddr = request
+        .interface_ip
+        .parse()
+        .map_err(|_| ipc_err("INTERFACE_INVALID", "interface address is not a valid IP"))?;
+
+    // Resolve the physical channel count from the actual device capabilities (enumeration only,
+    // never an audio stream).
+    let channels = host_core::capture::enumerate_input_devices()
+        .into_iter()
+        .find(|d| d.device_id == request.device_id)
+        .map(|d| d.input_channels.max(1))
+        .unwrap_or(2);
+
+    let core_request = CoreStartHostRequest {
+        capture: CoreCaptureRequest {
+            device_id: request.device_id.clone(),
+            sample_rate_hz: 48_000,
+            buffer_frames: 128,
+        },
+        interface: CoreInterfaceInfo {
+            name: request.interface_ip.clone(),
+            ip_address: interface_ip,
+            prefix: 0,
+        },
+        certificate_path: request.certificate_path.clone(),
+        key_path: request.key_path.clone(),
+    };
+
+    let selected = SelectedInterface {
+        name: request.interface_ip.clone(),
+        ip: interface_ip,
+        prefix: 0,
+    };
+
+    // Start against the real capture backend. This is the only hardware-opening path; it is never
+    // exercised by tests.
+    let session = HostSession::start_real(tls, selected, core_request, default_channel_map(channels))
+        .map_err(|error| ipc_err("HOST_START_FAILED", error.to_string()))?;
+
     let host_epoch = uuid::Uuid::new_v4();
-    let audio_epoch = uuid::Uuid::new_v4();
+    let audio_epoch = session.audio_epoch();
+
+    // Replace any previous session; dropping it stops and joins it.
+    {
+        let mut slot = state.lock()?;
+        *slot = Some(session);
+    }
+
     Ok(StartHostResult {
         host_epoch: host_epoch.to_string(),
         audio_epoch: audio_epoch.to_string(),
@@ -93,10 +169,14 @@ pub fn start_host(
     })
 }
 
-/// Stop the local host. Operator-window only.
+/// Stop the local host. Operator-window only. Idempotent.
 #[tauri::command]
-pub fn stop_host(window_label: String) -> Result<(), IpcError> {
+pub fn stop_host(window_label: String, state: State<'_, HostState>) -> Result<(), IpcError> {
     check_caller(&window_label)?;
+    let mut slot = state.lock()?;
+    if let Some(mut session) = slot.take() {
+        session.stop();
+    }
     Ok(())
 }
 
