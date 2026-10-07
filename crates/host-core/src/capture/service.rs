@@ -268,7 +268,14 @@ pub fn start_with_backend<B: CaptureBackend + ?Sized>(
 
     let telemetry = Arc::new(CaptureTelemetry::new());
     let (ready_tx, ready_rx) = rtrb::RingBuffer::<CaptureBlock>::new(CAPTURE_SLOTS);
-    let (free_tx, free_rx) = rtrb::RingBuffer::<AudioSlot>::new(CAPTURE_SLOTS);
+    let (mut free_tx, free_rx) = rtrb::RingBuffer::<AudioSlot>::new(CAPTURE_SLOTS);
+
+    // Seed the free queue with every preallocated slot. Without this the callback can never
+    // acquire a slot, so no block is ever published and capture silently produces nothing.
+    for _ in 0..CAPTURE_SLOTS {
+        // The ring was created with exactly CAPTURE_SLOTS capacity, so these pushes cannot fail.
+        let _ = free_tx.push(crate::contract::silent_audio_slot());
+    }
 
     let sink = CaptureSink {
         audio_epoch,
@@ -280,7 +287,11 @@ pub fn start_with_backend<B: CaptureBackend + ?Sized>(
         telemetry: Arc::clone(&telemetry),
     };
 
-    let stream = backend.build(&req, &caps, sink)?;
+    let mut stream = backend.build(&req, &caps, sink)?;
+    // Build only constructs the stream; without `play()` no callbacks are ever delivered, so
+    // capture would silently produce nothing. Start it here so a successful `start` means a
+    // running stream.
+    stream.play()?;
     let stream = Arc::new(Mutex::new(Some(stream)));
 
     Ok(CaptureHandle {
