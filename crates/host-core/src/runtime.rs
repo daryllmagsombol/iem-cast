@@ -28,7 +28,8 @@ pub use crate::pipeline::ListenerOutput as EncodedBlock;
 /// Receives encoded frames produced by the runtime worker.
 ///
 /// Called on the worker thread — **not** the audio callback — so implementations may allocate,
-/// log, or enqueue to a socket. Delivery must be non-blocking and must not panic.
+/// log, or enqueue to a socket. Delivery must be non-blocking and must not panic. A sink may be
+/// shared (for example an `Arc<MediaHub>`), so it takes `&self` and owns its own synchronization.
 pub trait EncodedSink: Send + Sync + 'static {
     /// Deliver one block's worth of outputs, indexed by listener slot.
     fn on_block(&self, outputs: &[ListenerOutput; MAX_SESSIONS]);
