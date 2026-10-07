@@ -1,23 +1,30 @@
 # IEM Cast
 
-**Status: planning only — not stage validated.**
+**Status: POC implemented — not stage validated.**
 
-IEM Cast is a planned live-performance in-ear monitor (IEM) system for bands and musicians.
+IEM Cast is a live-performance in-ear monitor (IEM) system for bands and musicians.
 It takes multichannel audio from a Soundcraft Signature 22 MTK connected
 by USB to a Rust desktop host, mixes personal monitor feeds on that host, and delivers one
-independent stereo stream per musician over a local 5 GHz network to a phone browser. It is
+independent stereo stream per musician over a local network to a phone browser. It is
 audio only; video is out of scope.
 
-Nothing here has been built, tested, or measured yet. This document records approved goals,
-constraints, and decision gates so the work can be implemented and qualified in order. It is a
-design and roadmap, not a detailed coding plan.
+The reusable macOS POC is built: a Rust `host-core` (capture, DSP, Opus, control/safety,
+HTTPS/WSS, WebRTC transport), a minimal Tauri operator shell, and React + TypeScript + Tailwind
+admin/musician interfaces. **Real-hardware qualification has not been performed** — no real
+mixer, phones, or electrical latency measurement yet. Automated checks are software evidence
+only. See [the qualification record](docs/qualification/macos-poc.md).
+
+**Project site:** <https://daryllmagsombol.github.io/iem-cast/> — documentation plus a clearly
+labeled silent, simulated mix demo (no host connection, no audio).
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — **draft** proposed implementation contracts, pending
-  user review.
-- [Design system](docs/DESIGN-SYSTEM.md) — **draft** proposed UI/interaction standard, pending
-  user review.
+- [Architecture](docs/ARCHITECTURE.md) — proposed implementation contracts.
+- [Design system](docs/DESIGN-SYSTEM.md) — shared UI/interaction standard.
+- [macOS POC plan](docs/superpowers/plans/2026-10-07-macos-poc-implementation.md) — execution plan
+  and approval gates.
+- [Qualification record](docs/qualification/macos-poc.md) — verified software results and the
+  remaining manual hardware gates.
 
 ## Goals and requirements
 
