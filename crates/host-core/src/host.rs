@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 
 use crate::audio::engine::MAX_SESSIONS;
 use crate::capture::service::{CaptureBackend, SystemCaptureBackend};
-use crate::contract::{CaptureFault, ChannelMapEntry, ControlError, SourceRole, StartHostRequest};
-use crate::ids::{AudioEpoch, ChannelMapRevision, SourceId};
+use crate::contract::{
+    CaptureFault, ChannelMapEntry, ControlError, MixSnapshot, SourceRole, StartHostRequest,
+};
+use crate::ids::{AudioEpoch, ChannelMapRevision, SessionEpoch, SourceId};
 use crate::pipeline::ListenerOutput;
 use crate::runtime::{EncodedSink, HostRuntime};
 use crate::server::tls::TlsIdentity;
@@ -58,6 +60,78 @@ impl EncodedSink for MediaHubSink {
     fn on_block(&self, outputs: &[ListenerOutput; MAX_SESSIONS]) {
         let mut hub = self.hub.lock().expect("media hub");
         hub.write_block(outputs);
+    }
+}
+
+/// Forwards the control actor's DSP commands into the running runtime and media hub.
+///
+/// A mix may arrive before the listener's media slot exists (e.g. a patch before `rtc.offer`).
+/// Those snapshots are held in `pending` and flushed when the session arms, so ordering between
+/// signaling and control cannot silently drop a mix.
+struct DspBridge {
+    handle: crate::runtime::RuntimeHandle,
+    hub: Arc<Mutex<MediaHub>>,
+    audio_epoch: AudioEpoch,
+    pending: Mutex<std::collections::HashMap<SessionEpoch, MixSnapshot>>,
+}
+
+impl DspBridge {
+    /// The media slot bound to a session, if the listener has negotiated one.
+    fn slot_for(&self, session: SessionEpoch) -> Option<usize> {
+        let hub = self.hub.lock().ok()?;
+        (0..MAX_SESSIONS).find(|&slot| hub.session_at(slot) == Some(session))
+    }
+}
+
+impl crate::contract::DspControl for DspBridge {
+    fn install_snapshot(&self, snapshot: MixSnapshot) -> Result<(), ControlError> {
+        let session = snapshot.context.session_epoch;
+        match self.slot_for(session) {
+            Some(slot) => self.handle.set_mix(slot, session, snapshot),
+            None => {
+                // No media session yet; remember it so arming can apply it.
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.insert(session, snapshot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn request_arm(&self, arm: crate::contract::ListenArm) -> Result<(), ControlError> {
+        let session = arm.context.session_epoch;
+        // Apply any mix that arrived before signaling opened the media slot.
+        let pending = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&session));
+        if let (Some(slot), Some(snapshot)) = (self.slot_for(session), pending) {
+            self.handle.set_mix(slot, session, snapshot);
+        }
+        // Open the per-session media gate with the exact context the actor assigned.
+        if let Some(slot) = self.slot_for(session) {
+            if let Ok(mut hub) = self.hub.lock() {
+                hub.arm(slot, arm.context);
+            }
+        }
+        Ok(())
+    }
+
+    fn disarm(&self, session: SessionEpoch, new_generation: crate::ids::SafetyGeneration) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&session);
+        }
+        if let Some(slot) = self.slot_for(session) {
+            let context = crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: self.audio_epoch,
+                safety_generation: new_generation,
+            };
+            if let Ok(mut hub) = self.hub.lock() {
+                hub.disarm(slot, context);
+            }
+        }
     }
 }
 
@@ -139,6 +213,20 @@ impl HostSession {
     /// The shared media hub (for wiring the WS signaling path / the control server).
     pub fn media_hub(&self) -> Arc<Mutex<MediaHub>> {
         Arc::clone(&self.hub)
+    }
+
+    /// A [`DspControl`] bridge so the control actor's installed mixes reach the DSP worker.
+    ///
+    /// Without this, the actor would accept patches that never affected audio. The bridge maps a
+    /// session to its media slot, forwards mixes to the runtime, and opens/closes the per-session
+    /// media gate on arm/disarm.
+    pub fn dsp_bridge(&self) -> Arc<dyn crate::contract::DspControl> {
+        Arc::new(DspBridge {
+            handle: self.runtime.handle(),
+            hub: Arc::clone(&self.hub),
+            audio_epoch: self.audio_epoch,
+            pending: Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     /// The capture generation this session minted for its blocks.
@@ -427,5 +515,65 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map[1].physical_index, 1);
         assert_eq!(map[1].role, SourceRole::InputChannel);
+    }
+
+    #[test]
+    fn dsp_bridge_queues_a_mix_that_precedes_the_media_slot_then_applies_on_arm() {
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 5,
+        };
+        let session = SessionEpoch::from_bytes([0x22; 16]);
+        let host = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let bridge = host.dsp_bridge();
+
+        // A patch arriving BEFORE the media slot exists must be accepted and queued, not lost.
+        let snapshot = crate::contract::MixSnapshot {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(0),
+            },
+            catalog_revision: crate::ids::CatalogRevision(1),
+            mix_revision: crate::ids::MixRevision(1),
+            sources: crate::contract::SourceGainMatrix::from_slice(&[crate::contract::SourceGain {
+                source_id: SourceId::from_bytes([0x11; 16]),
+                gain_db: -6.0,
+                muted: true,
+            }]),
+            master_db: 0.0,
+            master_muted: true,
+        };
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, snapshot).is_ok());
+
+        // Now signaling opens the media slot for the same session.
+        host.media_hub().lock().unwrap().open_slot(0, session).unwrap();
+
+        let arm = crate::contract::ListenArm {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(1),
+            },
+            applied_revision: crate::ids::MixRevision(1),
+            arm_nonce: crate::ids::ArmNonce::from_bytes([0x66; 16]),
+        };
+        // Arming flushes the queued mix and opens the session's gate; must not panic or error.
+        assert!(crate::contract::DspControl::request_arm(&*bridge, arm).is_ok());
+
+        // A subsequent patch now routes straight through (slot exists).
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, snapshot).is_ok());
+
+        // Disarm is priority and must not panic.
+        crate::contract::DspControl::disarm(&*bridge, session, crate::ids::SafetyGeneration(2));
     }
 }
