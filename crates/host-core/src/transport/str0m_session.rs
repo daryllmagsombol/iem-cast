@@ -283,3 +283,61 @@ impl MediaSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a real receive-only audio offer the way a browser would, using a second str0m
+    /// instance. This gives us a genuine SDP offer instead of a hand-written fixture, so the
+    /// answer we assert on is produced through the same code path a phone triggers.
+    fn browser_like_offer() -> String {
+        use str0m::media::{Direction, MediaKind};
+
+        let mut rtc = Rtc::builder().set_rtp_mode(false).build(Instant::now());
+        // A browser's own host candidate, present in the offer.
+        rtc.add_local_candidate(
+            Candidate::host(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000), "udp")
+                .expect("browser candidate"),
+        );
+        let mut changes = rtc.sdp_api();
+        changes.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+        let (offer, _pending) = changes.apply().expect("browser creates an offer");
+        offer.to_sdp_string()
+    }
+
+    #[test]
+    fn answer_advertises_the_configured_host_candidate_port() {
+        // Regression: the answer used to advertise the host candidate at port 0, so a phone that
+        // successfully paired and connected over WSS still failed ICE with "WebRTC connection
+        // failed". The advertised port must be the real media socket port.
+        let iface = SelectedInterface {
+            name: "en0".to_string(),
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10)),
+            prefix: 24,
+            port: 45123,
+        };
+        let mut session = MediaSession::new(SessionEpoch(uuid::Uuid::new_v4()), iface)
+            .expect("session is created");
+
+        let answer = session
+            .handle_offer(&browser_like_offer())
+            .expect("a real offer is accepted");
+
+        // The host must advertise a concrete, reachable UDP candidate on the configured port.
+        assert!(
+            answer.contains("a=candidate:"),
+            "answer must carry an ICE candidate:\n{answer}"
+        );
+        assert!(
+            answer.contains("192.168.1.10") && answer.contains("45123"),
+            "answer must advertise the configured address and REAL port, not port 0:\n{answer}"
+        );
+        assert!(
+            !answer.contains("192.168.1.10 0 "),
+            "answer must never advertise the media port as 0"
+        );
+        // The host is a non-trickle answerer, so the answer is send-only.
+        assert!(answer.contains("a=sendonly"), "answer must be send-only:\n{answer}");
+    }
+}
