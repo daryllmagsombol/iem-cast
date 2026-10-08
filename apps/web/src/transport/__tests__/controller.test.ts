@@ -287,15 +287,22 @@ describe('receiver controller safety gate', () => {
       connectSnapshots: [sessionSnapshotEvent('audio-epoch-abc'), catalogSnapshotEvent()],
     });
     const armSpy = ports.signaling.arm as unknown as ReturnType<typeof vi.fn>;
+    const mixSpy = ports.signaling.requestMix as unknown as ReturnType<typeof vi.fn>;
     const controller = createReceiverController(ports);
 
     await controller.connect();
     // No requestMix call: the listener simply pressed Start listening.
     await expect(controller.arm()).resolves.toBeUndefined();
+    // Arming must establish a mix first: the host only produces frames for a listener it has a
+    // mix for, so without this the session would be armed but silent.
+    expect(mixSpy).toHaveBeenCalledTimes(1);
+    const patch = mixSpy.mock.calls[0][0] as { sources: { sourceId: string; muted: boolean }[] };
+    expect(patch.sources).toHaveLength(1);
+    expect(patch.sources[0].muted).toBe(true); // neutral + safe: nothing audible until unmuted
     expect(armSpy).toHaveBeenCalledTimes(1);
     const sent = armSpy.mock.calls[0][0] as { audioEpoch: string; appliedRevision: string };
     expect(sent.audioEpoch).toBe('audio-epoch-abc');
-    // The first arm must reference the host's initial revision, not an invented one.
-    expect(sent.appliedRevision).toBe('0');
+    // The arm must reference the revision the host just accepted, not an invented one.
+    expect(sent.appliedRevision).toBe('12');
   });
 });

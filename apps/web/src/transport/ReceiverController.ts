@@ -289,11 +289,29 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       await ensureConnected();
       await playPromise;
 
-      const accepted = snapshot.accepted_mix ?? snapshot.requested_mix;
       if (hostAudioEpoch === null) {
         // Without the host's real audio epoch the arm would be rejected as STALE_EPOCH. Refuse
         // locally rather than sending a fabricated value that can never succeed.
         throw new Error('The host has not reported its audio epoch yet; reconnect and try again');
+      }
+
+      // The host only produces audio frames for a listener it holds a mix for. Arming alone does
+      // not register one, so a listener who starts listening without touching a fader would be
+      // armed but silent. Establish a neutral, muted mix first so the DSP registers this session;
+      // the listener then raises levels and unmutes explicitly.
+      let accepted = snapshot.accepted_mix ?? snapshot.requested_mix;
+      if (accepted === null) {
+        const neutral: MixPatch = {
+          baseRevision: '0' as CounterString,
+          catalogRevision: snapshot.catalog.catalogRevision,
+          sources: snapshot.catalog.sources
+            .filter(source => source.available && source.authorized)
+            .map(source => ({ sourceId: source.sourceId, gainDb: -60, muted: true })),
+          masterDb: -60,
+          masterMuted: true,
+        };
+        const ack = await controller.requestMix(neutral);
+        accepted = ack.canonicalSettings;
       }
 
       const nonce = crypto.randomUUID();
@@ -301,9 +319,7 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       const arm: ListenArm = {
         audioEpoch: hostAudioEpoch as ListenArm['audioEpoch'],
         safetyGeneration: (currentGeneration ?? '0') as CounterString,
-        // A freshly paired listener has no mix yet, so there is no accepted revision to reference.
-        // The host's initial revision is "0"; sending it is correct and lets the listener start
-        // listening before touching any fader.
+        // Reference the revision the host just accepted.
         appliedRevision: (accepted?.mixRevision ?? '0') as CounterString,
         armNonce: nonce as unknown as ListenArm['armNonce'],
       };
