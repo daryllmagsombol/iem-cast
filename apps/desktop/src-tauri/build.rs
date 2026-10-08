@@ -10,6 +10,7 @@ fn main() {
         tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "list_devices",
             "list_interfaces",
+            "host_defaults",
             "start_host",
             "stop_host",
             "source_catalog",

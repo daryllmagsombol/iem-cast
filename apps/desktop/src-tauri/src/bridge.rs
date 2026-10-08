@@ -85,6 +85,24 @@ pub struct CatalogSnapshot {
     pub sources: Vec<SourceInfo>,
 }
 
+/// Sensible default host-setup values discovered by the desktop backend.
+///
+/// The frontend never hard-codes paths or interface names; it displays only what this reports and
+/// keeps every field editable. A field is `None` when nothing discoverable exists, so the UI can
+/// leave the input blank rather than showing a fabricated value.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDefaults {
+    /// Preferred non-loopback interface name (`en0` when present), if any.
+    pub interface_name: Option<String>,
+    /// IPv4 address of the selected interface, if any.
+    pub interface_ip: Option<String>,
+    /// Absolute path to an existing `local-certs/cert.pem`, if discovered.
+    pub certificate_path: Option<String>,
+    /// Absolute path to an existing `local-certs/key.pem`, if discovered.
+    pub key_path: Option<String>,
+}
+
 /// An IPC error with a stable code and human-readable message.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

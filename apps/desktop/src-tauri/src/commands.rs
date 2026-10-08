@@ -19,13 +19,24 @@ use tauri::State;
 
 use crate::asset_embed::EmbeddedMusicianAssets;
 use crate::bridge::{
-    CatalogSnapshot, DeviceInfo, InterfaceInfo, IpcError, OutputDeviceInfo, PairingCredential,
-    SourceInfo, StartHostRequest, StartHostResult,
+    CatalogSnapshot, DeviceInfo, HostDefaults, InterfaceInfo, IpcError, OutputDeviceInfo,
+    PairingCredential, SourceInfo, StartHostRequest, StartHostResult,
 };
 use crate::window_guard::authorize_window;
 
 /// The default HTTPS/WSS control port when the operator does not override it.
 pub const DEFAULT_CONTROL_PORT: u16 = 8443;
+
+/// Preferred interface name when present.
+const PREFERRED_INTERFACE: &str = "en0";
+
+/// How many ancestor directories `host_defaults` walks up looking for `local-certs`.
+const CERT_SEARCH_ANCESTORS: usize = 6;
+
+/// The directory pair naming convention for operator TLS material.
+const LOCAL_CERTS_DIR: &str = "local-certs";
+const CERT_FILE: &str = "cert.pem";
+const KEY_FILE: &str = "key.pem";
 
 /// A fully started host: the media session and its HTTPS/WSS control server.
 ///
@@ -125,6 +136,89 @@ pub fn list_interfaces(window_label: String) -> Result<Vec<InterfaceInfo>, IpcEr
         }
     }
     Ok(out)
+}
+
+/// Choose the default interface: `en0` when present, otherwise the first candidate offered.
+///
+/// Input is ordered as the OS enumerated it, so "first non-loopback IPv4" is the caller's ordering
+/// contract. The selection is pure so it can be exercised without touching real hardware.
+fn select_default_interface(
+    candidates: Vec<(String, String)>,
+) -> Option<(String, String)> {
+    if let Some(preferred) = candidates.iter().find(|(name, _)| name == PREFERRED_INTERFACE) {
+        return Some(preferred.clone());
+    }
+    candidates.into_iter().next()
+}
+
+/// Whether a path exists and can be opened for reading; never modifies it.
+fn is_readable_file(path: &std::path::Path) -> bool {
+    std::fs::File::open(path).is_ok()
+}
+
+/// Search `start` and up to `max_ancestors` ancestor directories for a `local-certs` directory
+/// containing BOTH `cert.pem` and `key.pem`.
+///
+/// Returns absolute `(cert, key)` paths only when both files exist and are readable; otherwise
+/// `None`. This never creates files or invents a path that does not exist.
+fn discover_local_certs(
+    start: &std::path::Path,
+    max_ancestors: usize,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    for ancestor in start.ancestors().take(max_ancestors) {
+        let cert = ancestor.join(LOCAL_CERTS_DIR).join(CERT_FILE);
+        let key = ancestor.join(LOCAL_CERTS_DIR).join(KEY_FILE);
+        if is_readable_file(&cert) && is_readable_file(&key) {
+            return Some((cert, key));
+        }
+    }
+    None
+}
+
+/// Discover sensible default host-setup values for the operator.
+///
+/// This is honest discovery only: the interface is the real OS interface (preferring `en0`) and the
+/// certificate/key paths are returned only when both files already exist and are readable. Every
+/// field is independently optional, and the frontend keeps the corresponding input editable.
+#[tauri::command]
+pub fn host_defaults(window_label: String) -> Result<HostDefaults, IpcError> {
+    check_caller(&window_label)?;
+
+    // Collect non-loopback IPv4 interfaces in OS order; loopback and IPv6 are skipped.
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for iface in interfaces {
+            if let std::net::IpAddr::V4(v4) = iface.addr.ip() {
+                if v4.is_loopback() {
+                    continue;
+                }
+                candidates.push((iface.name, v4.to_string()));
+            }
+        }
+    }
+    let (interface_name, interface_ip) = match select_default_interface(candidates) {
+        Some((name, ip)) => (Some(name), Some(ip)),
+        None => (None, None),
+    };
+
+    // `tauri dev` runs with the crate directory as CWD, so the project root is an ancestor of it.
+    let (certificate_path, key_path) = match std::env::current_dir() {
+        Ok(cwd) => match discover_local_certs(&cwd, CERT_SEARCH_ANCESTORS) {
+            Some((cert, key)) => (
+                Some(cert.to_string_lossy().into_owned()),
+                Some(key.to_string_lossy().into_owned()),
+            ),
+            None => (None, None),
+        },
+        Err(_) => (None, None),
+    };
+
+    Ok(HostDefaults {
+        interface_name,
+        interface_ip,
+        certificate_path,
+        key_path,
+    })
 }
 
 /// Validate the operator-supplied TLS identity and start the local host session **and** its
@@ -479,7 +573,88 @@ fn stop_monitor_impl(window_label: &str, state: &HostState) -> Result<(), IpcErr
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::*;
+
+    /// Create a unique temporary directory for a test; never leaves shared state behind.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iem-cast-{tag}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn discover_local_certs_walks_up_to_the_project_root() {
+        let root = unique_temp_dir("certs-found");
+        let project = root.join("proj");
+        let certs = project.join("local-certs");
+        fs::create_dir_all(&certs).expect("create cert dir");
+        fs::write(certs.join("cert.pem"), b"cert").expect("write cert");
+        fs::write(certs.join("key.pem"), b"key").expect("write key");
+        // Simulate `tauri dev`: the search starts in the crate dir, an ancestor of the root.
+        let start = project.join("apps/desktop/src-tauri");
+        fs::create_dir_all(&start).expect("create start dir");
+
+        let found = discover_local_certs(&start, 6).expect("must find the project certs");
+        assert_eq!(found.0, certs.join("cert.pem"));
+        assert_eq!(found.1, certs.join("key.pem"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discover_local_certs_returns_none_when_a_file_is_missing() {
+        let root = unique_temp_dir("certs-missing");
+        let certs = root.join("local-certs");
+        fs::create_dir_all(&certs).expect("create cert dir");
+        // Only the certificate exists; discovery must never invent the key.
+        fs::write(certs.join("cert.pem"), b"cert").expect("write cert only");
+
+        assert!(discover_local_certs(&root, 6).is_none());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn select_default_interface_prefers_en0_over_the_first_candidate() {
+        let candidates = vec![
+            ("utun3".to_string(), "10.0.0.2".to_string()),
+            ("en0".to_string(), "192.168.1.10".to_string()),
+            ("en1".to_string(), "192.168.1.11".to_string()),
+        ];
+        assert_eq!(
+            select_default_interface(candidates),
+            Some(("en0".to_string(), "192.168.1.10".to_string()))
+        );
+    }
+
+    #[test]
+    fn select_default_interface_falls_back_to_the_first_when_no_en0() {
+        let candidates = vec![
+            ("utun3".to_string(), "10.0.0.2".to_string()),
+            ("en1".to_string(), "192.168.1.11".to_string()),
+        ];
+        assert_eq!(
+            select_default_interface(candidates),
+            Some(("utun3".to_string(), "10.0.0.2".to_string()))
+        );
+        assert_eq!(select_default_interface(Vec::new()), None);
+    }
+
+    #[test]
+    fn host_defaults_rejects_a_non_operator_window() {
+        let error = host_defaults("musician".to_string()).expect_err("must reject");
+        assert_eq!(error.code, "WINDOW_FORBIDDEN");
+    }
+
+    #[test]
+    fn host_defaults_accepts_the_operator_window() {
+        // Discovery may legitimately yield `None` fields in a headless runner; the guard is what
+        // matters, and the command must not fail on a machine with no `en0` or no local certs.
+        assert!(host_defaults("operator".to_string()).is_ok());
+    }
 
     #[test]
     fn stop_host_is_idempotent_when_no_host_is_running() {

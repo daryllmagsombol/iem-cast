@@ -171,6 +171,48 @@ test('enumeration error has retry and never supplies fictional devices', async (
   expect(screen.queryByText('Soundcraft 22 MTK')).not.toBeInTheDocument();
 });
 
+test('host defaults pre-fill empty fields from the backend but stay editable', async () => {
+  const bridge = bridgeReady();
+  bridge.hostDefaults = vi.fn().mockResolvedValue({
+    interfaceName: 'en0',
+    interfaceIp: '192.168.1.10',
+    certificatePath: '/proj/local-certs/cert.pem',
+    keyPath: '/proj/local-certs/key.pem',
+  });
+  render(<AdminRoot bridge={bridge} />);
+
+  await waitFor(() =>
+    expect(screen.getByLabelText('Host network interface')).toHaveValue('192.168.1.10'),
+  );
+  expect(screen.getByLabelText('Certificate path')).toHaveValue('/proj/local-certs/cert.pem');
+  expect(screen.getByLabelText('Key path')).toHaveValue('/proj/local-certs/key.pem');
+  // Every field stays editable after pre-filling.
+  expect(screen.getByLabelText('Certificate path')).not.toBeDisabled();
+  expect(screen.getByLabelText('Key path')).not.toBeDisabled();
+});
+
+test('host defaults never overwrite a value the operator already typed', async () => {
+  const bridge = bridgeReady();
+  bridge.hostDefaults = vi.fn().mockResolvedValue({
+    interfaceName: 'en0',
+    interfaceIp: '192.168.1.10',
+    certificatePath: '/proj/local-certs/cert.pem',
+    keyPath: '/proj/local-certs/key.pem',
+  });
+  render(<AdminRoot bridge={bridge} />);
+
+  await screen.findByText('Reported USB input');
+  fireEvent.change(screen.getByLabelText('Certificate path'), {
+    target: { value: '/custom/cert.pem' },
+  });
+  // Give the async defaults a chance to resolve and attempt (incorrectly) to overwrite.
+  await waitFor(() => expect(bridge.hostDefaults).toHaveBeenCalled());
+  await waitFor(() =>
+    expect(screen.getByLabelText('Host network interface')).toHaveValue('192.168.1.10'),
+  );
+  expect(screen.getByLabelText('Certificate path')).toHaveValue('/custom/cert.pem');
+});
+
 test('preview has isolated fictional data, no RPC calls, and a usable exit', async () => {
   const bridge = fakeBridge({ joinUrl: '', expiresInSeconds: 0 });
   bridge.listDevices = vi.fn().mockResolvedValue([]);

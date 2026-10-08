@@ -32,6 +32,24 @@ export interface OutputDeviceInfo {
 }
 
 /**
+ * Default host-setup values discovered by the desktop backend.
+ *
+ * Every field is optional: the backend reports only what it could actually discover, and the UI
+ * keeps the corresponding input blank (and fully editable) when a field is `null`. The frontend
+ * must never hard-code these paths or interface names.
+ */
+export interface HostDefaults {
+  /** Preferred non-loopback interface name (`en0` when present), if any. */
+  interfaceName: string | null;
+  /** IPv4 address of the selected interface, if any. */
+  interfaceIp: string | null;
+  /** Absolute path to an existing `local-certs/cert.pem`, if discovered. */
+  certificatePath: string | null;
+  /** Absolute path to an existing `local-certs/key.pem`, if discovered. */
+  keyPath: string | null;
+}
+
+/**
  * Operator-only host bridge. Implemented over Tauri `invoke`; command identifiers are snake_case
  * on the Rust side (`list_devices`, ..., `stop_monitor`).
  */
@@ -57,4 +75,10 @@ export interface HostBridge {
   startMonitor(slot: number, deviceId: string | null): Promise<void>;
   /** Stop the local monitor. Idempotent. */
   stopMonitor(): Promise<void>;
+  /**
+   * Discover sensible setup defaults (preferred network interface and existing local certificate
+   * paths). The frontend displays these and keeps every field editable; a `null` field means the
+   * backend found nothing and the input should stay blank.
+   */
+  hostDefaults(): Promise<HostDefaults>;
 }

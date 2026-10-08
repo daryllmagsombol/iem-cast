@@ -293,6 +293,52 @@ describe('listOutputDevices', () => {
   });
 });
 
+describe('hostDefaults', () => {
+  test('calls host_defaults with the window label and returns the DTO verbatim', async () => {
+    const raw = {
+      interfaceName: 'en0',
+      interfaceIp: '192.168.1.10',
+      certificatePath: '/proj/local-certs/cert.pem',
+      keyPath: '/proj/local-certs/key.pem',
+    };
+    invokeMock.mockResolvedValueOnce(raw);
+
+    const defaults = await createTauriHostBridge().hostDefaults();
+
+    expect(invokeMock).toHaveBeenCalledWith('host_defaults', { windowLabel: 'operator' });
+    expect(defaults).toEqual(raw);
+  });
+
+  test('preserves explicit null fields instead of inventing values', async () => {
+    const raw = {
+      interfaceName: null,
+      interfaceIp: null,
+      certificatePath: null,
+      keyPath: null,
+    };
+    invokeMock.mockResolvedValueOnce(raw);
+
+    const defaults = await createTauriHostBridge().hostDefaults();
+
+    expect(defaults).toEqual(raw);
+  });
+
+  test('preserves a typed IPC failure code', async () => {
+    invokeMock.mockRejectedValueOnce({
+      code: 'WINDOW_FORBIDDEN',
+      message: 'caller is not the operator window',
+    });
+
+    const error = await createTauriHostBridge()
+      .hostDefaults()
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(IpcInvokeError);
+    expect((error as IpcInvokeError).code).toBe('WINDOW_FORBIDDEN');
+  });
+});
+
 describe('startMonitor', () => {
   test('sends the 0-based slot and the device id, preserving an explicit null', async () => {
     const bridge = createTauriHostBridge();

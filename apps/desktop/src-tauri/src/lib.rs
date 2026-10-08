@@ -20,6 +20,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_devices,
             commands::list_interfaces,
+            commands::host_defaults,
             commands::start_host,
             commands::stop_host,
             commands::source_catalog,

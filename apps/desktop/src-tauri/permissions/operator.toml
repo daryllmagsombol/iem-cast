@@ -4,6 +4,7 @@ description = "Allows the bundled operator window to drive host setup and the mu
 commands.allow = [
   "list_devices",
   "list_interfaces",
+  "host_defaults",
   "start_host",
   "stop_host",
   "source_catalog",

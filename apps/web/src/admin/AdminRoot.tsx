@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { HostBridge } from '../desktop-bridge/contracts';
 import type { DeviceInfo, InterfaceInfo } from '../protocol';
 import { DeviceView } from './DeviceView';
@@ -35,6 +35,8 @@ export function AdminRoot({ bridge }: AdminRootProps) {
   );
   const [hostBusy, setHostBusy] = useState(false);
   const [hostError, setHostError] = useState<string | null>(null);
+  // Backend-discovered defaults are applied once per bridge; a rescan must not clobber edits.
+  const defaultsAppliedFor = useRef<HostBridge | null>(null);
   useEffect(() => {
     if (!bridge) return;
     let current = true;
@@ -54,6 +56,24 @@ export function AdminRoot({ bridge }: AdminRootProps) {
             e instanceof Error ? e.message : 'Could not list network interfaces.',
           );
         }
+      })
+      .finally(() => {
+        if (!current || defaultsAppliedFor.current === bridge) return;
+        defaultsAppliedFor.current = bridge;
+        // Best-effort discovery: a failure leaves the inputs blank without breaking the screen.
+        bridge
+          .hostDefaults()
+          .then(defaults => {
+            if (!current) return;
+            // Pre-fill only fields the operator has not already typed into (still empty). Every
+            // field remains editable, and a `null` default leaves the input empty.
+            setInterfaceIp(prev => (prev === '' ? defaults.interfaceIp ?? '' : prev));
+            setCertificate(prev => (prev === '' ? defaults.certificatePath ?? '' : prev));
+            setKey(prev => (prev === '' ? defaults.keyPath ?? '' : prev));
+          })
+          .catch(() => {
+            // Discovery is optional; blanks are a valid outcome.
+          });
       });
     return () => {
       current = false;

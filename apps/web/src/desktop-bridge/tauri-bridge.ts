@@ -13,7 +13,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
-import type { HostBridge, OutputDeviceInfo, PairingCredential } from './contracts';
+import type { HostBridge, HostDefaults, OutputDeviceInfo, PairingCredential } from './contracts';
 import type {
   CatalogSnapshot,
   CounterString,
@@ -175,6 +175,12 @@ export function createTauriHostBridge(): HostBridge {
 
     async listInterfaces() {
       return callInvoke<InterfaceInfo[]>('list_interfaces', { windowLabel: label });
+    },
+
+    async hostDefaults() {
+      // The backend discovers these; the frontend never hard-codes them. `null` fields are passed
+      // through unchanged so the UI leaves those inputs blank.
+      return callInvoke<HostDefaults>('host_defaults', { windowLabel: label });
     },
 
     async startHost(req: StartHostRequest) {
