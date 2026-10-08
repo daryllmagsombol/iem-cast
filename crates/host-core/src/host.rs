@@ -106,6 +106,10 @@ struct DspBridge {
     hub: Arc<Mutex<MediaHub>>,
     audio_epoch: AudioEpoch,
     pending: Mutex<std::collections::HashMap<SessionEpoch, MixSnapshot>>,
+    /// The most recently applied mix per session, kept so arming can re-install it under the new
+    /// safety generation. Without it the runtime keeps stamping frames with the pre-arm generation
+    /// and the open gate drops every one (connected but silent).
+    live: Mutex<std::collections::HashMap<SessionEpoch, MixSnapshot>>,
     events: Option<Arc<dyn crate::contract::AudioEventSink>>,
 }
 
@@ -122,6 +126,23 @@ impl DspBridge {
             let _ = sink.try_publish(ev);
         }
     }
+
+    /// Record the mix currently installed in the runtime for a session.
+    fn remember(&self, session: SessionEpoch, snapshot: MixSnapshot) {
+        if let Ok(mut live) = self.live.lock() {
+            live.insert(session, snapshot);
+        }
+    }
+
+    /// The mix currently installed for a session, if any.
+    fn live_snapshot(&self, session: SessionEpoch) -> Option<MixSnapshot> {
+        self.live.lock().ok().and_then(|live| live.get(&session).copied())
+    }
+
+    /// Take a mix that arrived before the media slot existed.
+    fn take_pending(&self, session: SessionEpoch) -> Option<MixSnapshot> {
+        self.pending.lock().ok().and_then(|mut map| map.remove(&session))
+    }
 }
 
 impl crate::contract::DspControl for DspBridge {
@@ -132,6 +153,7 @@ impl crate::contract::DspControl for DspBridge {
                 let context = snapshot.context;
                 let applied_revision = snapshot.mix_revision;
                 self.handle.set_mix(slot, session, snapshot);
+                self.remember(session, snapshot);
                 self.publish(AudioEvent::MixApplied {
                     applied_revision,
                     context,
@@ -151,16 +173,26 @@ impl crate::contract::DspControl for DspBridge {
 
     fn request_arm(&self, arm: crate::contract::ListenArm) -> Result<(), ControlError> {
         let session = arm.context.session_epoch;
-        // Apply any mix that arrived before signaling opened the media slot.
-        let pending = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&session));
-        if let (Some(slot), Some(snapshot)) = (self.slot_for(session), pending) {
+        let wanted_generation = arm.context.safety_generation;
+
+        // Arming advances the safety generation, and the gate opens only for that new generation.
+        // The runtime must therefore be re-given this session's mix with the NEW generation stamped
+        // on it; otherwise every encoded frame still carries the old generation, the gate drops it,
+        // and the listener is connected but silent.
+        let reinstall = self
+            .take_pending(session)
+            .or_else(|| self.live_snapshot(session));
+
+        if let (Some(slot), Some(mut snapshot)) = (self.slot_for(session), reinstall) {
+            snapshot.context = crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: self.audio_epoch,
+                safety_generation: wanted_generation,
+            };
             let context = snapshot.context;
             let applied_revision = snapshot.mix_revision;
             self.handle.set_mix(slot, session, snapshot);
+            self.remember(session, snapshot);
             self.publish(AudioEvent::MixApplied {
                 applied_revision,
                 context,
@@ -168,6 +200,7 @@ impl crate::contract::DspControl for DspBridge {
                 snapshot,
             });
         }
+
         // Open the per-session media gate with the exact context the actor assigned.
         if let Some(slot) = self.slot_for(session) {
             if let Ok(mut hub) = self.hub.lock() {
@@ -311,6 +344,7 @@ impl HostSession {
             hub: Arc::clone(&self.hub),
             audio_epoch: self.audio_epoch,
             pending: Mutex::new(std::collections::HashMap::new()),
+            live: Mutex::new(std::collections::HashMap::new()),
             events: sink,
         })
     }
@@ -1081,21 +1115,33 @@ mod tests {
         crate::contract::DspControl::disarm(&*bridge, session, crate::ids::SafetyGeneration(2));
 
         let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 3);
+        // Install publishes MixApplied(gen 0). Arming must re-install the mix under the NEW
+        // generation before publishing ArmApplied, so the runtime stops stamping frames with the
+        // pre-arm generation (which the open gate would drop). Disarm then publishes Interrupted.
+        assert_eq!(events.len(), 4);
         assert!(matches!(
             events[0],
             AudioEvent::MixApplied {
                 applied_revision: crate::ids::MixRevision(1),
+                context,
                 ..
-            }
+            } if context.safety_generation == crate::ids::SafetyGeneration(0)
         ));
         assert!(matches!(
             events[1],
+            AudioEvent::MixApplied {
+                applied_revision: crate::ids::MixRevision(1),
+                context,
+                ..
+            } if context.safety_generation == crate::ids::SafetyGeneration(1)
+        ));
+        assert!(matches!(
+            events[2],
             AudioEvent::ArmApplied { arm_nonce, .. }
                 if arm_nonce == crate::ids::ArmNonce::from_bytes([0x66; 16])
         ));
         assert!(matches!(
-            events[2],
+            events[3],
             AudioEvent::Interrupted {
                 session_epoch,
                 reason: InterruptReason::UserDisarm,
@@ -1116,6 +1162,74 @@ mod tests {
         std::fs::write(&cert_path, cert.cert.pem()).expect("write test certificate");
         std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write test key");
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn arming_reinstalls_the_mix_under_the_new_generation() {
+        // Regression risk: the actor advances the safety generation when it arms (0 -> 1) and
+        // opens the media gate for the NEW generation, but the runtime mix snapshot was built at
+        // patch time with generation 0. If arming does not re-install the mix under the new
+        // generation, every encoded frame is stamped 0, the safety gate drops it, and the listener
+        // is connected but silent.
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 0,
+        };
+        let session = SessionEpoch::from_bytes([0x44; 16]);
+        let host = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let sink = Arc::new(RecordingEvents::default());
+        let bridge = host.dsp_bridge_with_events(Some(sink.clone()));
+        host.media_hub().lock().unwrap().open_slot(0, session).unwrap();
+
+        let snapshot = crate::contract::MixSnapshot {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(0),
+            },
+            catalog_revision: crate::ids::CatalogRevision(1),
+            mix_revision: crate::ids::MixRevision(1),
+            sources: crate::contract::SourceGainMatrix::from_slice(&[]),
+            master_db: 0.0,
+            master_muted: false,
+        };
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, snapshot).is_ok());
+
+        let arm = crate::contract::ListenArm {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(1),
+            },
+            applied_revision: crate::ids::MixRevision(1),
+            arm_nonce: crate::ids::ArmNonce::from_bytes([0x66; 16]),
+        };
+        assert!(crate::contract::DspControl::request_arm(&*bridge, arm).is_ok());
+
+        // After arming, the mix must have been re-applied under generation 1 so produced frames
+        // carry the generation the open gate expects. A `MixApplied` with the arm generation is
+        // the observable proof of that re-install.
+        let events = sink.events.lock().unwrap();
+        let reapplied = events.iter().any(|e| {
+            matches!(
+                e,
+                AudioEvent::MixApplied { context, .. }
+                    if context.safety_generation == crate::ids::SafetyGeneration(1)
+            )
+        });
+        assert!(
+            reapplied,
+            "arming must re-install the mix under the new generation (connected-but-silent bug)"
+        );
     }
 
     #[test]
