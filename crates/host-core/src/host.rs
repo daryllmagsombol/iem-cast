@@ -1149,6 +1149,74 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn dsp_bridge_repeated_same_context_install_routes_without_replacing_the_session() {
+        // The production ordinary patch path calls `install_snapshot` on every edit with the SAME
+        // exact context. The bridge must keep routing to the live session's slot and must not
+        // replace the session. (Partial/encoder preservation across the reinstall is proven at the
+        // synchronous `apply_command` seam in `runtime::tests`, which consumes the exact
+        // `SetMix` command the bridge emits, because the DSP worker is asynchronous.)
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 0,
+        };
+        let session = SessionEpoch::from_bytes([0x44; 16]);
+        let host = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+        let sink = Arc::new(RecordingEvents::default());
+        let bridge = host.dsp_bridge_with_events(Some(sink.clone()));
+        host.media_hub()
+            .lock()
+            .unwrap()
+            .open_slot(0, session)
+            .unwrap();
+
+        let snapshot = crate::contract::MixSnapshot {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: host.audio_epoch(),
+                safety_generation: crate::ids::SafetyGeneration(0),
+            },
+            catalog_revision: crate::ids::CatalogRevision(1),
+            mix_revision: crate::ids::MixRevision(1),
+            sources: crate::contract::SourceGainMatrix::from_slice(&[]),
+            master_db: 0.0,
+            master_muted: false,
+        };
+
+        // Two installs with the identical context (an ordinary edit between them changes only a
+        // revision/gain, still same context).
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, snapshot).is_ok());
+        let mut edited = snapshot;
+        edited.mix_revision = crate::ids::MixRevision(2);
+        assert!(crate::contract::DspControl::install_snapshot(&*bridge, edited).is_ok());
+
+        // The media slot still belongs to the same session (no implicit replacement).
+        assert_eq!(
+            host.media_hub().lock().unwrap().session_at(0),
+            Some(session)
+        );
+
+        // Both installs published a MixApplied carrying the same exact context.
+        let events = sink.events.lock().unwrap();
+        let mix_applied = events
+            .iter()
+            .filter(|e| matches!(e, AudioEvent::MixApplied { .. }))
+            .count();
+        assert_eq!(mix_applied, 2, "each install must publish one MixApplied");
+        assert!(events.iter().all(|e| match e {
+            AudioEvent::MixApplied { context, .. } => *context == snapshot.context,
+            _ => true,
+        }));
+    }
+
     /// Write a fresh self-signed localhost certificate/key pair and return their paths.
     ///
     /// Generated offline with `rcgen` so the server-start regression test never touches the

@@ -59,10 +59,24 @@ impl AudioEngine {
         }
     }
 
-    /// Register (or replace) the mix for one listener slot.
+    /// Register (or upsert) the mix for one listener slot.
+    ///
+    /// The [`SessionContext`] is the safety identity. When the incoming context is exactly equal to
+    /// the slot's current context, the partial PCM, gain ramps, and limiter are **preserved** so an
+    /// ordinary gain/mute/revision edit does not introduce a sample gap or a ramp discontinuity. A
+    /// new identity (session, audio epoch, or safety generation) resets all state fresh, never
+    /// re-tagging the old partial.
     pub fn register_session(&mut self, slot: usize, ctx: SessionContext, mix: MixSnapshot) {
         if slot >= self.sessions.len() {
             return;
+        }
+        // Same exact safety identity: preserve partial/ramps/limiter (and encoder/output state held
+        // by the caller). Gain/mute targets are re-resolved on every `process_block`, so there is
+        // nothing to rebuild here and smoothing continues from the current ramp positions.
+        if let Some(state) = self.sessions[slot].as_ref() {
+            if state.context == ctx {
+                return;
+            }
         }
         let mut ramps = [Ramp::new(0.0); MAX_SOURCES];
         for (index, entry) in self.channel_map.iter().enumerate() {
@@ -90,6 +104,24 @@ impl AudioEngine {
         });
     }
 
+    /// The exact safety context installed for `slot`, if any.
+    ///
+    /// Used by [`crate::pipeline::Pipeline`] to decide whether an upsert can preserve state without
+    /// duplicating the identity table.
+    pub(crate) fn context(&self, slot: usize) -> Option<SessionContext> {
+        self.sessions
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.context)
+    }
+
+    /// Drop all engine state for `slot` (partial PCM, ramps, limiter, context).
+    pub(crate) fn clear_session(&mut self, slot: usize) {
+        if let Some(entry) = self.sessions.get_mut(slot) {
+            *entry = None;
+        }
+    }
+
     /// Process one input block for `slot`, writing up to
     /// [`MAX_OUT_FRAMES_PER_BLOCK`] codec frames and returning how many were produced.
     pub fn process_block(
@@ -107,11 +139,32 @@ impl AudioEngine {
             .and_then(|s| s.as_mut())
             .ok_or(AudioFault::Internal)?;
 
-        // Identity change resets partial assembly; never stale-replay the held tail.
+        // The incoming capture block must belong to the snapshot's audio epoch. Validate it against
+        // `snapshot.context.audio_epoch` BEFORE any context state change or appending: comparing
+        // against the old `state.context.audio_epoch` would let an old-epoch block be retagged as
+        // the new epoch, or reject a valid new-epoch block while the old state is still installed.
+        if input.audio_epoch != snapshot.context.audio_epoch {
+            return Ok(0);
+        }
+
+        // Identity change resets partial assembly; never stale-replay the held tail. Gain/mute
+        // edits that keep the exact context do NOT reset the partial or ramps.
         let identity_changed = state.context != snapshot.context;
         if identity_changed {
             state.partial_frames = 0;
             state.context = snapshot.context;
+        }
+
+        // A timeline gap means the held partial is no longer contiguous with this block. Keep the
+        // encoder (caller-owned) but drop the incomplete PCM and re-anchor to this block's real
+        // start; do not synthesize silence.
+        if state.partial_frames > 0 {
+            let expected = state
+                .partial_start
+                .saturating_add(state.partial_frames as u64);
+            if input.start_sample != expected {
+                state.partial_frames = 0;
+            }
         }
 
         // Resolve and validate targets before touching samples.

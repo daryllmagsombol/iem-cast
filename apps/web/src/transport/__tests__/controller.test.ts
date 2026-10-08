@@ -114,7 +114,7 @@ function fakePorts(options: FakeOptions = {}) {
         for (const event of onConnect) handler?.(event);
       }),
       requestMix: vi.fn(async () => ack),
-      arm: vi.fn(async () => {
+      arm: vi.fn(async arm => {
         handler?.({
           v: 1,
           type: 'listen.armed',
@@ -125,7 +125,7 @@ function fakePorts(options: FakeOptions = {}) {
             sessionEpoch: 's',
             safetyGeneration: '1',
             audioEpoch: 'a',
-            armNonce: 'matching-nonce',
+            armNonce: arm.armNonce,
           },
         } as unknown as ServerEvent);
       }),
@@ -150,6 +150,374 @@ function fakePorts(options: FakeOptions = {}) {
 }
 
 describe('receiver controller safety gate', () => {
+  test.each(['stop', 'disconnect'] as const)('delayed connection cannot set up media or restore phase after %s', async action => {
+    const { ports, media } = fakePorts();
+    let release!: () => void;
+    vi.mocked(ports.signaling.connect).mockImplementationOnce(() => new Promise<void>(r => { release = r; }));
+    const controller = createReceiverController(ports);
+    const pending = controller.connect().catch(() => undefined);
+    controller[action]();
+    const stopped = controller.getSnapshot();
+    release();
+    await pending;
+    expect(media.createRecvOnlyAudio).not.toHaveBeenCalled();
+    expect(media.setJitterBufferTargetMs).not.toHaveBeenCalled();
+    expect(controller.getSnapshot()).toEqual(stopped);
+    controller.disconnect();
+  });
+
+  test.each(['media', 'jitter'] as const)('cancellation during %s setup prevents later setup and phase mutation', async boundary => {
+    const { ports, media } = fakePorts();
+    let release!: () => void;
+    if (boundary === 'media') media.createRecvOnlyAudio.mockImplementationOnce(() => new Promise<void>(r => { release = r; }));
+    else media.setJitterBufferTargetMs.mockImplementationOnce(() => new Promise<boolean>(r => { release = () => r(true); }));
+    const controller = createReceiverController(ports);
+    const pending = controller.connect().catch(() => undefined);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    controller.disconnect();
+    const stopped = controller.getSnapshot();
+    release();
+    await pending;
+    if (boundary === 'media') expect(media.setJitterBufferTargetMs).not.toHaveBeenCalled();
+    expect(controller.getSnapshot()).toEqual(stopped);
+  });
+
+  test.each(['promise', 'push'] as const)('old canceled mix %s cannot overwrite newer authoritative session settings', async delivery => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    let release!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(() => new Promise<MixAck>(r => { release = r; }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const pending = controller.requestMix(patchGain(-9)).catch(() => undefined);
+    controller.stop();
+    const newer = accept(patchGain(-3), '20').canonicalSettings;
+    const session = sessionSnapshotEvent('a');
+    emit({ ...session, payload: { ...session.payload, requestedMix: newer, acceptedMix: newer } } as ServerEvent);
+    const authoritative = controller.getSnapshot();
+    const observer = vi.fn();
+    controller.subscribe(observer);
+    if (delivery === 'push') emit({ type: 'mix.ack', requestId: 'old-request', sessionEpoch: 's', hostEpoch: 'h', payload: ack } as ServerEvent);
+    release(ack);
+    await pending;
+    await new Promise(r => setTimeout(r, 0));
+    expect(controller.getSnapshot()).toEqual(authoritative);
+    expect(observer).not.toHaveBeenCalled();
+    controller.disconnect();
+  });
+
+  test('unrelated error before enqueue survives pending mix and acceptance', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    emit({ type: 'error', requestId: 'other', payload: { message: 'Host device unavailable' } } as ServerEvent);
+    let release!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(() => new Promise<MixAck>(r => { release = r; }));
+    const pending = controller.requestMix(patchGain(-9));
+    expect(controller.getSnapshot().error).toBe('Host device unavailable');
+    release(ack);
+    await pending;
+    expect(controller.getSnapshot().error).toBe('Host device unavailable');
+    controller.disconnect();
+  });
+
+  test('a new authoritative session with no mix clears old settings and ignores old completion', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    await controller.requestMix(patchGain(-9));
+    let release!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(() => new Promise<MixAck>(r => { release = r; }));
+    const pending = controller.requestMix(patchGain(-3)).catch(() => undefined);
+    emit({ ...sessionSnapshotEvent('new-audio'), sessionEpoch: 'new-session' } as ServerEvent);
+    expect(controller.getSnapshot().accepted_mix).toBeNull();
+    expect(controller.getSnapshot().requested_mix).toBeNull();
+    const authoritative = controller.getSnapshot();
+    release(ack);
+    await pending;
+    expect(controller.getSnapshot()).toEqual(authoritative);
+    controller.disconnect();
+  });
+
+  test('late timed-out confirmation updates host generation only, so retry uses current generation', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports, emit, media } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+      vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+      const controller = createReceiverController(ports);
+      const first = controller.arm().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1);
+      const sent = vi.mocked(ports.signaling.arm).mock.calls[0][0];
+      await vi.advanceTimersByTimeAsync(10000);
+      await first;
+      emit({ type: 'listen.armed', sessionEpoch: 's', hostEpoch: 'h', payload: { armNonce: sent.armNonce, safetyGeneration: '7' } } as ServerEvent);
+      expect(controller.getSnapshot().phase).toBe('ready-muted');
+      expect(media.mute).not.toHaveBeenCalledWith(false);
+      const retry = controller.arm().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(vi.mocked(ports.signaling.arm).mock.calls[1][0].safetyGeneration).toBe('7');
+      controller.disconnect();
+      await retry;
+    } finally { vi.useRealTimers(); }
+  });
+
+  test('authoritative session generation is used for arm', async () => {
+    const session = sessionSnapshotEvent('a');
+    const { ports } = fakePorts({ connectSnapshots: [{ ...session, payload: { ...session.payload,
+      context: { audioEpoch: 'a', safetyGeneration: '6' } } } as ServerEvent] });
+    const controller = createReceiverController(ports);
+    await controller.arm();
+    expect(vi.mocked(ports.signaling.arm).mock.calls[0][0].safetyGeneration).toBe('6');
+    controller.disconnect();
+  });
+
+  test('host armed snapshot after timeout updates authority without granting local arm permission', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports, emit, media } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+      vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+      const controller = createReceiverController(ports);
+      const first = controller.arm().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(10001);
+      await first;
+      const session = sessionSnapshotEvent('a');
+      emit({ ...session, payload: { ...session.payload, phase: 'armed',
+        context: { audioEpoch: 'a', safetyGeneration: '8' } } } as ServerEvent);
+      expect(controller.getSnapshot().phase).toBe('ready-muted');
+      controller.personalMasterMute(false);
+      expect(media.mute).not.toHaveBeenCalledWith(false);
+      const retry = controller.arm().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(vi.mocked(ports.signaling.arm).mock.calls[1][0].safetyGeneration).toBe('8');
+      controller.disconnect();
+      await retry;
+    } finally { vi.useRealTimers(); }
+  });
+
+  function accept(patch: MixPatch, revision: string): MixAck {
+    return { acceptedRevision: counter(revision), catalogRevision: patch.catalogRevision,
+      canonicalSettings: { ...patch, mixRevision: counter(revision) } };
+  }
+
+  test('serializes and coalesces edits onto the latest accepted revision', async () => {
+    const { ports } = fakePorts();
+    let first!: (ack: MixAck) => void;
+    const send = vi.mocked(ports.signaling.requestMix);
+    send.mockImplementationOnce(() => new Promise(resolve => { first = resolve; }))
+      .mockImplementation(async patch => accept(patch, '14'));
+    const controller = createReceiverController(ports);
+    const one = controller.requestMix(patchGain(-9));
+    const two = controller.requestMix({ ...patchGain(-6), masterDb: -3 });
+    const three = controller.requestMix({ ...patchGain(-4), masterDb: -3 });
+    expect(send).toHaveBeenCalledTimes(1);
+    first(accept(patchGain(-9), '13'));
+    await Promise.all([one, two, three]);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1][0]).toMatchObject({ baseRevision: '13', masterDb: -3,
+      sources: [{ sourceId: 'ch1', gainDb: -4, muted: false }] });
+  });
+
+  test('arm waits for a pending mix acceptance, not its requested echo', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    let resolve!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementation(() => new Promise(r => { resolve = r; }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const mix = controller.requestMix(patchGain(-9));
+    const arm = controller.arm();
+    await new Promise(r => setTimeout(r, 0));
+    expect(ports.signaling.arm).not.toHaveBeenCalled();
+    resolve(accept(patchGain(-9), '13'));
+    await Promise.all([mix, arm]);
+    expect(ports.signaling.arm).toHaveBeenCalledWith(expect.objectContaining({ appliedRevision: '13' }), expect.any(String), expect.any(AbortSignal));
+    controller.disconnect();
+  });
+
+  test('rejected intent rolls requested state back to accepted state', async () => {
+    const { ports } = fakePorts();
+    const controller = createReceiverController(ports);
+    await controller.requestMix(patchGain(-9));
+    vi.mocked(ports.signaling.requestMix).mockRejectedValueOnce(new Error('Revision conflict'));
+    await expect(controller.requestMix(patchGain(-3))).rejects.toThrow('Revision conflict');
+    expect(controller.getSnapshot().requested_mix).toEqual(controller.getSnapshot().accepted_mix);
+  });
+
+  test('a later queued edit survives rejection of the in-flight edit', async () => {
+    const { ports } = fakePorts();
+    const controller = createReceiverController(ports);
+    await controller.requestMix(patchGain(-9));
+    let reject!: (error: Error) => void;
+    const send = vi.mocked(ports.signaling.requestMix);
+    send.mockImplementationOnce(() => new Promise((_, r) => { reject = r; }))
+      .mockImplementation(async patch => accept(patch, '13'));
+    const failed = controller.requestMix(patchGain(-6));
+    const failure = expect(failed).rejects.toThrow('Rejected');
+    const later = controller.requestMix({ ...patchGain(-3), masterDb: -4 });
+    reject(new Error('Rejected'));
+    await failure;
+    await later;
+    expect(send.mock.calls[2][0]).toMatchObject({ baseRevision: '12', masterDb: -4 });
+    expect(controller.getSnapshot().requested_mix?.sources[0].gainDb).toBe(-3);
+    expect(controller.getSnapshot().error).toBeNull();
+  });
+
+  test.each(['stop', 'disconnect'] as const)('canceling arm during mix wait with %s discards queued intent', async action => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    let resolve!: (ack: MixAck) => void;
+    const send = vi.mocked(ports.signaling.requestMix);
+    send.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const mix = controller.requestMix(patchGain(-9));
+    const queued = controller.requestMix(patchGain(-3));
+    const arm = controller.arm();
+    const armResult = arm.then(() => 'resolved', () => 'canceled');
+    const queuedResult = queued.then(() => 'resolved', () => 'canceled');
+    const mixResult = mix.then(() => 'resolved', () => 'canceled');
+    await new Promise(r => setTimeout(r, 0));
+    controller[action]();
+    // Teardown settles callers even though the already-sent host request is still delayed.
+    expect(await armResult).toBe('canceled');
+    expect(await queuedResult).toBe('canceled');
+    expect(await mixResult).toBe('canceled');
+    resolve(accept(patchGain(-9), '13'));
+    await new Promise(r => setTimeout(r, 0));
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ports.signaling.arm).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().phase).not.toBe('armed');
+    controller.disconnect();
+  });
+
+  test('arm stays pending after send until matching confirmation and repeated start cannot replace it', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+    const controller = createReceiverController(ports);
+    let settled = false;
+    const arm = controller.arm().then(() => { settled = true; });
+    await vi.waitFor(() => expect(ports.signaling.arm).toHaveBeenCalledTimes(1));
+    expect(settled).toBe(false);
+    const sent = vi.mocked(ports.signaling.arm).mock.calls[0][0];
+    const repeated = controller.arm().catch(() => undefined);
+    await new Promise(r => setTimeout(r, 0));
+    expect(ports.signaling.arm).toHaveBeenCalledTimes(1);
+    emit({ type: 'listen.armed', payload: { armNonce: 'unrelated', safetyGeneration: '1' } } as ServerEvent);
+    expect(settled).toBe(false);
+    emit({ type: 'listen.armed', payload: { armNonce: sent.armNonce, safetyGeneration: '1' } } as ServerEvent);
+    await Promise.all([arm, repeated]);
+    expect(settled).toBe(true);
+    expect(controller.getSnapshot().phase).toBe('armed');
+    controller.disconnect();
+  });
+
+  test('arm confirmation has a bounded timeout and late confirmation cannot arm', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+      vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+      const controller = createReceiverController(ports);
+      const result = controller.arm().then(() => 'resolved', e => e.message as string);
+      await vi.advanceTimersByTimeAsync(1);
+      const sent = vi.mocked(ports.signaling.arm).mock.calls[0][0];
+      await vi.advanceTimersByTimeAsync(15000);
+      expect(await result).toMatch(/timed out/i);
+      emit({ type: 'listen.armed', payload: { armNonce: sent.armNonce, safetyGeneration: '1' } } as ServerEvent);
+      expect(controller.getSnapshot().phase).not.toBe('armed');
+      controller.disconnect();
+    } finally { vi.useRealTimers(); }
+  });
+
+  test('stop rejects a sent arm awaiting confirmation and ignores its late confirmation', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+    const controller = createReceiverController(ports);
+    const result = controller.arm().then(() => 'resolved', e => e.message as string);
+    await vi.waitFor(() => expect(ports.signaling.arm).toHaveBeenCalledTimes(1));
+    const sent = vi.mocked(ports.signaling.arm).mock.calls[0][0];
+    controller.stop();
+    expect(await result).toMatch(/canceled/i);
+    emit({ type: 'listen.armed', payload: { armNonce: sent.armNonce, safetyGeneration: '1' } } as ServerEvent);
+    expect(controller.getSnapshot().phase).toBe('ready-muted');
+    controller.disconnect();
+  });
+
+  test('mix success does not clear an unrelated error received after mix rejection', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    let reject!: (error: Error) => void;
+    let resolve!: (ack: MixAck) => void;
+    const send = vi.mocked(ports.signaling.requestMix);
+    send.mockImplementationOnce(() => new Promise((_, r) => { reject = r; }))
+      .mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const one = controller.requestMix(patchGain(-9)).catch(() => undefined);
+    const two = controller.requestMix(patchGain(-3));
+    reject(new Error('Mix rejected'));
+    await one;
+    emit({ type: 'error', requestId: 'other-action', payload: { message: 'Another action failed' } } as ServerEvent);
+    resolve(accept(patchGain(-3), '13'));
+    await two;
+    expect(controller.getSnapshot().error).toBe('Another action failed');
+    controller.disconnect();
+  });
+
+  test('only a correlated host error rejects a pending arm', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.arm).mockResolvedValue(undefined);
+    const controller = createReceiverController(ports);
+    let settled = false;
+    const result = controller.arm().then(() => 'resolved', e => { settled = true; return e.message; });
+    await vi.waitFor(() => expect(ports.signaling.arm).toHaveBeenCalledTimes(1));
+    emit({ type: 'error', requestId: 'unrelated', payload: { message: 'Unrelated failure' } } as ServerEvent);
+    expect(settled).toBe(false);
+    const sent = vi.mocked(ports.signaling.arm).mock.calls[0][0];
+    emit({ type: 'error', requestId: sent.armNonce, payload: { message: 'Arm was refused' } } as ServerEvent);
+    expect(await result).toBe('Arm was refused');
+    expect(controller.getSnapshot().phase).not.toBe('armed');
+    controller.disconnect();
+  });
+
+  test('muting during delayed explicit unmute invalidates its permission to open output', async () => {
+    const { ports, media, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.arm).mockImplementation(async arm => {
+      emit({ type: 'listen.armed', payload: { armNonce: arm.armNonce, safetyGeneration: '1' } } as ServerEvent);
+    });
+    const controller = createReceiverController(ports);
+    await controller.arm();
+    let resolve!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    controller.personalMasterMute(false);
+    controller.personalMasterMute(true);
+    resolve(ack);
+    await new Promise(r => setTimeout(r, 0));
+    expect(controller.getSnapshot().master_local_muted).toBe(true);
+    expect(media.mute).not.toHaveBeenCalledWith(false);
+    controller.disconnect();
+  });
+
+  test.each([false, true])('fresh arm and explicit output unmute releases host mute safely (reject=%s)', async reject => {
+    const { ports, media, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a'), catalogSnapshotEvent()] });
+    let revision = 0;
+    vi.mocked(ports.signaling.requestMix).mockImplementation(async patch => accept(patch, String(++revision)));
+    vi.mocked(ports.signaling.arm).mockImplementation(async arm => {
+      emit({ type: 'listen.armed', payload: { armNonce: arm.armNonce, safetyGeneration: '1' } } as ServerEvent);
+    });
+    const controller = createReceiverController(ports);
+    await controller.arm();
+    expect(controller.getSnapshot().accepted_mix?.masterMuted).toBe(true);
+    await controller.requestMix({ ...patchGain(-9), masterMuted: true });
+    expect(controller.getSnapshot().master_local_muted).toBe(true);
+    if (reject) vi.mocked(ports.signaling.requestMix).mockRejectedValueOnce(new Error('Host refused output'));
+    controller.personalMasterMute(false);
+    await vi.waitFor(() => expect(ports.signaling.requestMix).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(controller.getSnapshot().master_local_muted).toBe(reject));
+    expect(vi.mocked(ports.signaling.requestMix).mock.calls[2][0]).toMatchObject({ masterMuted: false, baseRevision: '2' });
+    if (reject) {
+      expect(media.mute).not.toHaveBeenCalledWith(false);
+      expect(controller.getSnapshot().error).toContain('Host refused output');
+      expect(controller.getSnapshot().requested_mix?.masterMuted).toBe(true);
+    } else expect(controller.getSnapshot().accepted_mix?.masterMuted).toBe(false);
+    controller.disconnect();
+  });
+
   test('arming_requires_explicit_gesture', async () => {
     const { ports } = fakePorts({ gesture: false });
     const controller = createReceiverController(ports);

@@ -97,6 +97,27 @@ function mediaDeps() {
 }
 
 describe('browser media port', () => {
+  test.each(['offer', 'description'] as const)('stop during delayed %s work cannot send a canceled RTC offer', async boundary => {
+    let release!: () => void;
+    const deferred = new Promise<void>(r => { release = r; });
+    const spy = boundary === 'offer'
+      ? vi.spyOn(FakePeerConnection.prototype, 'createOffer').mockImplementationOnce(async () => {
+        await deferred; return { type: 'offer', sdp: 'canceled' };
+      })
+      : vi.spyOn(FakePeerConnection.prototype, 'setLocalDescription').mockImplementationOnce(async () => { await deferred; });
+    const { signaling, offer } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    try {
+      const pending = media.createRecvOnlyAudio().catch(() => undefined);
+      await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+      media.stop();
+      release();
+      await pending;
+      expect(offer).not.toHaveBeenCalled();
+      expect(media.peerConnection()).toBeNull();
+    } finally { spy.mockRestore(); }
+  });
+
   test('creates exactly one recvonly audio transceiver and never calls getUserMedia', async () => {
     FakePeerConnection.instances = [];
     const getUserMedia = vi.fn();
@@ -108,7 +129,7 @@ describe('browser media port', () => {
     const pc = FakePeerConnection.instances.at(-1)!;
     expect(pc.transceivers).toHaveLength(1);
     expect(pc.transceivers[0].direction).toBe('recvonly');
-    await vi.waitFor(() => expect(offer).toHaveBeenCalledWith('v=0\r\no=offer\r\n'));
+    await vi.waitFor(() => expect(offer).toHaveBeenCalledWith('v=0\r\no=offer\r\n', undefined));
     expect(getUserMedia).not.toHaveBeenCalled();
 
     pc.connect();
