@@ -72,6 +72,19 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
 
   const base = snapshot.requested_mix ?? snapshot.accepted_mix ?? snapshot.applied_mix;
   const applied = snapshot.applied_mix;
+  // A listener starts with no host mix. Rather than block every edit, synthesize a neutral local
+  // mix from the catalog (all sources muted at a safe attenuation, master attenuated); the first
+  // patch then carries the listener's real intent. Muted-by-default keeps nothing unexpectedly
+  // audible before an explicit unmute.
+  const neutralMix: MixSnapshot = base ?? {
+    catalogRevision: snapshot.catalog.catalogRevision,
+    mixRevision: '0' as CounterString,
+    sources: snapshot.catalog.sources
+      .filter(source => source.available && source.authorized)
+      .map(source => ({ sourceId: source.sourceId, gainDb: -60, muted: true })),
+    masterDb: -60,
+    masterMuted: true,
+  };
   const match =
     !!intent?.acceptedRevision &&
     applied?.mixRevision === intent.acceptedRevision &&
@@ -84,7 +97,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       ),
     );
   const pending = !!intent && !match;
-  const display = pending ? intent.patch : rollback ?? base;
+  const display = pending ? intent.patch : rollback ?? neutralMix;
   const editable = snapshot.phase === 'armed' || snapshot.phase === 'ready-muted';
   const errorMessage = (e: unknown) =>
     e instanceof Error ? e.message : 'The host could not complete this action.';
@@ -113,9 +126,11 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
     }
   }
   function edit(change: Partial<Pick<MixSnapshot, 'sources' | 'masterDb' | 'masterMuted'>>) {
-    if (!display || !base) return;
+    if (!display) return;
     void request({
-      baseRevision: snapshot.accepted_mix?.mixRevision ?? base.mixRevision,
+      // Revisions are decimal strings; the first patch of a session uses "0" (the host's initial
+      // revision) when no mix has been accepted yet.
+      baseRevision: (snapshot.accepted_mix?.mixRevision ?? base?.mixRevision ?? '0') as CounterString,
       catalogRevision: snapshot.catalog.catalogRevision,
       sources: display.sources,
       masterDb: display.masterDb,
@@ -185,19 +200,28 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       />
     );
   }
-  const channels = (display?.sources ?? []).map(s => {
-    const a = applied?.sources.find(n => n.sourceId === s.sourceId);
-    return {
-      sourceId: s.sourceId,
-      label: snapshot.catalog.sources.find(n => n.sourceId === s.sourceId)?.label ?? s.sourceId,
-      requestedDb: s.gainDb,
-      appliedDb: a?.gainDb,
-      appliedMuted: a?.muted,
-      muted: s.muted,
-      pending,
-      accepted: pending && !!intent?.acceptedRevision,
-    };
-  });
+  // Channels come from the CATALOG, not from the mix: a freshly paired listener has no mix yet,
+  // and deriving faders from the mix left zero controls, so the listener could never create a
+  // first patch. Gain/mute defaults are neutral until the host sends real values.
+  const mixBySource = new Map((display?.sources ?? []).map(s => [s.sourceId, s]));
+  const channels = snapshot.catalog.sources
+    .filter(source => source.available && source.authorized)
+    .map(source => {
+      const mixed = mixBySource.get(source.sourceId);
+      const a = applied?.sources.find(n => n.sourceId === source.sourceId);
+      return {
+        sourceId: source.sourceId,
+        label: source.label,
+        // Default to muted with a safe attenuation so nothing is unexpectedly audible before the
+        // listener sets a level and unmutes explicitly.
+        requestedDb: mixed?.gainDb ?? -60,
+        appliedDb: a?.gainDb,
+        appliedMuted: a?.muted,
+        muted: mixed?.muted ?? true,
+        pending,
+        accepted: pending && !!intent?.acceptedRevision,
+      };
+    });
 
   return (
     <ReceiverView

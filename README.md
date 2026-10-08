@@ -16,7 +16,7 @@ incomplete; the UI marks unsupported actions unavailable rather than reporting s
 **Real-hardware qualification has not been performed.** Rendering a screen or passing unit tests
 does not prove that mixer audio reaches a phone. See [the qualification record](docs/qualification/macos-poc.md).
 
-**Project site:** <https://daryllmagsombol.github.io/iem-cast/> — documentation plus a clearly
+**Project site:** <https://iem-cast.darjosh.dev/> — documentation plus a clearly
 labeled silent, simulated mix demo (no host connection, no audio).
 
 ## Run the app

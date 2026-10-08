@@ -46,6 +46,55 @@ test('accepted settings are never presented as Applied; mute waits for matching 
   expect(screen.queryByText(/Accepted · Waiting for host application/)).not.toBeInTheDocument();
 });
 
+test('a listener with no mix yet still gets a fader per catalog source', () => {
+  // Regression: a freshly paired listener has no requested/accepted/applied mix, but the channel
+  // strips were derived ONLY from the mix. With no mix the phone rendered zero faders, so the
+  // listener could never create a first patch — a deadlock. Channels must come from the catalog.
+  let snapshot: ReceiverSnapshot = {
+    phase: 'ready-muted',
+    catalog: {
+      catalogRevision: '1' as CounterString,
+      sources: [
+        {
+          sourceId: 'vocal',
+          physicalIndex: 0,
+          label: 'Lead vocal',
+          available: true,
+          authorized: true,
+          stereoPair: null,
+          role: 'inputChannel',
+        },
+      ],
+    },
+    requested_mix: null,
+    accepted_mix: null,
+    applied_mix: null,
+    master_local_muted: true,
+    error: null,
+    diagnostics: {
+      network_rtt_ms: 'Unavailable',
+      buffer_delay_ms: 'Waiting for sample',
+      end_to_end: 'Not measured',
+      last_updated: null,
+    },
+  };
+  const controller: ReceiverController = {
+    getSnapshot: () => snapshot,
+    subscribe: () => () => {},
+    connect: vi.fn(async () => {}),
+    arm: vi.fn(async () => {}),
+    requestMix: vi.fn(),
+    personalMasterMute: vi.fn(),
+    stop: vi.fn(),
+    disconnect: vi.fn(),
+  };
+  render(<MusicianRoot controller={controller} />);
+
+  // The channel exists (so a gain can be requested) even though the host has sent no mix.
+  expect(screen.getAllByText('Lead vocal').length).toBeGreaterThan(0);
+  expect(screen.getByRole('slider', { name: /lead vocal/i })).toBeInTheDocument();
+});
+
 test('prepare rejection is visible rather than an unhandled promise', async () => {
   const { controller } = fixture();
   controller.connect = vi.fn().mockRejectedValue(new Error('Host is unavailable'));
@@ -69,11 +118,14 @@ test('accepted-only gain edit stays pending and a rejected edit restores the app
   expect(screen.getByRole('slider', { name: 'Lead vocal' })).toHaveValue('-12');
 });
 
-test('source loss disables edits and requests local silence without auto-unmute or arm', () => {
+test('source loss requests local silence without auto-unmute or arm', () => {
   const { controller, update } = fixture('armed');
   render(<MusicianRoot controller={controller} />);
+  // Channels are derived from the catalog, so losing the source removes its fader entirely.
+  expect(screen.getByRole('slider', { name: 'Lead vocal' })).toBeInTheDocument();
   act(() => update({ catalog: { catalogRevision: '2' as CounterString, sources: [] } }));
-  expect(screen.getByRole('slider', { name: 'vocal' })).toBeDisabled();
+  expect(screen.queryByRole('slider', { name: 'Lead vocal' })).not.toBeInTheDocument();
+  expect(screen.getByText('No channels assigned')).toBeInTheDocument();
   expect(controller.personalMasterMute).toHaveBeenCalledWith(true);
   expect(controller.personalMasterMute).not.toHaveBeenCalledWith(false);
   expect(controller.arm).not.toHaveBeenCalled();

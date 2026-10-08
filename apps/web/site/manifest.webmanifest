@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/web-manifest-combined.json",
+  "name": "IEM Cast",
+  "short_name": "IEM Cast",
+  "description": "Personal monitor mixes for live performance, delivered to a wired phone browser.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#11161C",
+  "theme_color": "#11161C"
+}

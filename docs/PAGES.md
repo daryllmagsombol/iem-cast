@@ -1,6 +1,6 @@
 # GitHub Pages: documentation and simulated mix demo
 
-**DRAFT — design for review before site implementation.** The user selected both documentation and an interactive simulated UI demo. This document does not authorize bypassing POC plan review, create a website, or claim deployment. Expected project address: <https://daryllmagsombol.github.io/iem-cast/>; it is not verified as deployed.
+**DRAFT — design for review before site implementation.** The user selected both documentation and an interactive simulated UI demo. This document does not authorize bypassing POC plan review, create a website, or claim deployment. The site is served at the configured custom domain; the base path is a deployment setting (`VITE_SITE_BASE`), not a source constant.
 
 ## Purpose and content
 

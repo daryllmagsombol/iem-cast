@@ -1,6 +1,6 @@
-export function Documentation() {
-  const repo = 'https://github.com/daryllmagsombol/iem-cast';
+import { repoUrl as repo, releasesUrl } from './config';
 
+export function Documentation() {
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-3 py-6 sm:px-4 lg:flex-row lg:gap-8">
       <nav aria-label="Documentation sections" className="lg:w-60 lg:shrink-0">
@@ -102,7 +102,7 @@ export function Documentation() {
               </a>
             </li>
             <li>
-              <a className="text-accent underline" href={`${repo}/releases`}>
+              <a className="text-accent underline" href={releasesUrl}>
                 View releases
               </a>
             </li>

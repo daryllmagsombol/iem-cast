@@ -34,7 +34,14 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # The custom domain and asset base are deployment settings, not source constants. CNAME is
+      # emitted into the artifact from VITE_SITE_DOMAIN; the site serves from the domain root, so
+      # the base path is '/'.
       - run: npm run build:site --workspace apps/web
+        env:
+          VITE_SITE_BASE: '/'
+          VITE_SITE_DOMAIN: ${{ vars.PAGES_CUSTOM_DOMAIN }}
+          VITE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

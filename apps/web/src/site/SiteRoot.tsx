@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { repoUrl } from './config';
 import { Documentation } from './Documentation';
 import { MixDemo } from './MixDemo';
 
@@ -95,7 +96,7 @@ export function SiteRoot() {
               {theme === 'dark' ? 'Light theme' : 'Dark theme'}
             </button>
             <a
-              href="https://github.com/daryllmagsombol/iem-cast"
+              href={repoUrl}
               className="inline-flex min-h-target-compact items-center rounded-control border border-boundary bg-surface px-3 text-label text-accent underline hover:bg-surface-raised"
             >
               Source
