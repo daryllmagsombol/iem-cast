@@ -22,10 +22,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      # Read PR data for the review; posting the review uses issues: write
-      # (PRs are issues for commenting/reactions). No PR/contents write is
-      # granted, so the action cannot push even if a tool were misused.
-      pull-requests: read
+      # Allow the action to comment and react on PR timelines. These use
+      # issue endpoints, but issues: write alone returned 403 on PR #1.
+      # Keep contents read-only: the action must not push repository changes.
+      pull-requests: write
       issues: write
     steps:
       - name: Checkout

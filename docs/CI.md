@@ -150,12 +150,17 @@ remote push. The prompt is defense-in-depth, not the enforcement mechanism.
 
 ### Job permissions
 
-The job uses `contents: read` (checkout), `pull-requests: read` (the action reads PR
-data via GraphQL/REST), and `issues: write` to post the review comment and reactions
-(on a `pull_request` event the action comments on the PR's issue thread). No
-`contents`/`pull-requests` write is granted, so the action cannot push even if a tool
-were misused. These GitHub API scopes are the action's own operations; they do not
-grant the agent tool permissions (those are handled by `OPENCODE_PERMISSION` above).
+The job uses `contents: read` (checkout), `pull-requests: write`, and `issues: write`.
+A pull request's comments/reactions are served by the "issues" endpoints. Grant
+`pull-requests: write` for the action to post to a PR timeline: with only
+`pull-requests: read` and `issues: write`, the action's
+`POST /repos/{owner}/{repo}/issues/{n}/comments` and `.../reactions` calls returned
+`403 Resource not accessible by integration` (observed on PR #1).
+`issues: write` remains for issue-thread operations.
+
+No `contents` write is granted, so the action still cannot push even if a tool were
+misused. These GitHub API scopes are the action's own operations; they do not grant the
+agent tool permissions (those are handled by `OPENCODE_PERMISSION` above).
 
 ### Repository secret
 
