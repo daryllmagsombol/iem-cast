@@ -1,0 +1,107 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Build/test only; no repository writes.
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Web correctness gate on Linux. Vitest runs headless; the targeted mix
+  # regression drives headless Chromium, which is well supported on ubuntu.
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      - name: Web unit tests
+        run: npm test
+
+      # `build:web` runs `npm run build --workspace apps/web`, whose `build`
+      # script begins with `tsc --noEmit`, then Vite-builds the admin and
+      # musician bundles. This is the production build gate for the frontend.
+      - name: Build web (includes typecheck)
+        run: npm run build:web
+
+      # Playwright is pinned by the root lockfile (@playwright/test 1.63.0).
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Targeted browser mix regression: real MusicianRoot + ReceiverController
+      # driven in Chromium via a Vite dev server. This is the acceptance check
+      # for the mix/arm/unmute/safety UI behavior. `vite.musician.config.ts` is
+      # resolved relative to the working directory, so run from `apps/web`.
+      - name: Browser mix regression
+        working-directory: apps/web
+        run: node src/musician/__tests__/mix.browser.mjs
+
+  # Rust correctness gate on macOS. The workspace includes the Tauri desktop
+  # crate (`apps/desktop/src-tauri`), whose native dependencies are macOS
+  # frameworks; on Linux the same build needs WebKitGTK/ALSA/CMake packages and
+  # is not a faithful environment. The desktop crate also `#[folder]`-embeds
+  # `apps/web/dist/musician` and its tests assert the join page is present, so
+  # the web bundles must be built before `cargo test --workspace`.
+  rust:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install web dependencies (locked)
+        run: npm ci
+
+      # Required before the workspace tests: the desktop crate embeds the built
+      # musician bundle and asserts its presence at test time. `apps/web/dist`
+      # is gitignored, so it is always absent on a fresh runner.
+      - name: Build web bundles for desktop embed
+        run: npm run build:web
+
+      # Pinned to the dtolnay/rust-toolchain v1 commit. Toolchain 1.90 matches
+      # rust-toolchain.toml (`channel = "1.90"`); `clippy` is installed because
+      # this job runs clippy (rustfmt is declared there too but not run here).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: "1.90"
+          components: clippy
+
+      # Caches the Cargo registry and target dirs; keyed on Cargo.lock and the
+      # rust-toolchain files, so it stays compatible with the locked toolchain.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Rust tests (workspace, locked)
+        run: cargo test --workspace --locked
+
+      - name: Rust clippy (workspace, locked, warnings denied)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

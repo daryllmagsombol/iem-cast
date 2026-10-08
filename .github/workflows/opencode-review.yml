@@ -1,0 +1,105 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# The review job only reads the repo and comments on the PR.
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Fork PRs do not receive repository secrets, so the review cannot run
+    # there. Do NOT switch to `pull_request_target`: that would hand repository
+    # secrets and a write-capable token to untrusted PR code.
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Read PR data for the review; posting the review uses issues: write
+      # (PRs are issues for commenting/reactions). No PR/contents write is
+      # granted, so the action cannot push even if a tool were misused.
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Do not leave git credentials on disk.
+          persist-credentials: false
+
+      # `secrets` is not available in an `if:` condition, so gate via a step
+      # output. Unconfigured repos (and any non-fork PR missing the secret)
+      # skip with a clear annotation instead of failing. See docs/CI.md.
+      - name: Check review credentials
+        id: review_creds
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          if [ -n "$OPENCODE_API_KEY" ]; then
+            echo "run_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_review=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OPENCODE_API_KEY is not set; skipping the AI code review. See docs/CI.md."
+          fi
+
+      # Informational only: continue-on-error so a review failure can never block
+      # a PR or be mistaken for a correctness gate. The Tests workflow is the
+      # actual correctness gate; this job is advisory.
+      #
+      # Enforcement is layered (see docs/CI.md for the full boundary):
+      #  1. `OPENCODE_PERMISSION` (a supported opencode env var, merged into the
+      #     global permission config) denies the edit/write, bash, webfetch,
+      #     websearch, task, and external_directory TOOLS, so the reviewer cannot
+      #     modify files or run shell writes. The action's own git/Octokit
+      #     operations do not use these tools.
+      #  2. `OPENCODE_DISABLE_PROJECT_CONFIG=true` stops the agent from loading
+      #     the PR's `.opencode/` config, so an untrusted PR cannot supply
+      #     permissions, agents, or plugins that weaken the review.
+      #  3. `contents: read` + `persist-credentials: false` mean the token cannot
+      #     push, so no remote write is possible.
+      # The prompt below is defense-in-depth, not the enforcement mechanism.
+      - name: AI Code Review
+        if: steps.review_creds.outputs.run_review == 'true'
+        continue-on-error: true
+        uses: anomalyco/opencode/github@11e47f91496005aab4d7c5a2d0a7da5d2651b4ac # v1.17.8
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Deny the tools a read-only reviewer must never use. Keys are the
+          # documented permission keys (edit covers edit/write/apply_patch; the
+          # shell tool's permission key is "bash").
+          OPENCODE_PERMISSION: '{"edit":"deny","bash":"deny","webfetch":"deny","websearch":"deny","task":"deny","external_directory":"deny"}'
+          # Never load project (PR-supplied) opencode config.
+          OPENCODE_DISABLE_PROJECT_CONFIG: "true"
+        with:
+          model: opencode/muse-spark-1.3-contributor-free
+          use_github_token: true
+          prompt: |
+            You are a read-only reviewer for the iem-cast repository:
+            a Rust workspace (`crates/host-core`, `apps/desktop/src-tauri`)
+            with a TypeScript/React frontend (`apps/web`).
+
+            Review this pull request's diff and changed files only.
+
+            Do not attempt to edit, create, or delete files, run shell commands,
+            commit, or push. Finding and reporting issues is the whole task.
+            Write your findings as a PR comment with file:line references.
+
+            Check for:
+            - Bugs and logic errors
+            - Security vulnerabilities, especially around the local HTTPS/TLS
+              host, transport/session handling, and untrusted network input
+            - Missing error handling
+            - Rust and TypeScript/React correctness issues
+
+            Be conservative: only flag issues you are 90%+ sure about.
+            Skip style, formatting, and naming nits.
+            If the code looks good, say LGTM.
+            End the review with the model name for traceability.
