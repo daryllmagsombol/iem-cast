@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { DeviceInfo, SourceInfo } from '../protocol';
 import type { HostBridge } from '../desktop-bridge/contracts';
-import { Button } from '../ui/Button';
 
 export interface SourcesViewProps {
   bridge?: HostBridge;
@@ -56,8 +55,9 @@ export function SourcesView({ bridge, device }: SourcesViewProps) {
       {device && bridge && !error && sources !== null && sources.length > 0 && (
         <>
           <p className="text-text-secondary">
-            These are the {sources.length} channels reported by {device.name}. They are read-only:
-            this build cannot persist source renames or permissions.
+            All {sources.length} channels reported by {device.name} are already available to
+            musicians. No publishing step is required: a listener can mix these as soon as they
+            join. Treating the channel names as fixed is a deliberate limit of this build.
           </p>
           <ul className="iem-stack" aria-label="Reported source channels">
             {sources.map(source => (
@@ -71,14 +71,11 @@ export function SourcesView({ bridge, device }: SourcesViewProps) {
           </ul>
         </>
       )}
-      <div className="iem-row">
-        <Button disabled explanation="Source names cannot be saved in this build.">
-          Save label
-        </Button>
-        <Button disabled explanation="Source permissions are not stored in this build.">
-          Publish sources
-        </Button>
-      </div>
+      {/*
+        Deliberately no disabled "Save label" / "Publish sources" buttons: they would imply a
+        required step that does not exist. The host already exposes every channel, so the honest
+        statement above replaces a control that could only mislead.
+      */}
     </div>
   );
 }

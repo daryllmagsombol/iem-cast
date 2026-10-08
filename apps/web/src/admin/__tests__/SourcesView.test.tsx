@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { SourcesView } from '../SourcesView';
 import type { DeviceInfo, SourceInfo } from '../../protocol';
 import type { CatalogSnapshot } from '../../protocol';
@@ -79,19 +79,17 @@ test('a device reporting no channels shows an honest empty state', async () => {
   expect(await screen.findByText(/reports no source channels/i)).toBeInTheDocument();
 });
 
-test('label and publish stay disabled and never call the mutation RPCs', async () => {
+test('shows every channel as already available with no publishing step', async () => {
   const bridge = bridgeWith({ 'blackhole-2ch': twoChannelSources });
   bridge.setAvailableSources = vi.fn();
   bridge.setSourceLabel = vi.fn();
   render(<SourcesView bridge={bridge} device={twoChannelDevice} />);
   await screen.findByText('Channel 1');
 
-  const save = screen.getByRole('button', { name: 'Save label' });
-  const publish = screen.getByRole('button', { name: 'Publish sources' });
-  expect(save).toBeDisabled();
-  expect(publish).toBeDisabled();
-  fireEvent.click(save);
-  fireEvent.click(publish);
-  await waitFor(() => expect(bridge.setAvailableSources).not.toHaveBeenCalled());
+  // The host already exposes every reported channel, so there is no publish step to imply.
+  expect(screen.getByText(/already available to musicians/i)).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Publish sources' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Save label' })).not.toBeInTheDocument();
+  expect(bridge.setAvailableSources).not.toHaveBeenCalled();
   expect(bridge.setSourceLabel).not.toHaveBeenCalled();
 });

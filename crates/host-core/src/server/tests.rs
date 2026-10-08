@@ -503,6 +503,109 @@ fn ws_cross_session_rtc_message_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Control frames over the wired socket dispatch path
+// ---------------------------------------------------------------------------------------------
+
+/// Build an envelope naming `test_session_a()` on both the envelope and (for disarm) the payload.
+fn listen_envelope(kind: &str, payload: serde_json::Value) -> String {
+    serde_json::to_string(&EnvelopeV1 {
+        v: 1,
+        kind: kind.to_string(),
+        request_id: RequestId("listen-1".to_string()),
+        host_epoch: test_host_epoch(),
+        session_epoch: Some(test_session_a()),
+        payload,
+    })
+    .unwrap()
+}
+
+#[test]
+fn ws_listen_arm_overlays_the_authenticated_session() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    // A real phone frame: the payload carries no session field (it comes from the envelope).
+    let nonce = ArmNonce::from_bytes([0x66; 16]);
+    let text = listen_envelope(
+        "listen.arm",
+        serde_json::json!({
+            "audioEpoch": test_audio_epoch().to_string(),
+            "safetyGeneration": "0",
+            "appliedRevision": "0",
+            "armNonce": nonce.to_string(),
+        }),
+    );
+
+    let reply = crate::server::ws::dispatch(&shared, test_session_a(), &text);
+    assert!(
+        reply.is_none(),
+        "a real listen.arm frame must be accepted, not rejected: {reply:?}"
+    );
+
+    // The arm reached the actor for the authenticated session (generation advanced 0 -> 1).
+    let guard = shared.lock().unwrap();
+    assert_eq!(
+        guard.control.current_generation(test_session_a()),
+        SafetyGeneration(1)
+    );
+}
+
+#[test]
+fn ws_listen_arm_rejects_an_envelope_naming_a_different_session() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    let nonce = ArmNonce::from_bytes([0x67; 16]);
+    let text = serde_json::to_string(&EnvelopeV1 {
+        v: 1,
+        kind: "listen.arm".to_string(),
+        request_id: RequestId("listen-2".to_string()),
+        host_epoch: test_host_epoch(),
+        // The envelope claims a session other than the one the socket is authenticated as.
+        session_epoch: Some(SessionEpoch::from_bytes([0x77; 16])),
+        payload: serde_json::json!({
+            "audioEpoch": test_audio_epoch().to_string(),
+            "safetyGeneration": "0",
+            "appliedRevision": "0",
+            "armNonce": nonce.to_string(),
+        }),
+    })
+    .unwrap();
+
+    let reply = crate::server::ws::dispatch(&shared, test_session_a(), &text).expect("reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["payload"]["code"], "UNAUTHORIZED");
+}
+
+#[test]
+fn ws_listen_disarm_from_a_real_client_frame_is_accepted() {
+    let (server, _clock) = build_server();
+    let shared: crate::server::http::SharedServer = Arc::new(Mutex::new(server));
+
+    // Match `signaling.ts::disarm`: the payload repeats the session epoch on the wire.
+    let text = listen_envelope(
+        "listen.disarm",
+        serde_json::json!({
+            "sessionEpoch": test_session_a().to_string(),
+            "safetyGeneration": "0",
+        }),
+    );
+
+    let reply = crate::server::ws::dispatch(&shared, test_session_a(), &text);
+    assert!(
+        reply.is_none(),
+        "a real listen.disarm frame must be accepted, not rejected: {reply:?}"
+    );
+
+    let guard = shared.lock().unwrap();
+    assert_eq!(
+        guard.control.current_generation(test_session_a()),
+        SafetyGeneration(1)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Outbound push: initial snapshots and audio-event delivery
 // ---------------------------------------------------------------------------------------------
 

@@ -306,6 +306,15 @@ fn handle_arm(
             )
         }
     };
+    // The wire payload carries no session field; session identity comes from the authenticated
+    // socket (and the matching envelope check in `dispatch`). Overlay it before the actor's check.
+    let arm = crate::contract::ListenArm {
+        context: crate::contract::SessionContext {
+            session_epoch: session,
+            ..arm.context
+        },
+        ..arm
+    };
     let mut guard = lock(state);
     match guard.control.arm(session, arm) {
         Ok(()) => None, // `listen.armed` is emitted only when the DSP confirms the tuple.

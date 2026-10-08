@@ -153,7 +153,8 @@ test('real enumeration, selection and rescan do not call unsupported mutation RP
   expect(screen.getByLabelText('Certificate path')).toHaveValue('/local/cert.pem');
   // The host has not been started, so pairing stays unavailable and no mutation fires.
   expect(screen.getByRole('button', { name: 'Generate pairing code' })).toBeDisabled();
-  expect(screen.getByRole('button', { name: 'Save label' })).toBeDisabled();
+  // The sources step exposes every reported channel as already available; there is no publish
+  // control that could imply a step the host does not require.
   fireEvent.click(screen.getByRole('button', { name: 'Rescan devices' }));
   expect(bridge.listDevices).toHaveBeenCalledTimes(2);
   // Selecting a device triggers the read-only source catalog for that device; mutation RPCs never fire.
