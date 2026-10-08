@@ -290,9 +290,6 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       await playPromise;
 
       const accepted = snapshot.accepted_mix ?? snapshot.requested_mix;
-      if (!accepted) {
-        throw new Error('No accepted mix is available to arm');
-      }
       if (hostAudioEpoch === null) {
         // Without the host's real audio epoch the arm would be rejected as STALE_EPOCH. Refuse
         // locally rather than sending a fabricated value that can never succeed.
@@ -304,7 +301,10 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       const arm: ListenArm = {
         audioEpoch: hostAudioEpoch as ListenArm['audioEpoch'],
         safetyGeneration: (currentGeneration ?? '0') as CounterString,
-        appliedRevision: accepted.mixRevision,
+        // A freshly paired listener has no mix yet, so there is no accepted revision to reference.
+        // The host's initial revision is "0"; sending it is correct and lets the listener start
+        // listening before touching any fader.
+        appliedRevision: (accepted?.mixRevision ?? '0') as CounterString,
         armNonce: nonce as unknown as ListenArm['armNonce'],
       };
 

@@ -277,4 +277,25 @@ describe('receiver controller safety gate', () => {
     // The catalog revision must never be passed off as an audio epoch.
     expect(sent.audioEpoch).not.toBe('1');
   });
+
+  test('a fresh listener can arm without having moved any fader', async () => {
+    // Regression: `arm()` required an accepted/requested mix, but a freshly paired listener has
+    // neither until they touch a control. Tapping Start listening without moving a fader threw
+    // "No accepted mix is available to arm" — a deadlock for the normal happy path.
+    const { ports } = fakePorts({
+      gesture: true,
+      connectSnapshots: [sessionSnapshotEvent('audio-epoch-abc'), catalogSnapshotEvent()],
+    });
+    const armSpy = ports.signaling.arm as unknown as ReturnType<typeof vi.fn>;
+    const controller = createReceiverController(ports);
+
+    await controller.connect();
+    // No requestMix call: the listener simply pressed Start listening.
+    await expect(controller.arm()).resolves.toBeUndefined();
+    expect(armSpy).toHaveBeenCalledTimes(1);
+    const sent = armSpy.mock.calls[0][0] as { audioEpoch: string; appliedRevision: string };
+    expect(sent.audioEpoch).toBe('audio-epoch-abc');
+    // The first arm must reference the host's initial revision, not an invented one.
+    expect(sent.appliedRevision).toBe('0');
+  });
 });
