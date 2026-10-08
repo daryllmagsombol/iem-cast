@@ -93,6 +93,10 @@ test('a listener with no mix yet still gets a fader per catalog source', () => {
   // The channel exists (so a gain can be requested) even though the host has sent no mix.
   expect(screen.getAllByText('Lead vocal').length).toBeGreaterThan(0);
   expect(screen.getByRole('slider', { name: /lead vocal/i })).toBeInTheDocument();
+  // Regression: Start listening was gated on an existing mix, so a fresh listener could never
+  // arm, which left the personal-output unmute permanently disabled. It must be available once the
+  // connection is ready and a source exists.
+  expect(screen.getByRole('button', { name: 'Start listening' })).toBeEnabled();
 });
 
 test('prepare rejection is visible rather than an unhandled promise', async () => {

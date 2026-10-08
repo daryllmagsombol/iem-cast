@@ -256,7 +256,10 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       onStart={start}
       onPrepare={prepare}
       starting={busy}
-      hasSources={hasSources && !!base}
+      // A listener may arm before touching any fader: no mix exists yet, but the host accepts the
+      // arm and audio can flow. Requiring an existing mix here disabled Start listening forever
+      // for a fresh listener, which also left the personal-output unmute permanently disabled.
+      hasSources={hasSources}
       diagnostics={snapshot.diagnostics}
       meters={{}}
       error={error ?? snapshot.error}
