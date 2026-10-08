@@ -24,16 +24,17 @@ import type {
 
 /** Authenticated musician WSS signaling. */
 export interface MusicianSignaling {
-  connect(): Promise<void>;
-  requestMix(patch: MixPatch): Promise<MixAck>;
-  arm(arm: ListenArm): Promise<void>;
+  connect(signal?: AbortSignal): Promise<void>;
+  requestMix(patch: MixPatch, signal?: AbortSignal, requestId?: string): Promise<MixAck>;
+  /** Optional correlation id lets the controller identify an arm's host error. */
+  arm(arm: ListenArm, requestId?: string, signal?: AbortSignal): Promise<void>;
   disarm(): Promise<void>;
   onEvent(handler: (ev: ServerEvent) => void): () => void;
 }
 
 /** Browser WebRTC receive-only audio plus media element control. */
 export interface AudioMediaPort {
-  createRecvOnlyAudio(): Promise<void>;
+  createRecvOnlyAudio(signal?: AbortSignal): Promise<void>;
   setJitterBufferTargetMs(ms: number): Promise<boolean>;
   play(): Promise<void>;
   stop(): void;
@@ -101,6 +102,8 @@ export interface ReceiverSnapshot {
   accepted_mix: MixSnapshot | null;
   applied_mix: MixSnapshot | null;
   master_local_muted: boolean;
+  /** Explicit output-unmute intent awaiting host acceptance; local output is still muted. */
+  master_unmute_pending?: boolean;
   diagnostics: DiagnosticsSnapshot;
   error: string | null;
 }
@@ -116,7 +119,7 @@ export interface ReceiverController {
   connect(): Promise<void>;
   /** Resolves on accepted (canonical ack), never on DSP-applied. */
   requestMix(patch: MixPatch): Promise<MixAck>;
-  /** Invokes `media.play()` from the gesture before awaiting host confirmation. */
+  /** Invokes `media.play()` in the gesture; resolves only on matching host confirmation. */
   arm(): Promise<void>;
   personalMasterMute(muted: boolean): void;
   stop(): void;

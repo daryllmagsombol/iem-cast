@@ -126,7 +126,8 @@ export function createBrowserMediaPort(
   }
 
   return {
-    async createRecvOnlyAudio(): Promise<void> {
+    async createRecvOnlyAudio(signal?: AbortSignal): Promise<void> {
+      signal?.throwIfAborted();
       if (pc && readiness) return readiness;
       if (!PeerConnection) {
         throw new Error('WebRTC is not available in this browser');
@@ -134,6 +135,7 @@ export function createBrowserMediaPort(
 
       const connection = new PeerConnection();
       pc = connection;
+      const isCurrent = () => pc === connection && !signal?.aborted;
 
       // One receive-only audio section; no microphone, no video, no data channel.
       const audioTransceiver = connection.addTransceiver('audio', { direction: 'recvonly' });
@@ -142,16 +144,19 @@ export function createBrowserMediaPort(
       const element = ensureAudioElement();
 
       connection.ontrack = event => {
+        if (!isCurrent()) return;
         const [stream] = event.streams;
         if (stream) element.srcObject = stream;
       };
 
       connection.onicecandidate = event => {
+        if (!isCurrent()) return;
         signaling.sendRtcCandidate(event.candidate);
       };
 
       // Subscribe to host signaling before offering so the answer/candidates cannot race the offer.
       unsubscribe = signaling.onEvent(event => {
+        if (!isCurrent()) return;
         if (event.type === 'rtc.answer') {
           applyAnswer(event.payload as RtcAnswer);
         } else if (event.type === 'rtc.candidate') {
@@ -194,8 +199,11 @@ export function createBrowserMediaPort(
       readiness.catch(() => undefined);
 
       const offer = await connection.createOffer();
+      if (!isCurrent()) return;
       await connection.setLocalDescription(offer);
-      await signaling.sendRtcOffer(connection.localDescription?.sdp ?? offer.sdp ?? '');
+      if (!isCurrent()) return;
+      await signaling.sendRtcOffer(connection.localDescription?.sdp ?? offer.sdp ?? '', signal);
+      if (!isCurrent()) return;
 
       return readiness;
     },

@@ -1,0 +1,74 @@
+import assert from 'node:assert/strict';
+import { chromium, expect } from '@playwright/test';
+import { createServer } from 'vite';
+
+const server = await createServer({ configFile: 'vite.musician.config.ts',
+  server: { host: '127.0.0.1', port: 5191, strictPort: true } });
+let browser;
+try {
+  await server.listen();
+  browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await page.goto('http://127.0.0.1:5191');
+  await page.evaluate(async () => {
+    const harness = await import('/src/musician/__tests__/mix.browserHarness.tsx');
+    window.mixTest = await harness.mountMixReceiver();
+  });
+  const source = page.getByRole('slider', { name: 'Lead vocal', exact: true });
+  await source.fill('-24');
+  await source.fill('-12');
+  assert.equal(await page.evaluate(() => window.mixTest.inFlight), 1);
+  assert.equal(await page.evaluate(() => window.mixTest.calls.length), 1);
+  await page.getByRole('button', { name: 'Start listening' }).click();
+  await expect(page.getByText('Connected · Not listening')).toBeVisible();
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await expect.poll(() => page.evaluate(() => window.mixTest.calls.length)).toBe(2);
+  assert.equal(await page.evaluate(() => window.mixTest.calls[1].baseRevision), '1');
+  assert.equal(await page.evaluate(() => window.mixTest.calls[1].sources[0].gainDb), -12);
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await expect.poll(() => page.evaluate(() => window.mixTest.arms.length)).toBe(1);
+  await expect(page.getByRole('button', { name: /Start listening/ })).toBeDisabled();
+  await expect(page.getByText('Connected · Not listening')).toBeVisible();
+  await page.evaluate(() => window.mixTest.confirmArm());
+  await expect(page.getByText('Session armed · Personal output muted')).toBeVisible();
+  await page.getByRole('button', { name: 'Unmute Lead vocal', exact: true }).click();
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await page.getByText('Master attenuation & details', { exact: true }).click();
+  const master = page.getByRole('slider', { name: 'Personal Master attenuation', exact: true });
+  await master.fill('-6');
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await source.fill('-18');
+  await source.fill('-10');
+  await page.evaluate(() => window.mixTest.reject());
+  await expect(page.getByRole('alert')).toHaveText('Host refused this mix');
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Unmute personal output', exact: true }).click();
+  await expect(page.getByText('Session armed · Personal output muted')).toBeVisible();
+  assert.equal(await page.evaluate(() => window.mixTest.calls.at(-1).masterMuted), false);
+  await page.evaluate(() => window.mixTest.reject());
+  await expect(page.getByRole('alert')).toHaveText('Host refused this mix');
+  assert.equal(await page.evaluate(() => window.mixTest.snapshot().master_local_muted), true);
+  await page.getByRole('button', { name: 'Unmute personal output', exact: true }).click();
+  await page.getByRole('button', { name: 'Cancel output unmute', exact: true }).click();
+  await page.evaluate(() => window.mixTest.acknowledge());
+  assert.equal(await page.evaluate(() => window.mixTest.output.includes(false)), false);
+  await expect(page.getByText('Session armed · Personal output muted')).toBeVisible();
+  await page.getByRole('button', { name: 'Unmute personal output', exact: true }).click();
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await expect(page.getByText('Listening', { exact: true })).toBeVisible();
+  assert.equal(await page.evaluate(() => window.mixTest.snapshot().accepted_mix.masterMuted), false);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  const acceptedBeforeStop = await page.evaluate(() => window.mixTest.snapshot().accepted_mix);
+  await source.fill('-20');
+  await page.getByRole('button', { name: 'Stop listening', exact: true }).click();
+  await page.evaluate(() => window.mixTest.acknowledge());
+  await expect(page.getByText('Connected · Not listening')).toBeVisible();
+  assert.deepEqual(await page.evaluate(() => window.mixTest.snapshot().accepted_mix), acceptedBeforeStop);
+  assert.equal(await page.evaluate(() => window.mixTest.snapshot().master_local_muted), true);
+  await page.evaluate(() => window.mixTest.dispose());
+  console.log('PASS: serialized edits, delayed arm confirmation, superseded error cleared, cancelable unmute, safe rejection, host output release, canceled mix ignored after Stop, no overflow');
+} finally {
+  await browser?.close();
+  await server.close();
+}
