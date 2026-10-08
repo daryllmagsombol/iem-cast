@@ -66,6 +66,9 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
   let currentArmNonce: string | null = null;
   // The generation the host last confirmed; replies must match it to arm.
   let currentGeneration: string | null = null;
+  // The host's real audio epoch, learned from `session.snapshot`/`listen.armed`. Arming must send
+  // this exact value; the host rejects a mismatch with STALE_EPOCH.
+  let hostAudioEpoch: string | null = null;
   // The most recent applied mix, and the accepted one, kept distinct from the request.
   let previousInbound: ReturnType<ReceiverPorts['stats']['inbound']> | null = null;
   let diagnostics: DiagnosticsSnapshot = EMPTY_DIAGNOSTICS;
@@ -105,10 +108,15 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       case 'session.snapshot': {
         const payload = event.payload as {
           phase: ListenerPhase;
+          context?: { audioEpoch?: string; safetyGeneration?: string };
           requestedMix: MixSnapshot | null;
           acceptedMix: MixSnapshot | null;
           appliedMix: MixSnapshot | null;
         };
+        // The host's real audio epoch arrives here; arming must send exactly this value.
+        if (typeof payload.context?.audioEpoch === 'string') {
+          hostAudioEpoch = payload.context.audioEpoch;
+        }
         snapshot = {
           ...snapshot,
           phase: payload.phase,
@@ -137,10 +145,15 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
         break;
       }
       case 'listen.armed': {
-        const payload = event.payload as { armNonce: string; safetyGeneration: CounterString };
+        const payload = event.payload as {
+          armNonce: string;
+          safetyGeneration: CounterString;
+          audioEpoch?: string;
+        };
         // Ignore replies for a cancelled attempt or a superseded generation.
         if (currentArmNonce === null || payload.armNonce !== currentArmNonce) break;
         currentGeneration = payload.safetyGeneration;
+        if (typeof payload.audioEpoch === 'string') hostAudioEpoch = payload.audioEpoch;
         phase('armed');
         // The gate stays closed until playback readiness is confirmed below.
         break;
@@ -198,12 +211,24 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
   async function ensureConnected(): Promise<void> {
     if (snapshot.phase === 'unpaired') {
       phase('negotiating');
-      await ports.signaling.connect();
-      await ports.media.createRecvOnlyAudio();
-      await ports.media.setJitterBufferTargetMs(0);
+      // Subscribe BEFORE connecting: the host pushes its initial `session.snapshot` and
+      // `catalog.snapshot` the moment the socket opens, so subscribing afterwards would drop them
+      // and leave the phone with no catalog ("No sources available") forever.
       if (!unsubscribeSignaling) unsubscribeSignaling = ports.signaling.onEvent(handleEvent);
-      startDiagnostics();
-      phase('ready-muted');
+      try {
+        await ports.signaling.connect();
+        await ports.media.createRecvOnlyAudio();
+        await ports.media.setJitterBufferTargetMs(0);
+        startDiagnostics();
+        phase('ready-muted');
+      } catch (error) {
+        // Do not leave a subscription attached to a connection that never succeeded.
+        if (unsubscribeSignaling) {
+          unsubscribeSignaling();
+          unsubscribeSignaling = null;
+        }
+        throw error;
+      }
     }
   }
 
@@ -268,11 +293,16 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       if (!accepted) {
         throw new Error('No accepted mix is available to arm');
       }
+      if (hostAudioEpoch === null) {
+        // Without the host's real audio epoch the arm would be rejected as STALE_EPOCH. Refuse
+        // locally rather than sending a fabricated value that can never succeed.
+        throw new Error('The host has not reported its audio epoch yet; reconnect and try again');
+      }
 
       const nonce = crypto.randomUUID();
       currentArmNonce = nonce;
       const arm: ListenArm = {
-        audioEpoch: accepted.catalogRevision as unknown as ListenArm['audioEpoch'],
+        audioEpoch: hostAudioEpoch as ListenArm['audioEpoch'],
         safetyGeneration: (currentGeneration ?? '0') as CounterString,
         appliedRevision: accepted.mixRevision,
         armNonce: nonce as unknown as ListenArm['armNonce'],

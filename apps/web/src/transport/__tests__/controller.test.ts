@@ -38,6 +38,53 @@ const ack: MixAck = {
 interface FakeOptions {
   gesture?: boolean;
   armed?: boolean;
+  /** Host pushes delivered while `connect()` is still in flight. */
+  connectSnapshots?: ServerEvent[];
+}
+
+/** A `session.snapshot` carrying the host's real audio epoch in its context. */
+function sessionSnapshotEvent(audioEpoch: string): ServerEvent {
+  return {
+    v: 1,
+    type: 'session.snapshot',
+    requestId: 'r',
+    hostEpoch: 'h',
+    sessionEpoch: 's',
+    payload: {
+      sessionEpoch: 's',
+      context: { sessionEpoch: 's', audioEpoch, safetyGeneration: '0' },
+      phase: 'ready-muted',
+      catalogRevision: '1',
+      requestedMix: null,
+      acceptedMix: null,
+      appliedMix: null,
+    },
+  } as unknown as ServerEvent;
+}
+
+/** A `catalog.snapshot` with one authorized, available source. */
+function catalogSnapshotEvent(): ServerEvent {
+  return {
+    v: 1,
+    type: 'catalog.snapshot',
+    requestId: 'r',
+    hostEpoch: 'h',
+    sessionEpoch: 's',
+    payload: {
+      catalogRevision: '1',
+      sources: [
+        {
+          sourceId: 'ch1',
+          physicalIndex: 0,
+          label: 'Channel 1',
+          role: 'inputChannel',
+          authorized: true,
+          available: true,
+          stereoPair: null,
+        },
+      ],
+    },
+  } as unknown as ServerEvent;
 }
 
 function fakePorts(options: FakeOptions = {}) {
@@ -56,9 +103,16 @@ function fakePorts(options: FakeOptions = {}) {
     refresh: async () => {},
   } satisfies StatsPort;
 
+  /** Snapshots the host pushes the instant the socket opens, before connect() resolves. */
+  const onConnect: ServerEvent[] = options.connectSnapshots ?? [];
+
   const ports: ReceiverPorts = {
     signaling: {
-      connect: vi.fn(async () => {}),
+      connect: vi.fn(async () => {
+        // Deliver the host's initial pushes *during* connect: the controller must already be
+        // listening or they are lost and the phone stays "Not paired" with no sources.
+        for (const event of onConnect) handler?.(event);
+      }),
       requestMix: vi.fn(async () => ack),
       arm: vi.fn(async () => {
         handler?.({
@@ -185,5 +239,42 @@ describe('receiver controller safety gate', () => {
     // Accepted is recorded; applied is still absent.
     expect(controller.getSnapshot().accepted_mix).not.toBeNull();
     expect(controller.getSnapshot().applied_mix).toBeNull();
+  });
+
+  test('initial_snapshots_pushed_during_connect_are_not_lost', async () => {
+    // The host pushes `session.snapshot` and `catalog.snapshot` the instant the socket opens.
+    // If the controller subscribes only after connect() resolves, those pushes are dropped and
+    // the phone is left with no catalog ("No sources available") forever.
+    const { ports } = fakePorts({
+      gesture: true,
+      connectSnapshots: [sessionSnapshotEvent('audio-epoch-abc'), catalogSnapshotEvent()],
+    });
+    const controller = createReceiverController(ports);
+
+    await controller.connect();
+
+    const snap = controller.getSnapshot();
+    expect(snap.catalog.sources).toHaveLength(1);
+    expect(snap.catalog.sources[0].available).toBe(true);
+  });
+
+  test('arm_sends_the_host_audio_epoch_not_a_catalog_revision', async () => {
+    // Regression: `arm()` used to send `catalogRevision` as `audioEpoch`. The host compares the
+    // audio epoch against its own and rejects a mismatch with STALE_EPOCH, so arming failed.
+    const { ports } = fakePorts({
+      gesture: true,
+      connectSnapshots: [sessionSnapshotEvent('audio-epoch-abc'), catalogSnapshotEvent()],
+    });
+    const armSpy = ports.signaling.arm as unknown as ReturnType<typeof vi.fn>;
+    const controller = createReceiverController(ports);
+
+    await controller.requestMix(patchGain(-9)).catch(() => undefined);
+    await controller.arm().catch(() => undefined);
+
+    expect(armSpy).toHaveBeenCalled();
+    const sent = armSpy.mock.calls[0][0] as { audioEpoch: string };
+    expect(sent.audioEpoch).toBe('audio-epoch-abc');
+    // The catalog revision must never be passed off as an audio epoch.
+    expect(sent.audioEpoch).not.toBe('1');
   });
 });
