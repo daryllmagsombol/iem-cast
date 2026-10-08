@@ -340,4 +340,187 @@ mod tests {
         // The host is a non-trickle answerer, so the answer is send-only.
         assert!(answer.contains("a=sendonly"), "answer must be send-only:\n{answer}");
     }
+
+    /// Drive one simulated datagram/timer tick between the production [`MediaSession`] and a
+    /// peer `str0m::Rtc`. No sockets or real network are involved: every `Transmit` is delivered
+    /// straight into the other peer, exactly as the application's UDP pump would.
+    fn pump_once(
+        host: &mut MediaSession,
+        browser: &mut Rtc,
+        now: Instant,
+        browser_events: &mut Vec<Event>,
+    ) {
+        use str0m::net::{Protocol, Receive};
+
+        host.handle_timeout(now).expect("host timer");
+        browser
+            .handle_input(Input::Timeout(now))
+            .expect("browser timer");
+
+        // Host -> browser.
+        for t in host.take_transmits() {
+            let receive = Receive::new(Protocol::Udp, t.source, t.destination, &t.contents)
+                .expect("host datagram parses");
+            browser
+                .handle_input(Input::Receive(now, receive))
+                .expect("browser receives");
+        }
+
+        // Browser -> host.
+        loop {
+            match browser.poll_output().expect("browser poll") {
+                Output::Timeout(_) => break,
+                Output::Transmit(t) => {
+                    host.handle_datagram(now, t.source, t.destination, &t.contents)
+                        .expect("host receives");
+                }
+                Output::Event(e) => browser_events.push(e),
+            }
+        }
+    }
+
+    #[test]
+    fn negotiated_session_connects_then_learns_mid_and_delivers_opus() {
+        // End-to-end regression via a real two-peer ICE/DTLS handshake, driven by a deterministic
+        // in-memory datagram/timer pump. It proves:
+        //   1. `handle_offer` does NOT expose a mid/pt before the peer is connected. str0m withholds
+        //      media events until SRTP is ready (`poll_event` gates on `ready_for_srtp`, installed
+        //      str0m 0.24.1 session.rs). The earlier test that asserted mid/pt directly after
+        //      `handle_offer` was therefore invalid, not evidence of a transport defect.
+        //   2. Once connected, draining outputs yields the sendonly `MediaAdded`, so mid and the
+        //      negotiated payload type are learned.
+        //   3. A real Opus-encoded frame written through the armed safety gate reaches the
+        //      receiving peer as `MediaData`.
+        use std::time::Duration;
+
+        use str0m::change::SdpAnswer;
+
+        use crate::audio::CODEC_FRAME_FRAMES;
+        use crate::contract::{EncodedFrame, SessionContext, StereoFrame};
+        use crate::encoder::OpusWorker;
+        use crate::ids::{AudioEpoch, SafetyGeneration};
+
+        let session_epoch = SessionEpoch(uuid::Uuid::new_v4());
+        let iface = SelectedInterface {
+            name: "en0".to_string(),
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10)),
+            prefix: 24,
+            port: 45123,
+        };
+        let mut host = MediaSession::new(session_epoch, iface).expect("session is created");
+
+        // A browser-like peer: same crate, genuine SDP, its own host candidate.
+        let browser_addr =
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20)), 50_000);
+        let mut browser = Rtc::builder().set_rtp_mode(false).build(Instant::now());
+        browser
+            .add_local_candidate(Candidate::host(browser_addr, "udp").expect("browser candidate"));
+
+        let mut changes = browser.sdp_api();
+        changes.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+        let (offer, pending) = changes.apply().expect("browser creates an offer");
+
+        let answer_sdp = host
+            .handle_offer(&offer.to_sdp_string())
+            .expect("a real offer is accepted");
+
+        // Corrected assertion: nothing media-related is learned until the peer is connected.
+        assert!(
+            host.mid.is_none(),
+            "no media mid may be learned before the peer is connected"
+        );
+        assert!(
+            host.pt.is_none(),
+            "no payload type may be learned before the peer is connected"
+        );
+
+        let answer = SdpAnswer::from_sdp_string(&answer_sdp).expect("host answer parses");
+        browser
+            .sdp_api()
+            .accept_answer(pending, answer)
+            .expect("browser accepts the answer");
+
+        // Pump until both peers connect and the host has drained the sendonly MediaAdded.
+        let mut now = Instant::now();
+        let mut browser_events: Vec<Event> = Vec::new();
+        for _ in 0..5_000 {
+            now += Duration::from_millis(2);
+            pump_once(&mut host, &mut browser, now, &mut browser_events);
+            if host.is_connected() && browser.is_connected() && host.mid.is_some() {
+                break;
+            }
+        }
+
+        assert!(host.is_connected(), "host must reach ICE/DTLS connected");
+        assert!(browser.is_connected(), "browser peer must reach connected");
+        assert!(
+            host.mid.is_some(),
+            "mid must be learned only after connected outputs are drained"
+        );
+        assert!(
+            host.pt.is_some(),
+            "negotiated payload type must be learned once connected"
+        );
+        assert!(
+            host.take_events()
+                .iter()
+                .any(|e| matches!(e, MediaEvent::Readiness { ready: true, .. })),
+            "the host must publish a readiness event on connect"
+        );
+
+        // One real encoded Opus frame through the armed safety gate.
+        let context = SessionContext {
+            session_epoch,
+            audio_epoch: AudioEpoch::from_bytes([0x55; 16]),
+            safety_generation: SafetyGeneration(1),
+        };
+        host.arm(context);
+
+        let mut stereo = StereoFrame::zeroed(context);
+        stereo.start_sample = 0;
+        stereo.frame_count = CODEC_FRAME_FRAMES;
+        for n in 0..CODEC_FRAME_FRAMES as usize {
+            let value = (n as f32 / CODEC_FRAME_FRAMES as f32) * 0.25;
+            stereo.pcm[n * 2] = value;
+            stereo.pcm[n * 2 + 1] = -value;
+        }
+        let mut encoded = EncodedFrame::zeroed();
+        OpusWorker::new()
+            .expect("opus worker")
+            .encode(&stereo, &mut encoded)
+            .expect("opus encode");
+        assert!(encoded.packet.len > 0, "encoder must produce a payload");
+
+        host.write_packet(&encoded)
+            .expect("an armed, connected write is accepted");
+
+        // Flush the queued payload into a datagram and deliver it to the receiver.
+        for _ in 0..200 {
+            now += Duration::from_millis(2);
+            pump_once(&mut host, &mut browser, now, &mut browser_events);
+            if browser_events
+                .iter()
+                .any(|e| matches!(e, Event::MediaData(_)))
+            {
+                break;
+            }
+        }
+
+        let media = browser_events
+            .iter()
+            .find_map(|e| match e {
+                Event::MediaData(d) => Some(d),
+                _ => None,
+            })
+            .expect("the receiving peer must surface the sent frame as MediaData");
+        assert_eq!(
+            media.mid,
+            host.mid.expect("host mid"),
+            "mid must match the sendonly mid"
+        );
+        assert!(
+            !media.data.is_empty(),
+            "the delivered Opus frame must carry payload bytes"
+        );
+    }
 }

@@ -72,7 +72,14 @@ impl Pipeline {
         self.sample_rate_hz
     }
 
-    /// Register or replace one listener slot with its mix and session.
+    /// Register or upsert one listener slot with its mix and session.
+    ///
+    /// State is preserved (engine partial PCM/ramps/limiter and this slot's Opus encoder and
+    /// `SafetyWorker`) only when this is the **same live session**, the engine already holds the
+    /// **exact same safety context** (session, audio epoch, safety generation), and both worker
+    /// states exist. An ordinary gain/mute/revision edit meets those conditions and does not reset
+    /// the stream. A changed safety generation/audio epoch/session, an invalid slot, a mismatched
+    /// session, or missing worker state resets everything fresh. Revision metadata is never compared.
     pub fn register(
         &mut self,
         slot: usize,
@@ -82,12 +89,33 @@ impl Pipeline {
         if slot >= MAX_SESSIONS {
             return Err(AudioFault::Internal);
         }
-        let encoder = OpusWorker::new().map_err(|_| AudioFault::Internal)?;
+        // The session argument must agree with the mix's own session identity.
+        if mix.context.session_epoch != session {
+            return Err(AudioFault::Internal);
+        }
         let context = SessionContext {
             session_epoch: session,
             audio_epoch: mix.context.audio_epoch,
             safety_generation: mix.context.safety_generation,
         };
+
+        let preserve = self.sessions[slot] == Some(session)
+            && self.engine.context(slot) == Some(context)
+            && self.encoders[slot].is_some()
+            && self.safety[slot].is_some();
+
+        if preserve {
+            // Identity unchanged: keep engine partial/ramps/limiter, the encoder, and safety state.
+            // Targets are re-resolved from the snapshot on the next `process`.
+            return Ok(());
+        }
+
+        let encoder = OpusWorker::new().map_err(|_| AudioFault::Internal)?;
+        // Non-preserving register: clear any existing engine state first. Otherwise a fallback for
+        // the same context (e.g. a missing worker) would call `register_session`, which preserves
+        // the old partial and could later complete it. Clearing guarantees fresh PCM/ramps/limiter
+        // alongside the fresh encoder and safety worker.
+        self.engine.clear_session(slot);
         self.engine.register_session(slot, context, mix);
         self.encoders[slot] = Some(encoder);
         self.sessions[slot] = Some(session);
@@ -95,9 +123,10 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Remove a listener slot; its encoder and safety state are dropped.
+    /// Remove a listener slot; its engine state, encoder, and safety state are dropped.
     pub fn unregister(&mut self, slot: usize) {
         if slot < MAX_SESSIONS {
+            self.engine.clear_session(slot);
             self.encoders[slot] = None;
             self.sessions[slot] = None;
             self.safety[slot] = None;
@@ -313,5 +342,69 @@ mod tests {
         pipeline.process(&block(0.5, 120), &snapshots, &mut out, None).unwrap();
         assert_eq!(out[0].count, 0);
         assert!(pipeline.session_at(0).is_none());
+    }
+
+    fn ramp(start_sample: u64, frames: u32) -> CaptureBlock {
+        let mut samples = Box::new([0.0f32; AUDIO_SLOT_SAMPLES]);
+        for frame in 0..frames as usize {
+            samples[frame] = (start_sample as usize + frame) as f32 * 0.001;
+        }
+        CaptureBlock {
+            audio_epoch: AudioEpoch::from_bytes([0x55; 16]),
+            start_sample,
+            frame_count: frames,
+            sample_rate_hz: 48_000,
+            channel_count: 1,
+            channel_map_revision: ChannelMapRevision(1),
+            samples,
+        }
+    }
+
+    #[test]
+    fn nonpreserving_register_clears_old_engine_partial_and_rebuilds_workers() {
+        // Regression: a non-preserving `register` (here forced by a missing worker state) built a
+        // fresh encoder but then called `register_session`, which — because the engine context was
+        // unchanged — preserved the old partial. The old 100-frame partial could then be completed
+        // by later frames. A non-preserving register must clear the engine slot so PCM, ramps,
+        // limiter, encoder, and safety all restart fresh.
+        let mut pipeline = Pipeline::new(48_000, &channel_map());
+        let session = SessionEpoch::from_bytes([0x22; 16]);
+        let mix = snapshot(session, -6.0);
+        pipeline.register(0, session, mix).unwrap();
+
+        let mut snapshots = empty_snapshots();
+        snapshots[0] = Some(mix);
+
+        // Hold a 100-frame partial.
+        let mut out = empty_outputs();
+        pipeline
+            .process(&ramp(0, 100), &snapshots, &mut out, None)
+            .unwrap();
+        assert_eq!(out[0].count, 0);
+
+        // Force the non-preserving branch by dropping one worker state, then re-register identically
+        // (same session + exact engine context).
+        pipeline.safety[0] = None;
+        pipeline.register(0, session, mix).unwrap();
+        assert!(
+            pipeline.safety_at(0).is_some(),
+            "fresh safety worker installed"
+        );
+
+        // 20 contiguous frames would complete the old 100-frame partial if it were retained.
+        pipeline
+            .process(&ramp(100, 20), &snapshots, &mut out, None)
+            .unwrap();
+        assert_eq!(
+            out[0].count, 0,
+            "non-preserving register must clear the old engine partial, not complete it"
+        );
+
+        // A complete 120-frame fresh block still emits, anchored to its real start.
+        pipeline
+            .process(&ramp(200, 120), &snapshots, &mut out, None)
+            .unwrap();
+        assert_eq!(out[0].count, 1);
+        assert_eq!(out[0].frames[0].start_sample, 200);
     }
 }
