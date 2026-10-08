@@ -92,6 +92,7 @@ impl HostServer {
             name: "loopback".to_string(),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             prefix: 8,
+            port: 0,
         });
         Self::with_media(control, clock, entropy, origin, assets, Arc::new(Mutex::new(hub)))
     }

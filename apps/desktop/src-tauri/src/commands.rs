@@ -196,6 +196,9 @@ pub fn start_host(
         name: request.interface_ip.clone(),
         ip: interface_ip,
         prefix: 0,
+        // 0 tells the host to bind an ephemeral media port and advertise the real bound port; the
+        // WebRTC candidate must never be advertised at port 0 or ICE cannot connect.
+        port: 0,
     };
 
     let channel_map = default_channel_map(channels);

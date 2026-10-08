@@ -518,6 +518,7 @@ fn build_server_with_catalog() -> HostServer {
             name: "loopback".to_string(),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             prefix: 8,
+            port: 0,
         },
     )));
     HostServer::with_media_and_catalog(

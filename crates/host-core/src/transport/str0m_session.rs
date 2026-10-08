@@ -31,11 +31,16 @@ pub struct SelectedInterface {
     pub name: String,
     pub ip: IpAddr,
     pub prefix: u8,
+    /// The UDP port the host advertises and receives WebRTC media on.
+    ///
+    /// This must be the *actual* bound socket port. Advertising `0` hands the phone an
+    /// unreachable candidate and ICE never connects.
+    pub port: u16,
 }
 
 impl SelectedInterface {
     fn host_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.ip, 0)
+        SocketAddr::new(self.ip, self.port)
     }
 }
 

@@ -95,6 +95,11 @@ impl MediaHub {
         self.slots.get(slot).and_then(|s| s.as_ref()).map(|s| s.session)
     }
 
+    /// The interface (address + advertised media port) new sessions are bound to.
+    pub fn interface(&self) -> &SelectedInterface {
+        &self.iface
+    }
+
     /// Accept a browser offer and return the host answer.
     pub fn handle_offer(&mut self, slot: usize, sdp: &str) -> Result<String, MediaFailureCode> {
         let slot_ref = self.slot_mut(slot)?;
@@ -220,6 +225,7 @@ mod tests {
             name: "en0".to_string(),
             ip: IpAddr::from([192, 168, 1, 10]),
             prefix: 24,
+            port: 0,
         }
     }
 

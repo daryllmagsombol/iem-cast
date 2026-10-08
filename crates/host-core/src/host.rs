@@ -228,7 +228,16 @@ impl HostSession {
     ) -> Result<Self, HostFault> {
         tls.validate_paths()?;
 
-        let hub = Arc::new(Mutex::new(MediaHub::new(interface.clone())));
+        // Bind the media socket FIRST so the hub advertises the real bound port. If the hub were
+        // created with the caller's port (often 0), every WebRTC host candidate would point at
+        // port 0 and ICE could never connect.
+        let socket = UdpSocket::bind(SocketAddr::new(interface.ip, interface.port))?;
+        socket.set_nonblocking(true)?;
+        let bound_port = socket.local_addr()?.port();
+        let mut advertised = interface;
+        advertised.port = bound_port;
+
+        let hub = Arc::new(Mutex::new(MediaHub::new(advertised)));
         let sink = MediaHubSink {
             hub: Arc::clone(&hub),
         };
@@ -243,9 +252,6 @@ impl HostSession {
             channel_map,
             sink,
         )?;
-
-        let socket = UdpSocket::bind(SocketAddr::new(interface.ip, 0))?;
-        socket.set_nonblocking(true)?;
 
         let stopped = Arc::new(AtomicBool::new(false));
         let pump_hub = Arc::clone(&hub);
@@ -809,6 +815,8 @@ mod tests {
             name: "lo0".to_string(),
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             prefix: 8,
+            // 0 lets the host bind an ephemeral port and advertise the real one.
+            port: 0,
         }
     }
 
@@ -863,6 +871,37 @@ mod tests {
 
         session.stop();
         session.stop(); // idempotent
+    }
+
+    #[test]
+    fn host_advertises_the_real_bound_media_port_not_zero() {
+        // Regression: the WebRTC host candidate used to be advertised at port 0 while the UDP
+        // socket bound an ephemeral port afterwards. The phone was told to reach `ip:0`, so ICE
+        // could never connect and the receiver reported "WebRTC connection failed".
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 0,
+        };
+        let session = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let bound = session.local_addr().expect("media socket bound").port();
+        let advertised = session.media_hub().lock().unwrap().interface().port;
+
+        assert_ne!(bound, 0, "the media socket must bind a real port");
+        assert_eq!(
+            advertised, bound,
+            "the advertised candidate port must match the bound socket"
+        );
+
+        drop(session);
     }
 
     #[test]
