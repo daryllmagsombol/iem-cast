@@ -106,11 +106,14 @@ describe('listDevices', () => {
 });
 
 describe('sourceCatalog', () => {
-  test('unwraps CatalogSnapshot.sources exactly and normalizes availability/authorization', async () => {
+  test('sends the selected device id and unwraps CatalogSnapshot.sources exactly', async () => {
     invokeMock.mockResolvedValueOnce(rawCatalog);
-    const sources = await createTauriHostBridge().sourceCatalog();
+    const sources = await createTauriHostBridge().sourceCatalog('dev-i16');
 
-    expect(invokeMock).toHaveBeenCalledWith('source_catalog', { windowLabel: 'operator' });
+    expect(invokeMock).toHaveBeenCalledWith('source_catalog', {
+      windowLabel: 'operator',
+      deviceId: 'dev-i16',
+    });
     expect(sources).toEqual([
       {
         sourceId: '33333333-3333-4333-8333-333333333333',
@@ -142,9 +145,20 @@ describe('sourceCatalog', () => {
     ]);
   });
 
+  test('sends an explicit null deviceId when no device is selected', async () => {
+    invokeMock.mockResolvedValueOnce({ catalogRevision: '0', sources: [] });
+    const sources = await createTauriHostBridge().sourceCatalog(null);
+
+    expect(invokeMock).toHaveBeenCalledWith('source_catalog', {
+      windowLabel: 'operator',
+      deviceId: null,
+    });
+    expect(sources).toEqual([]);
+  });
+
   test('does not silently substitute an empty list for a malformed response', async () => {
     invokeMock.mockResolvedValueOnce({ catalogRevision: '34' });
-    await expect(createTauriHostBridge().sourceCatalog()).rejects.toThrow();
+    await expect(createTauriHostBridge().sourceCatalog('dev-i16')).rejects.toThrow();
   });
 });
 
@@ -207,7 +221,10 @@ describe('startHost', () => {
       'interfaceIp',
       'keyPath',
     ]);
-    expect(invokeMock).toHaveBeenNthCalledWith(2, 'source_catalog', { windowLabel: 'operator' });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'source_catalog', {
+      windowLabel: 'operator',
+      deviceId: 'dev-f32',
+    });
     expect(result).toEqual({
       hostEpoch: '11111111-1111-4111-8111-111111111111',
       audioEpoch: '22222222-2222-4222-8222-222222222222',

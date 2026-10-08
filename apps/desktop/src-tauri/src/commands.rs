@@ -2,8 +2,8 @@
 //!
 //! Every command verifies the caller window label first (see [`crate::window_guard`]). Commands
 //! never expose filesystem, shell, or LAN controls; they only drive host setup and the musician
-//! catalog. The musician catalog here is a draft 22-channel mapping pending the real device
-//! capability probe; it is not a validated hardware mapping.
+//! catalog. The operator source catalog is read-only and derived from the selected device's real
+//! channel count, using the same mapping the running host publishes to phones.
 
 use std::sync::Mutex;
 
@@ -12,7 +12,7 @@ use host_core::contract::{
     StartHostRequest as CoreStartHostRequest,
 };
 use host_core::host::{catalog_from_channel_map, default_channel_map, HostServerHandle, HostSession, ServerConfig};
-use host_core::ids::{CatalogRevision, SourceId};
+use host_core::ids::CatalogRevision;
 use host_core::server::{OriginPolicy, TlsIdentity};
 use host_core::transport::SelectedInterface;
 use tauri::State;
@@ -286,39 +286,98 @@ pub fn list_output_devices(window_label: String) -> Result<Vec<OutputDeviceInfo>
         .collect())
 }
 
-/// Draft 22-channel catalog. Operator-window only.
-#[tauri::command]
-pub fn source_catalog(window_label: String) -> Result<CatalogSnapshot, IpcError> {
-    check_caller(&window_label)?;
-    Ok(build_catalog(&[]))
+/// Resolve the physical input channel count for a device id, the same way `start_host` does.
+///
+/// Unknown or absent devices resolve to `None`; callers must render an explicit empty state rather
+/// than inventing channels.
+fn resolve_channels(device_id: Option<&str>) -> Option<u16> {
+    let wanted = device_id?;
+    host_core::capture::enumerate_input_devices()
+        .into_iter()
+        .find(|d| d.device_id == wanted)
+        .map(|d| d.input_channels.max(1))
 }
 
-/// Choose which sources are available to musicians. Operator-window only.
+/// Build an honest, read-only catalog for a resolved channel count.
+///
+/// The rows come from the same `default_channel_map` + `catalog_from_channel_map` the running host
+/// uses, so two channels stay two rows and twenty-two stay twenty-two. This never falls back to a
+/// fabricated 22-channel list.
+fn catalog_for_channels(channels: u16) -> CatalogSnapshot {
+    let catalog = catalog_from_channel_map(&default_channel_map(channels), CatalogRevision(0));
+    CatalogSnapshot {
+        catalog_revision: catalog.catalog_revision.to_string(),
+        sources: catalog
+            .sources
+            .into_iter()
+            .map(|source| SourceInfo {
+                source_id: source.source_id.to_string(),
+                physical_index: source.physical_index,
+                label: source.label,
+                // Read-only build: physical presence and cast flag both mirror the device catalog.
+                available: source.available,
+                available_to_musicians: source.authorized,
+            })
+            .collect(),
+    }
+}
+
+/// Build the read-only catalog for a device id, or an explicit empty catalog when it is unknown.
+fn catalog_for_device(device_id: Option<&str>) -> CatalogSnapshot {
+    match resolve_channels(device_id) {
+        Some(channels) => catalog_for_channels(channels),
+        // Unknown/absent device: explicitly empty, never a fabricated row set.
+        None => CatalogSnapshot {
+            catalog_revision: "0".to_string(),
+            sources: Vec::new(),
+        },
+    }
+}
+
+/// Read-only operator catalog of the SELECTED device's real input channels. Operator-window only.
+///
+/// `device_id` identifies the selected capture device. When it is absent or unknown the catalog is
+/// explicitly empty; it is never the old hardcoded 22-channel draft.
+#[tauri::command]
+pub fn source_catalog(
+    window_label: String,
+    device_id: Option<String>,
+) -> Result<CatalogSnapshot, IpcError> {
+    check_caller(&window_label)?;
+    Ok(catalog_for_device(device_id.as_deref()))
+}
+
+/// Editing the source set is not supported in this build. Operator-window only.
+///
+/// Returns an explicit typed error instead of a fabricated catalog so the UI can never mistake a
+/// no-op for a persisted change.
 #[tauri::command]
 pub fn set_available_sources(
     window_label: String,
-    ids: Vec<String>,
+    _ids: Vec<String>,
 ) -> Result<CatalogSnapshot, IpcError> {
     check_caller(&window_label)?;
-    Ok(build_catalog(&ids))
+    Err(ipc_err(
+        "SOURCE_EDIT_UNSUPPORTED",
+        "publishing sources is not supported in this build",
+    ))
 }
 
-/// Rename a source. Operator-window only.
+/// Renaming a source is not supported in this build. Operator-window only.
+///
+/// Returns an explicit typed error instead of a fabricated catalog so the UI can never mistake a
+/// no-op for a persisted rename.
 #[tauri::command]
 pub fn set_source_label(
     window_label: String,
-    id: String,
-    label: String,
+    _id: String,
+    _label: String,
 ) -> Result<CatalogSnapshot, IpcError> {
     check_caller(&window_label)?;
-    if label.len() > 64 {
-        return Err(ipc_err(
-            "LABEL_TOO_LONG",
-            "label must be 64 characters or fewer",
-        ));
-    }
-    let _ = id;
-    Ok(build_catalog(&[]))
+    Err(ipc_err(
+        "SOURCE_EDIT_UNSUPPORTED",
+        "saving a source label is not supported in this build",
+    ))
 }
 
 /// Issue a fresh single-use pairing credential for one phone. Operator-window only.
@@ -413,26 +472,6 @@ fn stop_monitor_impl(window_label: &str, state: &HostState) -> Result<(), IpcErr
         host.monitor = None;
     }
     Ok(())
-}
-
-fn build_catalog(available_ids: &[String]) -> CatalogSnapshot {
-    let sources: Vec<SourceInfo> = (0..22u16)
-        .map(|index| {
-            let id = SourceId::from_bytes([index as u8; 16]);
-            let id_text = id.0.to_string();
-            SourceInfo {
-                available_to_musicians: available_ids.iter().any(|v| v == &id_text),
-                source_id: id_text,
-                physical_index: index + 1,
-                label: format!("Channel {}", index + 1),
-                available: true,
-            }
-        })
-        .collect();
-    CatalogSnapshot {
-        catalog_revision: "0".to_string(),
-        sources,
-    }
 }
 
 #[cfg(test)]
@@ -552,5 +591,74 @@ mod tests {
         .expect("deserializes without a port");
         assert_eq!(request.port, None);
         assert_eq!(request.port.unwrap_or(DEFAULT_CONTROL_PORT), 8443);
+    }
+
+    #[test]
+    fn catalog_rows_track_the_resolved_device_channel_count() {
+        // The row count must equal the device's real channel count: 2 stays 2, 22 stays 22.
+        let two = catalog_for_channels(2);
+        assert_eq!(two.sources.len(), 2);
+        assert_eq!(catalog_for_channels(22).sources.len(), 22);
+
+        // Labels are stable and deterministic, and indices preserve the device mapping.
+        assert_eq!(two.sources[0].label, "Channel 1");
+        assert_eq!(two.sources[0].physical_index, 0);
+        assert_eq!(two.sources[1].label, "Channel 2");
+        assert_eq!(two.sources[1].physical_index, 1);
+        assert_eq!(two.catalog_revision, "0");
+    }
+
+    #[test]
+    fn source_catalog_for_an_absent_device_is_empty_and_never_fabricates_rows() {
+        // An unknown device id resolves to no channels: an explicit empty catalog, never 22 rows.
+        let snapshot = catalog_for_device(Some("no-such-device"));
+        assert_eq!(snapshot.catalog_revision, "0");
+        assert!(snapshot.sources.is_empty());
+    }
+
+    #[test]
+    fn source_catalog_without_a_device_is_empty() {
+        let snapshot = catalog_for_device(None);
+        assert_eq!(snapshot.catalog_revision, "0");
+        assert!(snapshot.sources.is_empty());
+    }
+
+    #[test]
+    fn source_catalog_rejects_a_non_operator_window() {
+        let error = source_catalog("musician".to_string(), None).expect_err("must reject");
+        assert_eq!(error.code, "WINDOW_FORBIDDEN");
+    }
+
+    #[test]
+    fn source_mutations_return_an_explicit_unsupported_error() {
+        // The UI keeps these disabled; the commands must fail loudly, never fabricate a catalog.
+        assert_eq!(
+            set_available_sources("operator".to_string(), vec![])
+                .expect_err("must reject")
+                .code,
+            "SOURCE_EDIT_UNSUPPORTED"
+        );
+        assert_eq!(
+            set_source_label("operator".to_string(), "id".to_string(), "label".to_string())
+                .expect_err("must reject")
+                .code,
+            "SOURCE_EDIT_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn source_mutations_reject_a_non_operator_window() {
+        assert_eq!(
+            set_available_sources("musician".to_string(), vec![])
+                .expect_err("must reject")
+                .code,
+            "WINDOW_FORBIDDEN"
+        );
+        assert_eq!(
+            set_source_label("musician".to_string(), "id".to_string(), "label".to_string())
+                .expect_err("must reject")
+                .code,
+            "WINDOW_FORBIDDEN"
+        );
     }
 }

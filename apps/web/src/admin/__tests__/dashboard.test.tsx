@@ -139,7 +139,7 @@ test('real enumeration, selection and rescan do not call unsupported mutation RP
   const bridge = fakeBridge({ joinUrl: 'https://fake.invalid', expiresInSeconds: 120 });
   bridge.listDevices = vi.fn().mockResolvedValue([device]);
   bridge.listInterfaces = vi.fn().mockResolvedValue([iface]);
-  bridge.sourceCatalog = vi.fn();
+  bridge.sourceCatalog = vi.fn().mockResolvedValue([]);
   bridge.startHost = vi.fn();
   bridge.stopHost = vi.fn();
   bridge.setSourceLabel = vi.fn();
@@ -156,7 +156,9 @@ test('real enumeration, selection and rescan do not call unsupported mutation RP
   expect(screen.getByRole('button', { name: 'Save label' })).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: 'Rescan devices' }));
   expect(bridge.listDevices).toHaveBeenCalledTimes(2);
-  for (const method of [bridge.sourceCatalog, bridge.startHost, bridge.stopHost, bridge.setSourceLabel, bridge.setAvailableSources, bridge.issuePairingCredential]) expect(method).not.toHaveBeenCalled();
+  // Selecting a device triggers the read-only source catalog for that device; mutation RPCs never fire.
+  expect(bridge.sourceCatalog).toHaveBeenCalledWith('usb');
+  for (const method of [bridge.startHost, bridge.stopHost, bridge.setSourceLabel, bridge.setAvailableSources, bridge.issuePairingCredential]) expect(method).not.toHaveBeenCalled();
 });
 
 test('enumeration error has retry and never supplies fictional devices', async () => {

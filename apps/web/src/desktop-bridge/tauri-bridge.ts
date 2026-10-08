@@ -190,9 +190,13 @@ export function createTauriHostBridge(): HostBridge {
         },
       });
       // `start_host` returns the epoch/URL; the operator catalog is fetched separately so the UI
-      // never displays a catalog that was never actually built.
+      // never displays a catalog that was never actually built. It is fetched for the device the
+      // host was started against.
       const catalog = toCatalog(
-        await callInvoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label }),
+        await callInvoke<RawCatalogSnapshot>('source_catalog', {
+          windowLabel: label,
+          deviceId: req.capture.deviceId,
+        }),
       );
       return {
         hostEpoch: raw.hostEpoch as StartHostResult['hostEpoch'],
@@ -206,10 +210,15 @@ export function createTauriHostBridge(): HostBridge {
       await callInvoke<void>('stop_host', { windowLabel: label });
     },
 
-    async sourceCatalog() {
+    async sourceCatalog(deviceId: string | null) {
       // The Rust `source_catalog` command returns a full `CatalogSnapshot`; the frozen bridge
       // contract exposes only the source list, so unwrap it here rather than reshaping the host.
-      const raw = await callInvoke<RawCatalogSnapshot>('source_catalog', { windowLabel: label });
+      // `deviceId: null` is sent explicitly so the host can distinguish "no selection" from a
+      // malformed call, matching how `start_monitor` treats its optional device.
+      const raw = await callInvoke<RawCatalogSnapshot>('source_catalog', {
+        windowLabel: label,
+        deviceId,
+      });
       return toCatalog(raw).sources;
     },
 

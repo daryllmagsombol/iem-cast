@@ -40,7 +40,11 @@ export interface HostBridge {
   listInterfaces(): Promise<InterfaceInfo[]>;
   startHost(req: StartHostRequest): Promise<StartHostResult>;
   stopHost(): Promise<void>;
-  sourceCatalog(): Promise<SourceInfo[]>;
+  /**
+   * Read the real source catalog of the selected capture device. `deviceId` of `null` means no
+   * device is selected and yields an explicit empty list. The catalog is read-only.
+   */
+  sourceCatalog(deviceId: string | null): Promise<SourceInfo[]>;
   setAvailableSources(ids: string[]): Promise<CatalogSnapshot>;
   setSourceLabel(id: string, label: string): Promise<CatalogSnapshot>;
   issuePairingCredential(): Promise<PairingCredential>;

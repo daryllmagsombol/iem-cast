@@ -61,7 +61,7 @@ export function fakeBridge(credential: PairingCredential): FakeBridge {
       catalog,
     }),
     stopHost: async (): Promise<void> => {},
-    sourceCatalog: async (): Promise<SourceInfo[]> => [],
+    sourceCatalog: async (_deviceId: string | null): Promise<SourceInfo[]> => [],
     setAvailableSources: async (): Promise<CatalogSnapshot> => catalog,
     setSourceLabel: async (): Promise<CatalogSnapshot> => catalog,
     issuePairingCredential: async (): Promise<PairingCredential> => {

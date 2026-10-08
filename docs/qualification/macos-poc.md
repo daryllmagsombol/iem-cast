@@ -86,20 +86,54 @@ Steps to perform (record actual observations, never inferred passes):
    the pass statistics before qualifying the ≤10 ms goal.** Until then, the ≤10 ms target is
    unproven.
 
+## 4b. No-mixer smoke test with BlackHole (software path only)
+
+The mixer is not required to exercise the capture → mix → encode → WebRTC → phone path. A virtual
+loopback device gives a **stereo** system-audio source, which is enough to prove the pipeline runs
+end to end before the real console arrives.
+
+Setup (operator action):
+
+1. Install the loopback driver: `brew install blackhole-2ch` (approves an admin prompt and briefly
+   restarts Core Audio). `BlackHole 2ch` then appears as both an output and an input.
+2. In **Audio MIDI Setup**, create a **Multi-Output Device** containing your speakers/headphones
+   first and `BlackHole 2ch` second. Set macOS **Sound → Output** to that device, so you still hear
+   the Mac while BlackHole receives a copy.
+3. Set `BlackHole 2ch` to **48 kHz**. The app rejects a device that does not report 48 kHz.
+4. In the app, select **BlackHole 2ch** as the capture device.
+
+Honest limits of this test:
+
+- **Stereo only.** BlackHole 2ch exposes two channels, so every phone hears the same stereo feed.
+  It proves the transport, not per-instrument personal mixing.
+- It does **not** exercise the Soundcraft USB channel map or the 22 individual post-gain/pre-EQ
+  sources; only the real mixer can do that.
+- Selecting `BlackHole 2ch` as the macOS output directly (rather than via a Multi-Output Device)
+  silences the Mac — expected, not a fault.
+
 ## 5. Certificate and trust steps (manual operator action)
 
 - Generate a certificate whose SAN matches the **selected LAN interface** IP or resolvable hostname.
-- Transfer **only the public root certificate** to test devices. Never transfer or commit the
-  private root CA key.
-- iOS: install and **fully trust** the root certificate as a separate operator step.
-- Android Chrome: install/trust the root certificate and **verify on the real device**; driver or
-  native-app guidance is not proof of browser trust.
+  `mkcert -cert-file local-certs/cert.pem -key-file local-certs/key.pem "$LAN_IP" localhost 127.0.0.1 ::1`
+- Transfer **only the public root certificate** (`mkcert -CAROOT` → `rootCA.pem`) to test devices.
+  Never transfer or commit `rootCA-key.pem`.
+- **iOS:** open the CA file so the profile downloads, install it under
+  **Settings → General → VPN & Device Management**, then enable **full trust** under
+  **Settings → General → About → Certificate Trust Settings**. Skipping the final step leaves HTTPS
+  untrusted.
+- **Android:** install it as a **CA certificate** under Security/Encryption & credentials, then
+  **verify in Chrome on the real device**. The settings path varies by manufacturer.
+- Browser trust requires the visited URL to match a certificate SAN; hitting the host by a name the
+  certificate does not cover still warns even when the CA is trusted.
 - If the selected interface changes, **reject the mismatched certificate** and require operator
   reconfiguration. Never bypass certificate warnings and never auto-trust a CA.
 
 ## 6. Honest status
 
-- Automated software gates above: passing as recorded (transport pending final reconcile).
-- Real audio path, real phones, real AP, real device trust, and physical latency: **not yet
+- Automated software gates above: passing as recorded.
+- Live host startup, real pairing credentials, the browser receiver, and the local monitor are
+  implemented and unit-tested, but the full analog path has **not** been exercised on hardware.
+- Real audio from the mixer, real phones, real AP, real device trust, and physical latency: **not yet
   attempted**. No stage or qualification claim is made.
-- If hardware is unavailable, this task is recorded as **blocked** — never a fabricated pass.
+- If hardware is unavailable, this task is recorded as **blocked** — never a fabricated pass. The
+  BlackHole smoke test (§4b) is a software-path check only and never substitutes for it.
