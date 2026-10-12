@@ -28,6 +28,11 @@ const channel: ChannelStripState = {
 const diagnostics: DiagnosticsSnapshot = {
   network_rtt_ms: 'Unavailable',
   buffer_delay_ms: 'Waiting for sample',
+  buffer_target_delay_ms: 'Unavailable',
+  buffer_minimum_delay_ms: 'Unavailable',
+  packets_lost_delta: 'Unavailable',
+  concealment_percent: 'Unavailable',
+  jitter_buffer_preference: { state: 'Not requested', requested_ms: null },
   end_to_end: 'Not measured',
   last_updated: null,
 };

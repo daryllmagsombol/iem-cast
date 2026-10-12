@@ -4,8 +4,10 @@
  * Every read is served from the cache populated by {@link StatsPort.refresh}; `refresh()` never
  * overlaps itself even when the diagnostics interval fires faster than a sample completes. Only
  * genuinely present statistics are surfaced: a missing candidate pair or inbound report yields
- * `undefined`, never a fabricated zero. `jitterBufferDelay` is reported by the browser in seconds,
- * matching {@link InboundStats.delay}.
+ * `undefined`, never a fabricated zero. `jitterBufferDelay`/`jitterBufferTargetDelay`/
+ * `jitterBufferMinimumDelay` are reported by the browser in seconds, matching
+ * {@link InboundStats.delay}; the optional loss/concealment counts are carried only when present,
+ * finite, and non-negative (a signed/negative `packetsLost` is dropped, never surfaced).
  */
 
 import type { InboundStats, StatsPort } from '../receiver-ports';
@@ -36,6 +38,12 @@ interface InboundRtpStats {
   kind?: string;
   jitterBufferDelay?: number;
   jitterBufferEmittedCount?: number;
+  jitterBufferTargetDelay?: number;
+  jitterBufferMinimumDelay?: number;
+  packetsLost?: number;
+  packetsReceived?: number;
+  concealedSamples?: number;
+  totalSamplesReceived?: number;
   trackIdentifier?: string;
   mediaType?: string;
 }
@@ -104,7 +112,7 @@ export function createStatsPort(deps: StatsDeps): StatsPort {
     if (emitted === undefined || delay === undefined) return undefined;
 
     const stream = typeof stats.trackIdentifier === 'string' ? stats.trackIdentifier : '';
-    return {
+    const sample: InboundStats = {
       sessionEpoch: deps.sessionEpoch() ?? '',
       statsId,
       stream,
@@ -113,6 +121,24 @@ export function createStatsPort(deps: StatsDeps): StatsPort {
       delay,
       sampledAtMs: deps.clock(),
     };
+
+    // Optional fields are carried only when present, finite, and non-negative. Absent fields stay
+    // absent (`undefined`) rather than being normalized to 0; a signed/negative loss counter is
+    // dropped here so it can never be mistaken for a measurement.
+    const targetDelay = finiteOrUndefined(stats.jitterBufferTargetDelay);
+    if (targetDelay !== undefined) sample.targetDelay = targetDelay;
+    const minimumDelay = finiteOrUndefined(stats.jitterBufferMinimumDelay);
+    if (minimumDelay !== undefined) sample.minimumDelay = minimumDelay;
+    const packetsLost = finiteOrUndefined(stats.packetsLost);
+    if (packetsLost !== undefined) sample.packetsLost = packetsLost;
+    const packetsReceived = finiteOrUndefined(stats.packetsReceived);
+    if (packetsReceived !== undefined) sample.packetsReceived = packetsReceived;
+    const concealedSamples = finiteOrUndefined(stats.concealedSamples);
+    if (concealedSamples !== undefined) sample.concealedSamples = concealedSamples;
+    const totalSamplesReceived = finiteOrUndefined(stats.totalSamplesReceived);
+    if (totalSamplesReceived !== undefined) sample.totalSamplesReceived = totalSamplesReceived;
+
+    return sample;
   }
 
   return {

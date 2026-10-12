@@ -18,6 +18,8 @@ class FakeTransceiver {
 /** A fake `RTCPeerConnection` that records transceivers and drives readiness events. */
 class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
+  /** Receiver object used for the next created transceiver; `{}` means no jitterBufferTarget. */
+  static nextReceiver: { jitterBufferTarget?: number } = {};
 
   readonly transceivers: FakeTransceiver[] = [];
   connectionState: RTCPeerConnectionState = 'new';
@@ -35,7 +37,7 @@ class FakePeerConnection {
 
   addTransceiver(kind: string, init: { direction: string }): FakeTransceiver {
     expect(kind).toBe('audio');
-    const transceiver = new FakeTransceiver(init.direction, {});
+    const transceiver = new FakeTransceiver(init.direction, FakePeerConnection.nextReceiver);
     this.transceivers.push(transceiver);
     return transceiver;
   }
@@ -160,6 +162,73 @@ describe('browser media port', () => {
     await vi.waitFor(() => expect(offer).toHaveBeenCalled());
     // The fake receiver has no jitterBufferTarget, so the feature-detect returns false.
     await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    media.stop();
+    await expect(readiness).resolves.toBeUndefined();
+  });
+
+  test('an absent browser status is Unavailable, not an invented unsupported claim', () => {
+    const { signaling } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Unavailable', requested_ms: null });
+  });
+
+  test('a supported receiver accepts the preference and records Accepted (never a forced cap)', async () => {
+    FakePeerConnection.instances = [];
+    FakePeerConnection.nextReceiver = {};
+    const { signaling, offer } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    const readiness = media.createRecvOnlyAudio();
+    const pc = FakePeerConnection.instances.at(-1)!;
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    // Simulate a receiver that surfaces the property.
+    Object.defineProperty(pc.transceivers[0].receiver, 'jitterBufferTarget', {
+      configurable: true,
+      writable: true,
+      value: 500,
+    });
+    await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(true);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Accepted', requested_ms: 0 });
+    media.stop();
+    await expect(readiness).resolves.toBeUndefined();
+  });
+
+  test('a receiver whose property getter throws is Rejected, not Unsupported', async () => {
+    FakePeerConnection.instances = [];
+    const throwing: { jitterBufferTarget?: number } = {};
+    Object.defineProperty(throwing, 'jitterBufferTarget', {
+      configurable: true,
+      get() {
+        throw new Error('SecurityError');
+      },
+    });
+    FakePeerConnection.nextReceiver = throwing;
+    const { signaling, offer } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    const readiness = media.createRecvOnlyAudio();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Rejected', requested_ms: 0 });
+    media.stop();
+    await expect(readiness).resolves.toBeUndefined();
+  });
+
+  test('an assignment that throws is Rejected, and readback does not claim the actual buffer', async () => {
+    FakePeerConnection.instances = [];
+    const readonly: { jitterBufferTarget?: number } = {};
+    Object.defineProperty(readonly, 'jitterBufferTarget', {
+      configurable: true,
+      get: () => 300,
+      set() {
+        throw new Error('NotAllowedError');
+      },
+    });
+    FakePeerConnection.nextReceiver = readonly;
+    const { signaling, offer } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    const readiness = media.createRecvOnlyAudio();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Rejected', requested_ms: 0 });
     media.stop();
     await expect(readiness).resolves.toBeUndefined();
   });

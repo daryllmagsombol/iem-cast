@@ -12,7 +12,12 @@
  */
 
 import type { RtcAnswer, RtcCandidate } from '../protocol';
-import type { AudioMediaPort } from '../receiver-ports';
+import type {
+  AudioMediaPort,
+  JitterBufferPreference,
+  JitterBufferPreferenceStatus,
+} from '../receiver-ports';
+import { buildJitterBufferPreference } from './diagnostics';
 import type { BrowserMusicianSignaling } from './signaling';
 
 /** How long to wait for a live ICE/DTLS connection before failing honestly. */
@@ -33,6 +38,8 @@ export interface BrowserAudioMediaPort extends AudioMediaPort {
   audioElement(): HTMLAudioElement | null;
   /** The live peer connection, or `null`; the stats port reads `getStats()` from it. */
   peerConnection(): RTCPeerConnection | null;
+  /** Raw jitter-buffer preference feature-detect/assignment outcome, or `undefined` when unset. */
+  jitterBufferStatus(): JitterBufferPreference;
 }
 
 /** Tracks whether the local element is currently silenced. */
@@ -59,6 +66,8 @@ export function createBrowserMediaPort(
   let cancelReadiness: (() => void) | null = null;
   let muted = true;
   let unsubscribe: (() => void) | null = null;
+  // Raw feature-detect/assignment outcome for the current receiver; reset with the connection.
+  let jitterStatus: JitterBufferPreferenceStatus | undefined;
 
   function ensureAudioElement(): HTMLAudioElement {
     if (audio) return audio;
@@ -102,6 +111,8 @@ export function createBrowserMediaPort(
       audio.pause();
       audio.srcObject = null;
     }
+    // A new connection gets a new receiver; the old preference outcome no longer applies.
+    jitterStatus = undefined;
     readiness = null;
   }
 
@@ -212,11 +223,28 @@ export function createBrowserMediaPort(
       const receiver = transceiver?.receiver as
         | (RTCRtpReceiver & { jitterBufferTarget?: number })
         | undefined;
-      if (!receiver || !('jitterBufferTarget' in receiver)) return false;
+      // Feature-detect the instance itself: some browsers throw on property access (e.g. a
+      // SecurityError getter), so even reading the property must be guarded.
+      let supported = false;
+      if (receiver) {
+        try {
+          supported = 'jitterBufferTarget' in receiver;
+        } catch {
+          supported = false;
+        }
+      }
+      if (!receiver || !supported) {
+        jitterStatus = { supported: false, requestedMs: ms, accepted: false };
+        return false;
+      }
       try {
         receiver.jitterBufferTarget = ms;
+        // Assignment not throwing means only that the browser accepted the preference, never that
+        // the actual buffer is `ms` or that latency dropped.
+        jitterStatus = { supported: true, requestedMs: ms, accepted: true };
         return true;
       } catch {
+        jitterStatus = { supported: true, requestedMs: ms, accepted: false };
         return false;
       }
     },
@@ -242,6 +270,12 @@ export function createBrowserMediaPort(
 
     peerConnection(): RTCPeerConnection | null {
       return pc;
+    },
+
+    jitterBufferStatus(): JitterBufferPreference {
+      // No receiver or no request yet: `buildJitterBufferPreference(undefined)` yields the honest
+      // `'Unavailable'`, not an invented `'Unsupported'` or a fabricated `'Accepted'`.
+      return buildJitterBufferPreference(jitterStatus);
     },
   };
 }

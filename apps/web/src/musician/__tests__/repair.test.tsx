@@ -9,7 +9,7 @@ import { MusicianRoot } from '../MusicianRoot';
 afterEach(cleanup);
 const mix: MixSnapshot = { catalogRevision: '1' as CounterString, mixRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -12, muted: true }], masterDb: -18, masterMuted: true };
 function fixture(phase: ReceiverSnapshot['phase'] = 'unpaired') {
-  let snapshot: ReceiverSnapshot = { phase, catalog: { catalogRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', physicalIndex: 0, label: 'Lead vocal', available: true, authorized: true, stereoPair: null, role: 'inputChannel' }] }, requested_mix: mix, accepted_mix: mix, applied_mix: null, master_local_muted: true, error: null, diagnostics: { network_rtt_ms: 'Unavailable', buffer_delay_ms: 'Waiting for sample', end_to_end: 'Not measured', last_updated: null } };
+  let snapshot: ReceiverSnapshot = { phase, catalog: { catalogRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', physicalIndex: 0, label: 'Lead vocal', available: true, authorized: true, stereoPair: null, role: 'inputChannel' }] }, requested_mix: mix, accepted_mix: mix, applied_mix: null, master_local_muted: true, error: null, diagnostics: { network_rtt_ms: 'Unavailable', buffer_delay_ms: 'Waiting for sample', buffer_target_delay_ms: 'Unavailable', buffer_minimum_delay_ms: 'Unavailable', packets_lost_delta: 'Unavailable', concealment_percent: 'Unavailable', jitter_buffer_preference: { state: 'Not requested', requested_ms: null }, end_to_end: 'Not measured', last_updated: null } };
   let notify: (s: ReceiverSnapshot) => void = () => {};
   const controller: ReceiverController = { getSnapshot: () => snapshot, subscribe: h => { notify = h; return () => {}; }, connect: vi.fn(async () => { snapshot = { ...snapshot, phase: 'ready-muted' }; notify(snapshot); }), arm: vi.fn(async () => {}), requestMix: vi.fn(async patch => ({ acceptedRevision: '2' as CounterString, catalogRevision: patch.catalogRevision, canonicalSettings: { ...mix, ...patch, mixRevision: '2' as CounterString } })), personalMasterMute: vi.fn(), stop: vi.fn(), disconnect: vi.fn() };
   return { controller, update: (s: Partial<ReceiverSnapshot>) => { snapshot = { ...snapshot, ...s }; notify(snapshot); } };
@@ -75,6 +75,11 @@ test('a listener with no mix yet still gets a fader per catalog source', () => {
     diagnostics: {
       network_rtt_ms: 'Unavailable',
       buffer_delay_ms: 'Waiting for sample',
+      buffer_target_delay_ms: 'Unavailable',
+      buffer_minimum_delay_ms: 'Unavailable',
+      packets_lost_delta: 'Unavailable',
+      concealment_percent: 'Unavailable',
+      jitter_buffer_preference: { state: 'Not requested', requested_ms: null },
       end_to_end: 'Not measured',
       last_updated: null,
     },
