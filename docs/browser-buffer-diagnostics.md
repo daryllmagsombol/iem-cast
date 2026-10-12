@@ -26,12 +26,17 @@ absent raw fields stay **absent** (`undefined`), never `0`.
 
 - Target/minimum delay reuse the existing buffer-delay identity and interval guards:
   `1000 × Δ(field) / Δ(jitterBufferEmittedCount)`, in ms. The raw browser fields are seconds.
-- Concealment uses a **compatible positive** `Δ(totalSamplesReceived)` denominator.
+- Concealment uses a **compatible positive** `Δ(totalSamplesReceived)` denominator; a
+  `Δ(concealedSamples)` larger than it is an impossible/asymmetric counter reset and yields
+  `'Unavailable'`, never a value > 100 or a clamped 100.
 - Availability is **independent per metric**: a missing minimum delay, for example, does not erase
   a valid target delay.
 - Same-interval counter decrease, reset, non-finite, or zero/negative denominators yield
   `'Unavailable'`; a first sample or a changed `sessionEpoch`/`statsId`/`stream`/`epoch` yields
-  `'Waiting for sample'`. Stale readings (> 3 s) become `'Unavailable'`.
+  `'Waiting for sample'`. A reading stale past the **3 s** freshness window becomes `'Unavailable'`
+  while a genuine `'Waiting for sample'` interval is preserved. Because `last_updated` advances on
+  each successful refresh, staleness can only trip after a `getStats()` stall longer than the
+  window (covered by an explicit controller test).
 
 ### Jitter-buffer preference states
 
@@ -43,12 +48,17 @@ at any time; readback does not reflect the UA's actual target).
 | --- | --- |
 | `'Not requested'` | A supported receiver was never asked (before `setJitterBufferTargetMs`). |
 | `'Accepted'` | The assignment did not throw. **Never** proof of the actual buffer or lower latency. |
-| `'Unsupported'` | The receiver instance did not expose a `jitterBufferTarget` property. |
-| `'Rejected'` | The property exists on a supported receiver but assignment (or feature-detect) threw. |
-| `'Unavailable'` | The port exposed no status accessor (older/fake port) — no capability claim is made. |
+| `'Unsupported'` | A receiver **was observed** and genuinely lacked a `jitterBufferTarget` property. |
+| `'Rejected'` | The property exists on a supported receiver but the assignment threw. |
+| `'Unavailable'` | No capability was observed: the port exposed no status accessor, no receiver existed, or the feature-detect itself could not be evaluated. No capability claim is made. |
 
-This distinguishes unsupported from error without inventing an `'Unsupported'` claim when nothing
-was observed. `requested_ms` is the millisecond value last requested, or `null`.
+The feature-detect uses `'jitterBufferTarget' in receiver`, which checks property presence and
+does **not** invoke a getter; only a `Proxy` `has` trap could throw there. A throwing `has` trap is
+an **unknown** capability, not an observed absence, so it also surfaces as `'Unavailable'` — never
+an invented `'Unsupported'`. `'Unsupported'` is reserved for a receiver that was actually observed
+without the property. This distinguishes unsupported from unknown/error without inventing an
+`'Unsupported'` claim when nothing was observed. `requested_ms` is the millisecond value last
+requested, or `null` when nothing was observed.
 
 ## Limitations
 
@@ -75,4 +85,5 @@ npm run build:web
 
 The focused suites cover per-metric availability, counter resets/decreases, stale/reset behavior,
 unit conversions (seconds → ms), signed-negative loss handling, and every preference state
-(unsupported, feature-detect throw, assignment throw, readback, and the absent-accessor case).
+(unsupported-observed, feature-detect `has`-trap throw, assignment throw, readback, the
+no-receiver case, and the absent-accessor case).

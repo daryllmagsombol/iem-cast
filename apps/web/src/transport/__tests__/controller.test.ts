@@ -853,4 +853,81 @@ describe('receiver controller diagnostics composition', () => {
       vi.useRealTimers();
     }
   });
+
+  /** Ports whose `clock()` can jump past the 3 s freshness window on demand. */
+  function stalePorts(samples: (InboundStats | undefined)[]) {
+    let index = 0;
+    let clockMs = 0;
+    const inbound = () => {
+      const sample = samples[Math.min(index, samples.length - 1)];
+      if (index < samples.length) index += 1;
+      return sample;
+    };
+    const ports: ReceiverPorts = {
+      signaling: {
+        connect: vi.fn(async () => {}),
+        requestMix: vi.fn(async () => ack),
+        arm: vi.fn(async () => {}),
+        disarm: vi.fn(async () => {}),
+        onEvent: vi.fn(() => () => {}),
+      },
+      media: {
+        createRecvOnlyAudio: vi.fn(async () => {}),
+        setJitterBufferTargetMs: vi.fn(async () => true),
+        play: vi.fn(async () => {}),
+        stop: vi.fn(() => {}),
+        mute: vi.fn((_muted: boolean) => {}),
+      },
+      activation: { onUserGesture: () => () => {}, isActive: () => true },
+      // Each refresh sees the clock jump 4000 ms: the previous reading is now stale.
+      clock: () => (clockMs += 4000),
+      stats: { selectedCandidateRtt: () => undefined, inbound, refresh: async () => {} } satisfies StatsPort,
+    };
+    return { ports };
+  }
+
+  test('a stale exceeding the freshness window shows Unavailable instead of a cached number', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = stalePorts([
+        sample({ emitted: 100, delay: 1.0, targetDelay: 1.0 }),
+        sample({ emitted: 200, delay: 1.2, targetDelay: 1.152 }),
+      ]);
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      // First tick: baseline (Waiting). Second tick: a valid interval, but > 3 s since the last
+      // update, so the cached reading is stale.
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const snap = controller.getSnapshot().diagnostics;
+      expect(snap.buffer_delay_ms).toBe('Unavailable');
+      expect(snap.buffer_target_delay_ms).toBe('Unavailable');
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('staleness does not overwrite a genuine Waiting for sample interval', async () => {
+    vi.useFakeTimers();
+    try {
+      // The second sample changes identity, so every metric resets to 'Waiting for sample'.
+      const { ports } = stalePorts([
+        sample({ emitted: 100 }),
+        sample({ statsId: 'inbound-b', emitted: 200 }),
+      ]);
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const snap = controller.getSnapshot().diagnostics;
+      expect(snap.buffer_delay_ms).toBe('Waiting for sample');
+      expect(snap.buffer_target_delay_ms).toBe('Waiting for sample');
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
