@@ -77,6 +77,68 @@ describe('stats port', () => {
     expect(port.inbound()).toBeUndefined();
   });
 
+  test('optional browser fields are carried through when finite and present', async () => {
+    const { port } = makePort(
+      report([
+        [
+          'inbound',
+          {
+            ...inboundRecord,
+            jitterBufferTargetDelay: 0.9,
+            jitterBufferMinimumDelay: 0.2,
+            packetsLost: 5,
+            packetsReceived: 400,
+            concealedSamples: 60,
+            totalSamplesReceived: 4800,
+          },
+        ],
+      ]),
+    );
+    await port.refresh();
+    expect(port.inbound()).toMatchObject({
+      targetDelay: 0.9,
+      minimumDelay: 0.2,
+      packetsLost: 5,
+      packetsReceived: 400,
+      concealedSamples: 60,
+      totalSamplesReceived: 4800,
+    });
+  });
+
+  test('absent optional fields stay absent rather than becoming 0', async () => {
+    const { port } = makePort(report([['inbound', inboundRecord]]));
+    await port.refresh();
+    const sample = port.inbound();
+    expect(sample?.packetsLost).toBeUndefined();
+    expect(sample?.targetDelay).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(sample, 'packetsLost')).toBe(false);
+    expect(sample?.packetsLost).not.toBe(0);
+    expect(sample?.targetDelay).not.toBe(0);
+  });
+
+  test('a negative optional counter is dropped, not surfaced as a signed value', async () => {
+    const { port } = makePort(
+      report([
+        ['inbound', { ...inboundRecord, packetsLost: -3, concealedSamples: -1, jitterBufferMinimumDelay: -0.5 }],
+      ]),
+    );
+    await port.refresh();
+    const sample = port.inbound();
+    expect(sample?.packetsLost).toBeUndefined();
+    expect(sample?.concealedSamples).toBeUndefined();
+    expect(sample?.minimumDelay).toBeUndefined();
+  });
+
+  test('a non-finite optional field is dropped', async () => {
+    const { port } = makePort(
+      report([['inbound', { ...inboundRecord, jitterBufferTargetDelay: Number.NaN, packetsReceived: Number.POSITIVE_INFINITY }]]),
+    );
+    await port.refresh();
+    const sample = port.inbound();
+    expect(sample?.targetDelay).toBeUndefined();
+    expect(sample?.packetsReceived).toBeUndefined();
+  });
+
   test('no peer connection leaves both reads undefined', async () => {
     const { port } = makePort(report([]), { pc: false });
     await port.refresh();

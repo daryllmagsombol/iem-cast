@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from 'vitest';
 import type {
   AudioMediaPort,
   InboundStats,
+  JitterBufferPreference,
   ReceiverPorts,
   StatsPort,
 } from '../../receiver-ports';
@@ -672,5 +673,184 @@ describe('receiver controller safety gate', () => {
     expect(sent.audioEpoch).toBe('audio-epoch-abc');
     // The arm must reference the revision the host just accepted, not an invented one.
     expect(sent.appliedRevision).toBe('12');
+  });
+});
+
+describe('receiver controller diagnostics composition', () => {
+  /** Build inbound samples advanced one interval at a time from a queue. */
+  function diagnosticsPorts(options: {
+    samples: (InboundStats | undefined)[];
+    rtt?: { currentRoundTripTime: number };
+    preference?: JitterBufferPreference;
+    exposeStatus?: boolean;
+  }) {
+    let index = 0;
+    let clockMs = 1000;
+    const inbound = () => {
+      const sample = options.samples[Math.min(index, options.samples.length - 1)];
+      if (index < options.samples.length) index += 1;
+      return sample;
+    };
+    const media: AudioMediaPort & Record<string, unknown> = {
+      createRecvOnlyAudio: vi.fn(async () => {}),
+      setJitterBufferTargetMs: vi.fn(async () => true),
+      play: vi.fn(async () => {}),
+      stop: vi.fn(() => {}),
+      mute: vi.fn((_muted: boolean) => {}),
+    };
+    if (options.exposeStatus !== false) {
+      media.jitterBufferStatus = () =>
+        options.preference ?? { state: 'Not requested', requested_ms: null };
+    }
+    const ports: ReceiverPorts = {
+      signaling: {
+        connect: vi.fn(async () => {}),
+        requestMix: vi.fn(async () => ack),
+        arm: vi.fn(async () => {}),
+        disarm: vi.fn(async () => {}),
+        onEvent: vi.fn(() => () => {}),
+      },
+      media,
+      activation: { onUserGesture: () => () => {}, isActive: () => true },
+      clock: () => (clockMs += 1000),
+      stats: {
+        selectedCandidateRtt: () => options.rtt,
+        inbound,
+        refresh: async () => {},
+      } satisfies StatsPort,
+    };
+    return { ports };
+  }
+
+  function sample(overrides: Partial<InboundStats> = {}): InboundStats {
+    return {
+      sessionEpoch: 's',
+      statsId: 'inbound-a',
+      stream: 'track-1',
+      epoch: 'audio-1',
+      emitted: 300,
+      delay: 1.5,
+      sampledAtMs: 1000,
+      ...overrides,
+    };
+  }
+
+  test('composes every optional metric into the snapshot with the reported preference', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({
+        samples: [
+          sample({ emitted: 300, delay: 1.5, targetDelay: 0.5, minimumDelay: 0.1, packetsLost: 2, concealedSamples: 10, totalSamplesReceived: 1000 }),
+          sample({ emitted: 400, delay: 1.62, targetDelay: 0.652, minimumDelay: 0.124, packetsLost: 5, concealedSamples: 25, totalSamplesReceived: 1100 }),
+        ],
+        rtt: { currentRoundTripTime: 0.042 },
+        preference: { state: 'Accepted', requested_ms: 0 },
+      });
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      // First interval awaits a baseline; the second computes each metric.
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      // Let the async refresh() microtasks settle.
+
+      const snap = controller.getSnapshot().diagnostics;
+      expect(snap.network_rtt_ms).toBeCloseTo(42, 6);
+      expect(snap.buffer_delay_ms).toBeCloseTo(1.2, 6);
+      expect(snap.buffer_target_delay_ms).toBeCloseTo(1.52, 6);
+      expect(snap.buffer_minimum_delay_ms).toBeCloseTo(0.24, 6);
+      expect(snap.packets_lost_delta).toBe(3);
+      expect(snap.concealment_percent).toBeCloseTo(15, 6);
+      expect(snap.jitter_buffer_preference).toEqual({ state: 'Accepted', requested_ms: 0 });
+      expect(snap.end_to_end).toBe('Not measured');
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('a valid 152 ms target delay is reported independently of RTT, never as end-to-end', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({
+        samples: [
+          sample({ emitted: 300, delay: 1.0, targetDelay: 1.0 }),
+          // ~1 s of 48 kHz audio: 48000 more emitted samples, 7296 s more accumulated target hold,
+          // i.e. 1000 * 7296 / 48000 = 152 ms average.
+          sample({ emitted: 48300, delay: 1.2, targetDelay: 7297.0 }),
+        ],
+        rtt: { currentRoundTripTime: 0.01 },
+      });
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const snap = controller.getSnapshot().diagnostics;
+      expect(snap.buffer_target_delay_ms).toBeCloseTo(152, 6);
+      expect(snap.network_rtt_ms).toBeCloseTo(10, 6);
+      expect(snap.end_to_end).toBe('Not measured');
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('an older/fake port without a status accessor reports Unavailable, not Unsupported', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({ samples: [sample()], exposeStatus: false });
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(controller.getSnapshot().diagnostics.jitter_buffer_preference).toEqual({
+        state: 'Unavailable',
+        requested_ms: null,
+      });
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('a missing optional field does not erase a valid target delay', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({
+        samples: [
+          sample({ emitted: 100, targetDelay: 0.5 }),
+          sample({ emitted: 200, targetDelay: 0.7 }),
+        ],
+      });
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const snap = controller.getSnapshot().diagnostics;
+      expect(snap.buffer_target_delay_ms).toBeCloseTo(2.0, 6);
+      expect(snap.buffer_minimum_delay_ms).toBe('Unavailable');
+      expect(snap.packets_lost_delta).toBe('Unavailable');
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('disconnect stops refreshing diagnostics', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({ samples: [sample()] });
+      const refresh = vi.spyOn(ports.stats, 'refresh');
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      await vi.advanceTimersByTimeAsync(1000);
+      const callsBefore = refresh.mock.calls.length;
+      controller.disconnect();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(refresh.mock.calls.length).toBe(callsBefore);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

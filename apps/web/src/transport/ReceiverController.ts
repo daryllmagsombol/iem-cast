@@ -32,8 +32,14 @@ import type {
 import {
   buildDiagnostics,
   computeBufferDelayMs,
+  computeConcealmentPercent,
+  computeMinimumDelayMs,
   computeNetworkRttMs,
+  computePacketsLostDelta,
+  computeTargetDelayMs,
   EMPTY_DIAGNOSTICS,
+  UNKNOWN_JITTER_BUFFER_PREFERENCE,
+  type IntervalMetric,
 } from './diagnostics';
 
 /** Freshness window for diagnostics: stale readings become `Unavailable`. */
@@ -292,17 +298,30 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       const pair = ports.stats.selectedCandidateRtt();
       const inbound = ports.stats.inbound();
       const rtt = computeNetworkRttMs(pair);
-      const buffer = computeBufferDelayMs(previousInbound ?? null, inbound);
+      // Each optional metric uses the same previous/current interval with its own guards, so a
+      // missing target/minimum/concealment/packets field never erases a valid neighbour.
+      const buffer: IntervalMetric = computeBufferDelayMs(previousInbound ?? null, inbound);
+      const target = computeTargetDelayMs(previousInbound ?? null, inbound);
+      const minimum = computeMinimumDelayMs(previousInbound ?? null, inbound);
+      const concealment = computeConcealmentPercent(previousInbound ?? null, inbound);
+      const lostDelta = computePacketsLostDelta(previousInbound ?? null, inbound);
+      const preference = ports.media.jitterBufferStatus?.() ?? UNKNOWN_JITTER_BUFFER_PREFERENCE;
       if (inbound) previousInbound = inbound;
 
       const now = ports.clock();
       const stale =
         diagnostics.last_updated !== null && now - diagnostics.last_updated > DIAGNOSTICS_STALE_MS;
-      const next = buildDiagnostics(
-        rtt,
-        stale && buffer !== 'Waiting for sample' ? 'Unavailable' : buffer,
-        now,
-      );
+      // Stale numeric samples show Unavailable; an interval awaiting its first baseline stays
+      // 'Waiting for sample' (it was never a measurement to go stale).
+      const fresh = (value: IntervalMetric): IntervalMetric =>
+        stale && value !== 'Waiting for sample' ? 'Unavailable' : value;
+      const next = buildDiagnostics(rtt, fresh(buffer), now, {
+        bufferTargetDelayMs: fresh(target),
+        bufferMinimumDelayMs: fresh(minimum),
+        concealmentPercent: fresh(concealment),
+        packetsLostDelta: fresh(lostDelta),
+        jitterBufferPreference: preference,
+      });
       diagnostics = next;
       snapshot = { ...snapshot, diagnostics: next };
       emit();
