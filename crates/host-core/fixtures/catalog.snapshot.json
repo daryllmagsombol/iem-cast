@@ -8,7 +8,9 @@
       "role": "inputChannel",
       "authorized": true,
       "available": true,
-      "stereoPair": null
+      "stereoPair": null,
+      "stereoSide": null,
+      "defaultPan": 0
     },
     {
       "sourceId": "44444444-4444-4444-8444-444444444444",
@@ -17,7 +19,9 @@
       "role": "masterLr",
       "authorized": true,
       "available": true,
-      "stereoPair": null
+      "stereoPair": null,
+      "stereoSide": null,
+      "defaultPan": 0
     }
   ]
 }

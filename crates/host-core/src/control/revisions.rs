@@ -16,6 +16,21 @@ pub const PATCH_RATE_PER_SEC: f64 = 30.0;
 /// Bounded burst allowance for the token bucket.
 pub const PATCH_BURST: f64 = 60.0;
 
+/// Lowest permitted pan/balance position (full left).
+pub const MIN_PAN: f32 = -1.0;
+/// Highest permitted pan/balance position (full right).
+pub const MAX_PAN: f32 = 1.0;
+
+/// Canonicalize a finite pan to `[-1.0, 1.0]`; reject non-finite values outright.
+///
+/// Malformed/non-finite values are a rejection, never a silent clamp-to-success.
+pub fn canonicalize_pan(p: f32) -> Result<f32, ControlError> {
+    if !p.is_finite() {
+        return Err(ControlError::Internal);
+    }
+    Ok(p.clamp(MIN_PAN, MAX_PAN))
+}
+
 /// Canonicalize a finite gain to `[-60, 0]`; reject non-finite values outright.
 ///
 /// Malformed/non-finite values are a rejection, never a silent clamp-to-success.

@@ -29,6 +29,6 @@ pub const CODEC_FRAME_FRAMES: u32 = 120;
 pub const MAX_OUT_FRAMES_PER_BLOCK: usize = 3;
 
 pub use engine::AudioEngine;
-pub use gain::{centered_coefficients, gain_linear, validate_gain};
+pub use gain::{centered_coefficients, gain_linear, pan_coefficients, validate_gain};
 pub use limiter::Limiter;
 pub use safety::SafetyWorker;

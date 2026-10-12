@@ -11,7 +11,8 @@
       {
         "sourceId": "33333333-3333-4333-8333-333333333333",
         "gainDb": -12,
-        "muted": false
+        "muted": false,
+        "pan": 0
       }
     ],
     "masterDb": -6,

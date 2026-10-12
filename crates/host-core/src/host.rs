@@ -690,6 +690,8 @@ pub fn catalog_from_channel_map(
             authorized: true,
             available: true,
             stereo_pair: entry.stereo_pair,
+            stereo_side: entry.stereo_side,
+            default_pan: 0.0,
         })
         .collect();
     CatalogSnapshot {
@@ -756,6 +758,7 @@ pub fn default_channel_map(channels: u16) -> Vec<ChannelMapEntry> {
             physical_index: index,
             source_id: SourceId::from_bytes([index as u8; 16]),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         })
         .collect()
@@ -1025,6 +1028,7 @@ mod tests {
                 source_id: SourceId::from_bytes([0x11; 16]),
                 gain_db: -6.0,
                 muted: true,
+                pan: 0.0,
             }]),
             master_db: 0.0,
             master_muted: true,

@@ -266,5 +266,6 @@ fn find_gain(snapshot: &MixSnapshot, source_id: SourceId) -> SourceGain {
             source_id,
             gain_db: 0.0,
             muted: false,
+            pan: 0.0,
         })
 }

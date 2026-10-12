@@ -20,7 +20,9 @@ use crate::ids::{
 use crate::server::pairing::{PairStore, PairingCredential};
 use crate::server::protocol::ServerMessage;
 
-use super::revisions::{canonicalize_gain, RateLimiter, PATCH_BURST, PATCH_RATE_PER_SEC};
+use super::revisions::{
+    canonicalize_gain, canonicalize_pan, RateLimiter, PATCH_BURST, PATCH_RATE_PER_SEC,
+};
 
 /// Bounded number of accepted-patch acknowledgements retained for idempotency.
 const REQUEST_CACHE_LIMIT: usize = 64;
@@ -210,10 +212,12 @@ impl ControlActor {
                 return Err(ControlError::SourceForbidden);
             }
             let gain_db = canonicalize_gain(entry.gain_db)?;
+            let pan = canonicalize_pan(entry.pan)?;
             canonical.push(SourceGain {
                 source_id: entry.source_id,
                 gain_db,
                 muted: entry.muted,
+                pan,
             });
         }
         let master_db = canonicalize_gain(request.master_db)?;

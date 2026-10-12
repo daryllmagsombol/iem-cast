@@ -13,4 +13,4 @@ mod tests;
 
 pub use actor::ControlActor;
 pub use auth::{OriginPolicy, SessionStore};
-pub use revisions::{canonicalize_gain, RateLimiter};
+pub use revisions::{canonicalize_gain, canonicalize_pan, RateLimiter};

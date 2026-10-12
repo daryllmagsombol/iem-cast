@@ -1,7 +1,7 @@
 //! DSP / mix / safety unit tests.
 
 use super::engine::{AudioEngine, MAX_SESSIONS};
-use super::gain::{centered_coefficients, gain_linear, validate_gain};
+use super::gain::{centered_coefficients, gain_linear, pan_coefficients, validate_gain};
 use super::limiter::Limiter;
 use super::safety::SafetyWorker;
 use super::{BUS_HEADROOM_DB, CODEC_FRAME_FRAMES, MAX_OUT_FRAMES_PER_BLOCK};
@@ -35,12 +35,14 @@ fn two_channel_map() -> Vec<ChannelMapEntry> {
             physical_index: 0,
             source_id: SourceId::from_bytes([1; 16]),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         },
         ChannelMapEntry {
             physical_index: 1,
             source_id: SourceId::from_bytes([2; 16]),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         },
     ]
@@ -56,11 +58,13 @@ fn snapshot_gain(master_db: f32, master_muted: bool) -> MixSnapshot {
                 source_id: SourceId::from_bytes([1; 16]),
                 gain_db: 0.0,
                 muted: false,
+                pan: 0.0,
             },
             SourceGain {
                 source_id: SourceId::from_bytes([2; 16]),
                 gain_db: 0.0,
                 muted: false,
+                pan: 0.0,
             },
         ]),
         master_db,
@@ -77,6 +81,7 @@ fn snapshot_source_gain(gain_db: f32, source_id: SourceId) -> MixSnapshot {
             source_id,
             gain_db,
             muted: false,
+            pan: 0.0,
         }]),
         master_db: 0.0,
         master_muted: false,
@@ -162,6 +167,16 @@ fn bus_headroom_constant_is_minus_6_db() {
 #[test]
 fn mono_source_is_centered_unity_into_both_sides() {
     assert_eq!(centered_coefficients(), [1.0, 1.0]);
+}
+
+#[test]
+fn pan_coefficients_center_endpoints_and_law() {
+    // A canonical value is consumed as-is; the function does not validate.
+    assert_eq!(pan_coefficients(0.0), [1.0, 1.0]);
+    assert_eq!(pan_coefficients(-1.0), [1.0, 0.0]);
+    assert_eq!(pan_coefficients(1.0), [0.0, 1.0]);
+    assert_eq!(pan_coefficients(-0.25), [1.0, 0.75]);
+    assert_eq!(pan_coefficients(0.25), [0.75, 1.0]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -354,6 +369,7 @@ fn input_map_source_count(n: usize) -> Vec<ChannelMapEntry> {
             physical_index: index as u16,
             source_id: SourceId::from_bytes([(index + 1) as u8; 16]),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         })
         .collect()
@@ -365,6 +381,7 @@ fn unity_gains(n: usize) -> Vec<SourceGain> {
             source_id: SourceId::from_bytes([(index + 1) as u8; 16]),
             gain_db: 0.0,
             muted: false,
+            pan: 0.0,
         })
         .collect()
 }
@@ -665,11 +682,13 @@ fn additive_fader_gain_stays_below_limiting() {
                 source_id: SourceId::from_bytes([1; 16]),
                 gain_db: -12.0,
                 muted: false,
+                pan: 0.0,
             },
             SourceGain {
                 source_id: SourceId::from_bytes([2; 16]),
                 gain_db: -12.0,
                 muted: false,
+                pan: 0.0,
             },
         ]),
         master_db: 0.0,

@@ -132,6 +132,8 @@ pub fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: true,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
             SourceInfo {
                 source_id: unavailable_source(),
@@ -141,6 +143,8 @@ pub fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: false,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
         ],
     }
@@ -177,6 +181,7 @@ pub fn patch_source_gain(source_id: SourceId, gain_db: f32) -> MixPatch {
             source_id,
             gain_db,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,

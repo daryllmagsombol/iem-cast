@@ -79,6 +79,8 @@ fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: true,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
             SourceInfo {
                 source_id: unavailable_source(),
@@ -88,6 +90,8 @@ fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: false,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
         ],
     }
@@ -135,6 +139,7 @@ fn patch_gain_only() -> MixPatch {
             source_id: shared_source(),
             gain_db: -3.0,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -149,6 +154,7 @@ fn patch_unmute_channel() -> MixPatch {
             source_id: shared_source(),
             gain_db: -3.0,
             muted: false,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -163,6 +169,7 @@ fn patch_mute_channel() -> MixPatch {
             source_id: shared_source(),
             gain_db: -12.0,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -380,6 +387,7 @@ fn unavailable_source_is_forbidden() {
             source_id: unavailable_source(),
             gain_db: -3.0,
             muted: true,
+            pan: 0.0,
         }]),
         ..patch_gain_only()
     };
@@ -397,10 +405,36 @@ fn nonfinite_gain_is_rejected() {
             source_id: shared_source(),
             gain_db: f32::NAN,
             muted: true,
+            pan: 0.0,
         }]),
         ..patch_gain_only()
     };
     assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+}
+
+#[test]
+fn canonicalize_pan_rejects_nonfinite_and_clamps_finite() {
+    use crate::control::revisions::canonicalize_pan;
+
+    assert_eq!(canonicalize_pan(f32::NAN), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(f32::INFINITY), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(f32::NEG_INFINITY), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(-2.0), Ok(-1.0));
+    assert_eq!(canonicalize_pan(5.0), Ok(1.0));
+    assert_eq!(canonicalize_pan(0.35), Ok(0.35));
+}
+
+#[test]
+fn silent_source_gain_is_center_and_muted() {
+    assert_eq!(
+        SourceGain::SILENT,
+        SourceGain {
+            source_id: SourceId::from_bytes([0; 16]),
+            gain_db: 0.0,
+            muted: true,
+            pan: 0.0,
+        }
+    );
 }
 
 #[test]

@@ -26,3 +26,12 @@ pub fn validate_gain(db: f32) -> Result<f32, AudioFault> {
 pub fn centered_coefficients() -> [f32; 2] {
     [1.0, 1.0]
 }
+
+/// Stereo coefficients for an already-canonicalized pan `p ∈ [-1.0, 1.0]`.
+///
+/// `L(p) = 1 - max(p, 0)`, `R(p) = 1 + min(p, 0)`, so `p = 0` is `[1.0, 1.0]` (dual-mono center,
+/// no boost), `p = -1` is full left, and `p = 1` is full right. This **consumes** a canonical value
+/// and does **not** validate; callers must canonicalize first.
+pub fn pan_coefficients(canonical_p: f32) -> [f32; 2] {
+    [1.0 - canonical_p.max(0.0), 1.0 + canonical_p.min(0.0)]
+}
