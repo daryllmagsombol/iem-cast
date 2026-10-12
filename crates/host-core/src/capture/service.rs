@@ -141,6 +141,44 @@ pub trait CaptureStream: Send {
     fn play(&mut self) -> Result<(), CaptureFault>;
 }
 
+/// One supported input configuration as the pure selection routine sees it.
+///
+/// `supports_rate` is whether this configuration can be opened at the requested sample rate; the
+/// selection routine only considers those, so an advertised maximum channel count that cannot run
+/// at the requested rate is never chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputConfigCandidate {
+    /// Channel count of this configuration.
+    pub channels: u16,
+    /// Sample format this configuration delivers as.
+    pub sample_format: SampleFormat,
+    /// Whether the configuration can run at the requested sample rate.
+    pub supports_rate: bool,
+}
+
+/// The single source of truth for stream-configuration selection.
+///
+/// Picks the highest-channel configuration that supports `sample_rate_hz`. The same routine backs
+/// both the running capture's [`CaptureCapabilities`] and the persistence identity helper, so the
+/// selected layout cannot drift between them.
+pub fn select_input_configuration(
+    candidates: &[InputConfigCandidate],
+    sample_rate_hz: u32,
+) -> Result<(u16, SampleFormat), CaptureFault> {
+    let best = candidates
+        .iter()
+        .filter(|candidate| candidate.supports_rate)
+        .max_by_key(|candidate| candidate.channels);
+    match best {
+        Some(candidate) => Ok((candidate.channels, candidate.sample_format)),
+        None => Err(if !SUPPORTED_RATES.contains(&sample_rate_hz) {
+            CaptureFault::UnsupportedRate
+        } else {
+            CaptureFault::UnsupportedFormat
+        }),
+    }
+}
+
 /// Platform seam so tests never open real hardware.
 pub trait CaptureBackend: Send + Sync {
     /// Resolve and validate the actual device capability for `req`.
@@ -153,6 +191,46 @@ pub trait CaptureBackend: Send + Sync {
         caps: &CaptureCapabilities,
         sink: CaptureSink,
     ) -> Result<Box<dyn CaptureStream>, CaptureFault>;
+
+    /// The authoritative device UID and the actual selected channel count for `sample_rate_hz`.
+    ///
+    /// This reuses the same pure stream-configuration selection the real capture build uses, so it
+    /// returns the layout that will actually be opened rather than the discovery maximum. It must
+    /// not open a stream. The default (used by fakes) derives from [`capabilities`](Self::capabilities)
+    /// and echoes the requested device id; the real backend overrides it to read the CPAL UID.
+    fn verified_identity(
+        &self,
+        device_id: &str,
+        sample_rate_hz: u32,
+    ) -> Result<(String, u16), CaptureFault> {
+        let caps = self.capabilities(&CaptureRequest {
+            device_id: device_id.to_string(),
+            sample_rate_hz,
+            buffer_frames: 128,
+        })?;
+        Ok((device_id.to_string(), caps.channels))
+    }
+}
+
+/// The authoritative capture identity for a real device: its stable CPAL UID and the channel count
+/// of the configuration the capture stream will actually open at `sample_rate_hz`.
+///
+/// Setup reads this without opening a second live stream; the started stream is then asserted to
+/// match this binding.
+pub fn verified_capture_identity(
+    device_id: &str,
+    sample_rate_hz: u32,
+) -> Result<(String, u16), CaptureFault> {
+    verified_capture_identity_with_backend(&SystemCaptureBackend, device_id, sample_rate_hz)
+}
+
+/// [`verified_capture_identity`] against an injected backend (tests never touch hardware).
+pub fn verified_capture_identity_with_backend<B: CaptureBackend + ?Sized>(
+    backend: &B,
+    device_id: &str,
+    sample_rate_hz: u32,
+) -> Result<(String, u16), CaptureFault> {
+    backend.verified_identity(device_id, sample_rate_hz)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -317,38 +395,7 @@ pub struct SystemCaptureBackend;
 impl CaptureBackend for SystemCaptureBackend {
     fn capabilities(&self, req: &CaptureRequest) -> Result<CaptureCapabilities, CaptureFault> {
         let device = find_device(&req.device_id)?;
-        let mut configs = device
-            .supported_input_configs()
-            .map_err(|_| CaptureFault::DeviceUnavailable)?;
-
-        let mut best: Option<(u16, u32, SampleFormat)> = None;
-        for range in configs.by_ref() {
-            let channels = range.channels();
-            let format = match range.sample_format() {
-                cpal::SampleFormat::F32 => SampleFormat::F32,
-                cpal::SampleFormat::I16 => SampleFormat::I16,
-                cpal::SampleFormat::U16 => SampleFormat::U16,
-                _ => continue,
-            };
-            // Confirmed cpal call: no `SampleRate` tuple constructor.
-            if range.try_with_sample_rate(req.sample_rate_hz).is_some() {
-                let replace = match best {
-                    None => true,
-                    Some((c, _, _)) => channels > c,
-                };
-                if replace {
-                    best = Some((channels, req.sample_rate_hz, format));
-                }
-            }
-        }
-
-        let (channels, sample_rate_hz, sample_format) = best.ok_or_else(|| {
-            if !SUPPORTED_RATES.contains(&req.sample_rate_hz) {
-                CaptureFault::UnsupportedRate
-            } else {
-                CaptureFault::UnsupportedFormat
-            }
-        })?;
+        let (channels, sample_format) = system_selected_configuration(&device, req.sample_rate_hz)?;
 
         // Prefer 64/128 when the device reports a supported range; otherwise defer to the device.
         let buffer_frames = match device.default_input_config() {
@@ -358,10 +405,28 @@ impl CaptureBackend for SystemCaptureBackend {
 
         Ok(CaptureCapabilities {
             channels,
-            sample_rate_hz,
+            sample_rate_hz: req.sample_rate_hz,
             buffer_frames,
             sample_format,
         })
+    }
+
+    fn verified_identity(
+        &self,
+        device_id: &str,
+        sample_rate_hz: u32,
+    ) -> Result<(String, u16), CaptureFault> {
+        if !is_supported_rate(sample_rate_hz) {
+            return Err(CaptureFault::UnsupportedRate);
+        }
+        let device = find_device(device_id)?;
+        // The stable CPAL UID is the device's own id, never the caller-supplied string.
+        let uid = device
+            .id()
+            .map_err(|_| CaptureFault::DeviceUnavailable)?
+            .to_string();
+        let (channels, _) = system_selected_configuration(&device, sample_rate_hz)?;
+        Ok((uid, channels))
     }
 
     fn build(
@@ -430,6 +495,40 @@ impl CaptureStream for SystemStream {
         use cpal::traits::StreamTrait;
         self.inner.play().map_err(|_| CaptureFault::StreamError)
     }
+}
+
+/// Read the device's advertised configurations into the pure [`InputConfigCandidate`] form and run
+/// the shared selection routine.
+///
+/// Only configurations that can actually open at `sample_rate_hz` are considered, so the highest
+/// *openable* channel count is chosen rather than the highest *advertised* one. No stream is opened
+/// here; `supported_input_configs` is discovery only.
+fn system_selected_configuration(
+    device: &cpal::Device,
+    sample_rate_hz: u32,
+) -> Result<(u16, SampleFormat), CaptureFault> {
+    let configs = device
+        .supported_input_configs()
+        .map_err(|_| CaptureFault::DeviceUnavailable)?;
+
+    let mut candidates = Vec::new();
+    for range in configs {
+        let sample_format = match range.sample_format() {
+            cpal::SampleFormat::F32 => SampleFormat::F32,
+            cpal::SampleFormat::I16 => SampleFormat::I16,
+            cpal::SampleFormat::U16 => SampleFormat::U16,
+            _ => continue,
+        };
+        // Confirmed cpal call: no `SampleRate` tuple constructor.
+        let supports_rate = range.try_with_sample_rate(sample_rate_hz).is_some();
+        candidates.push(InputConfigCandidate {
+            channels: range.channels(),
+            sample_format,
+            supports_rate,
+        });
+    }
+
+    select_input_configuration(&candidates, sample_rate_hz)
 }
 
 fn preferred_buffer(default: &cpal::SupportedStreamConfig, requested: u32) -> u32 {
@@ -542,5 +641,82 @@ pub(crate) fn publish_chunks(
             telemetry.record_drop(frames as u64);
         }
         offset += frames;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_uses_the_openable_layout_not_the_advertised_maximum() {
+        // A device advertises a 6-channel configuration that cannot run at 48 kHz, plus a
+        // 4-channel one that can. Selection must return 4, never the advertised maximum of 6.
+        let candidates = [
+            InputConfigCandidate {
+                channels: 6,
+                sample_format: SampleFormat::F32,
+                supports_rate: false,
+            },
+            InputConfigCandidate {
+                channels: 4,
+                sample_format: SampleFormat::F32,
+                supports_rate: true,
+            },
+        ];
+        let (channels, format) = select_input_configuration(&candidates, 48_000).unwrap();
+        assert_eq!(channels, 4);
+        assert_eq!(format, SampleFormat::F32);
+    }
+
+    #[test]
+    fn selection_reports_unsupported_rate_and_format() {
+        let none = [InputConfigCandidate {
+            channels: 2,
+            sample_format: SampleFormat::F32,
+            supports_rate: false,
+        }];
+        assert_eq!(
+            select_input_configuration(&none, 48_000),
+            Err(CaptureFault::UnsupportedFormat)
+        );
+        assert_eq!(
+            select_input_configuration(&[], 44_100),
+            Err(CaptureFault::UnsupportedRate)
+        );
+    }
+
+    /// A fake backend whose advertised capability is the selected layout (no re-selection here).
+    struct SelectingFake {
+        channels: u16,
+    }
+
+    impl CaptureBackend for SelectingFake {
+        fn capabilities(&self, _req: &CaptureRequest) -> Result<CaptureCapabilities, CaptureFault> {
+            Ok(CaptureCapabilities {
+                channels: self.channels,
+                sample_rate_hz: 48_000,
+                buffer_frames: 128,
+                sample_format: SampleFormat::F32,
+            })
+        }
+
+        fn build(
+            &self,
+            _req: &CaptureRequest,
+            _caps: &CaptureCapabilities,
+            _sink: CaptureSink,
+        ) -> Result<Box<dyn CaptureStream>, CaptureFault> {
+            Err(CaptureFault::StreamError)
+        }
+    }
+
+    #[test]
+    fn verified_capture_identity_uses_the_built_stream_channels() {
+        let backend = SelectingFake { channels: 4 };
+        let (uid, channels) =
+            verified_capture_identity_with_backend(&backend, "dev-1", 48_000).unwrap();
+        assert_eq!(uid, "dev-1");
+        assert_eq!(channels, 4);
     }
 }

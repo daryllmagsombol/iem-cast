@@ -19,6 +19,8 @@ pub use crate::ids::MAX_BLOCK_FRAMES;
 pub use device::enumerate_input_devices;
 pub use pool::CapturePool;
 pub use service::{
-    next_audio_epoch, start, CaptureHandle, CaptureService, CaptureTelemetry, StopHandle,
+    next_audio_epoch, select_input_configuration, start, verified_capture_identity,
+    verified_capture_identity_with_backend, CaptureBackend, CaptureCapabilities, CaptureHandle,
+    CaptureService, CaptureTelemetry, InputConfigCandidate, StopHandle,
 };
 pub use timeline::{should_discard, Timeline};
