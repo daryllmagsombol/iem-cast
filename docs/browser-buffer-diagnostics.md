@@ -72,6 +72,54 @@ requested, or `null` when nothing was observed.
   end-to-end delay. Confirming that requires before/after measurement on real hardware, which has
   **not** been performed here.
 
+## UI presentation
+
+The existing **Latency diagnostics** panel keeps **Network RTT**, **Browser buffer delay**, and
+**End-to-end audio latency** visible. RTT and buffer readings remain separate; end-to-end remains
+**Not measured**. The existing full-path/physical-measurement explanation stays visible.
+
+A collapsed native **Browser buffer details** disclosure adds:
+
+- **Browser target delay** and **Browser minimum delay**, in rounded milliseconds.
+- **Packets lost**, as a packet count over the latest sample interval, not a rate or cumulative total.
+- **Audio concealment**, as a latest-interval percentage (up to two decimals; a positive value below
+  0.01% is shown as **<0.01%**, not zero).
+- A **Jitter buffer preference** group with **Requested preference** in ms and **Request outcome**.
+  A requested **0 ms** is explicitly a preference, not the actual buffer or a cap. A null requested
+  value shows **Not requested** only for the matching state; otherwise it shows **Unavailable**.
+
+Zero-valued metrics stay zero. **Unavailable** and **Waiting for sample** remain literal labels
+without fabricated numbers or unit suffixes. No threshold colors, diagnoses, latency totals, or
+performance promises are added. The panel is read-only and contains no setting/playback controls.
+
+Final helper copy:
+
+> Network and buffer readings are not full-path audio latency. End-to-end requires a physical measurement.
+
+> Readings below cover the latest sample interval. Target and minimum are browser-reported interval averages, not measurements of the sound reaching your ears or its minimum possible delay.
+
+> Audio concealment is the share of audio samples the browser replaced to cover missing audio.
+
+> Accepted means the request was accepted, not that the actual buffer matches it. The browser may ignore the preference or choose a higher delay.
+
+The native disclosure supports Enter/Space, preserves its open state across snapshot updates, uses
+the existing focus/theme tokens and a 48px minimum target, and participates in the receiver's
+existing dock-clearance behavior. Wrapping label/value rows support narrow screens and larger
+text. Snapshot updates are deliberately **not** live-announced every second.
+
+Focused UI checks:
+
+```sh
+npm test --workspace apps/web -- src/ui/__tests__/LatencyDiagnostics.test.tsx
+# From apps/web; owns and closes its own Vite server on strict port 5194 and browser instances
+node src/ui/__tests__/LatencyDiagnostics.browser.mjs
+```
+
+The browser harness mounts the real `ReceiverView` with fixed diagnostics and a long source name;
+it performs no media/signaling operations. Chromium and WebKit verify 320px/390px/desktop/landscape
+layouts, light/dark themes, keyboard disclosure/focus, dock clearance, 200% text scaling, and request
+and metric states. These fixture checks are not physical-phone or audio-latency measurements.
+
 ## Retest instructions
 
 ```sh
