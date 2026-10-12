@@ -6,7 +6,7 @@ This repository has three workflows under `.github/workflows/`:
 |---|---|---|---|
 | Tests | `tests.yml` | PRs, push to `main`, manual | **Yes** — correctness gate |
 | SonarQube | `sonarqube.yml` | push to `main`, `v*` tags, PRs to `main`, manual | **Yes** when it runs — `sonar.qualitygate.wait=true` fails on a red gate |
-| AI Code Review | `opencode-review.yml` | PR opened/synchronize/reopened/ready_for_review | No — advisory (`continue-on-error`) |
+| AI Code Review | `opencode-review.yml` | PR opened/synchronize/reopened/ready_for_review | No — advisory (`continue-on-error`), and **disabled by default** (see below) |
 
 The existing Pages deployment (`.github/workflows/pages.yml`) is unchanged.
 
@@ -17,6 +17,18 @@ An earlier revision of this file described **both** SonarQube and AI review as
 `-Dsonar.qualitygate.wait=true`, so a failing quality gate **fails the job**. The
 job only skips (and does not fail) when `SONAR_TOKEN`/`SONAR_HOST_URL` are absent.
 This document now reflects the actual behavior.
+
+## SonarQube baseline requirement (PR scans)
+
+A pull-request scan compares against the target branch's existing analysis. The
+project must therefore already have an analysis of the **base branch** (`main`)
+on the SonarQube server before a PR scan can succeed. On the **Community Build**,
+branch analysis is effectively main-only, and a configured community/PR plugin
+still requires that baseline to exist. In the observed run the base `main` baseline
+did not exist, so the scanner failed with
+`ERROR No branch exists in Sonarqube with the name main` (exit code 3) during branch
+configuration. No scan or merge has happened in this repository yet, so this must be
+established (typically by a first scan of `main`) before PR scans are meaningful.
 
 ## Tests workflow (`tests.yml`)
 
@@ -121,7 +133,50 @@ passed to the action's `args` — key against `^[A-Za-z0-9_.:-]+$`, name against
 
 ## AI Code Review (`opencode-review.yml`)
 
-Advisory only. Fork PRs are skipped. Secrets, vars, and actions are not written.
+Advisory only, and **currently disabled by default**. Secrets, vars, and actions are
+not written.
+
+### Disabled by default (opt-in)
+
+The `review` job runs only when the repository variable
+**`AI_CODE_REVIEW_ENABLED == 'true'`** (Settings → Secrets and variables → Actions →
+Variables). When the variable is absent or set to anything else, the **whole job is
+skipped** by its job-level `if:`, so there is no checkout, no use of
+`OPENCODE_API_KEY`, and **no model/provider calls or spending**. The same `if` also
+keeps the existing fork exclusion:
+
+```yaml
+if: >-
+  github.event.pull_request.head.repo.fork == false &&
+  vars.AI_CODE_REVIEW_ENABLED == 'true'
+```
+
+Why it is off: the previously configured model
+`opencode/muse-spark-1.3-contributor-free` was rejected from GitHub Actions by the
+provider with `403 FreeTierError: OpenCode's free tier can only be used from within
+OpenCode` (`https://opencode.ai/zen/v1/responses`; observed on PR #1 rerun attempt 2).
+That is a model/provider limitation, not a GitHub permission issue. The workflow does
+**not** silently substitute a paid model.
+
+A skipped run is **not** a review: the job shows green only because nothing ran (and,
+when enabled, review failures are also non-blocking via `continue-on-error`). Do not
+treat a green AI Code Review check as evidence the diff was reviewed.
+
+### How to re-enable
+
+Only after choosing a **CI-supported** model/provider and configuring its credential(s):
+
+1. Pick a model/provider that is permitted to be called from GitHub Actions (the
+   current free tier is not). This is a deliberate decision — do not select a paid
+   model without owner approval.
+2. Provide the required secret(s) (e.g. `OPENCODE_API_KEY`, or the provider-specific
+   key) under repository/organization Actions secrets.
+3. Update the action input `model:` in `.github/workflows/opencode-review.yml` if the
+   provider/model id changes.
+4. Set the repository variable `AI_CODE_REVIEW_ENABLED` to `true`.
+5. Confirm a real review is posted to a PR before relying on it.
+
+Re-disabling is the reverse: set the variable to `false` or delete it.
 
 ### Enforcement boundary (accurate)
 
@@ -162,11 +217,12 @@ No `contents` write is granted, so the action still cannot push even if a tool w
 misused. These GitHub API scopes are the action's own operations; they do not grant the
 agent tool permissions (those are handled by `OPENCODE_PERMISSION` above).
 
-### Repository secret
+### Repository variable and secret
 
 | Name | Required | Purpose |
 |---|---|---|
-| `OPENCODE_API_KEY` | Yes (to run the review) | API key for the review model. |
+| `AI_CODE_REVIEW_ENABLED` | Yes (to run the review) | Repository **variable**. Review runs only when exactly `'true'`. Absent/false → the job is fully skipped with no API calls. |
+| `OPENCODE_API_KEY` | Yes (to run the review) | Secret. API key for the review model (CI-supported provider only). |
 
 The action is pinned to `anomalyco/opencode/github@11e47f91496005aab4d7c5a2d0a7da5d2651b4ac`
 (the commit for tag `v1.17.8`).

@@ -14,10 +14,21 @@ concurrency:
 
 jobs:
   review:
+    # DISABLED BY DEFAULT. The review requires an explicit opt-in via the
+    # repository variable `AI_CODE_REVIEW_ENABLED == 'true'`. When the variable
+    # is absent or any other value, the whole job is skipped: no checkout, no
+    # API key use, and no model/provider spending or calls. This is a deliberate
+    # stop after the configured free-tier model was rejected from GitHub Actions
+    # (`403 FreeTierError: OpenCode's free tier can only be used from within
+    # OpenCode`, see docs/CI.md). Re-enable only after choosing a CI-supported
+    # model/provider and configuring its secret(s).
+    #
     # Fork PRs do not receive repository secrets, so the review cannot run
     # there. Do NOT switch to `pull_request_target`: that would hand repository
     # secrets and a write-capable token to untrusted PR code.
-    if: github.event.pull_request.head.repo.fork == false
+    if: >-
+      github.event.pull_request.head.repo.fork == false &&
+      vars.AI_CODE_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -34,9 +45,10 @@ jobs:
           # Do not leave git credentials on disk.
           persist-credentials: false
 
-      # `secrets` is not available in an `if:` condition, so gate via a step
-      # output. Unconfigured repos (and any non-fork PR missing the secret)
-      # skip with a clear annotation instead of failing. See docs/CI.md.
+      # Only reached when the job-level opt-in is enabled. `secrets` is not
+      # available in an `if:` condition, so gate via a step output: if the
+      # secret is missing the review step skips with a clear annotation instead
+      # of failing. See docs/CI.md.
       - name: Check review credentials
         id: review_creds
         env:
