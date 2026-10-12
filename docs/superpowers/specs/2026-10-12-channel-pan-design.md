@@ -201,6 +201,10 @@ sourceDefaults: { sourceId, pan }[]
   migrated, serialized, atomic, and durable, and happen **off the audio path**.
 - A failed save retains the committed config revision. Corrupt or unsupported files are surfaced
   visibly and recovered from; they are never overwritten in place.
+- Failure before installing the new file preserves the prior file, memory, and revision. If an
+  atomic replacement succeeds but directory durability cannot be confirmed, reconcile memory to
+  the installed revision and return a distinct durability-uncertain result. The UI must not report
+  ordinary success or claim the original file was unchanged; reload current settings before retry.
 - `v1` migration preserves IDs, mapping, and labels; migrated defaults are **center**, revision
   `0`, and the input binding is verified before the save.
 - **Unresolved legacy pairs** carry no inferred side: the operator must explicitly set L/R or unlink

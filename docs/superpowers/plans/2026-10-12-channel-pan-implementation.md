@@ -180,6 +180,15 @@ In `control/revisions.rs` tests (or `control/tests.rs`): `canonicalize_pan(f32::
 
 ### Task 3: Transactional device-bound config store + authoritative capture identity
 
+Execution clarification: pre-install I/O failures retain the old file, memory, and revision.
+An installed replacement whose directory durability cannot be confirmed returns
+`ConfigError::DurabilityUncertain { revision, source }` after reconciling memory to the installed
+revision. This distinction overrides blanket unchanged-state wording below. Add deterministic
+failure-stage tests. Current-version loads validate complete routing/binding/pair/default state;
+sparse load defaults may normalize to center before validation, but saves stay complete. Preserve
+compatible migrated IDs and unresolved links during non-destructive layout verification, then
+require explicit side resolution/unlinking before persisting a canonical v2 configuration.
+
 **Files:**
 - Modify: `config/mod.rs`, `capture/service.rs` (+ a small capture-identity helper), `host.rs`
 - Create (tests): `config/tests.rs`
@@ -226,6 +235,12 @@ In `control/revisions.rs` tests (or `control/tests.rs`): `canonicalize_pan(f32::
 - [ ] **Step 5: Commit gate** — parent stages `config/mod.rs`, `config/tests.rs`, `capture/service.rs`, `host.rs`.
 
 ### Task 4: Desktop actual-caller IPC — exact typed commands
+
+Consume the store's distinct durability-uncertain outcome: report that installation occurred but
+restart durability is unconfirmed, reload current settings/revision, and never retry using a stale
+base or label the operation ordinary success. Confirm preflight device binding against the actual
+started capture layout through the host/runtime accessor. Fresh-connection catalog projection is a
+composition requirement; default saves must not broadcast to existing musicians.
 
 **Files:**
 - Modify: `window_guard.rs`, `bridge.rs`, `commands.rs`, `lib.rs`, `permissions/operator.toml`, `tests/composition.rs`

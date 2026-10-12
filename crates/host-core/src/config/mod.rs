@@ -9,12 +9,20 @@
 //!
 //! - `open` loads and migrates but never writes. A missing file is a fresh **unbound** empty
 //!   config, not a fabricated device. A corrupt or future-versioned file is surfaced as an error
-//!   and its bytes are left exactly as they were.
+//!   and its bytes are left exactly as they were. Current-version files are fully validated (pairs
+//!   resolved, defaults complete, indices in bounds); sparse default vectors are normalized to
+//!   center before that validation.
 //! - `commit` is transactional and durable: it validates, writes a temp file in the same directory,
-//!   fsyncs, renames atomically, then fsyncs the parent directory. The in-memory committed value and
-//!   revision advance **only after** the rename succeeds; an I/O failure leaves both untouched.
-//! - `bind` is the explicit stopped-host rebinding operation; it is distinct from an accidental
-//!   device change arriving through `commit`.
+//!   fsyncs, atomically renames, then fsyncs the parent directory. A failure **before** the rename
+//!   leaves memory, the file, and the revision untouched. If the rename succeeds but directory
+//!   durability cannot be confirmed, the store reconciles memory to the installed revision and
+//!   returns [`ConfigError::DurabilityUncertain`] — it never claims ordinary success or that the
+//!   original file is unchanged.
+//! - `bind` is the explicit stopped-host rebinding operation: a different device or layout mints
+//!   fresh source ids and centered defaults. `verify_layout` is same-device verification and
+//!   retains compatible ids/map/labels; an unresolved legacy configuration is preserved in memory
+//!   for the UI but never written as an (invalid) current-version file until the operator resolves
+//!   the sides.
 //! - A legacy v1 file migrates to v2 preserving ids, mapping, and labels, with center defaults and
 //!   revision `0`. Unresolved legacy pairs are preserved for the UI but cannot be saved until the
 //!   operator chooses an explicit side or unlinks — no side is ever inferred.
@@ -38,7 +46,8 @@ pub const CONFIG_VERSION: u32 = 2;
 /// and must never be collapsed into a silent fallback.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// A filesystem read/write/flush/rename failure.
+    /// A filesystem read/write/flush/rename failure **before** the new file is installed. Memory,
+    /// the file, and the revision are unchanged.
     #[error("config io: {0}")]
     Io(#[from] std::io::Error),
     /// The file is not decodable, or the configuration is structurally invalid.
@@ -53,6 +62,43 @@ pub enum ConfigError {
     /// A commit attempted to change the bound device; use `bind` for an explicit rebind.
     #[error("device mismatch: bound {bound}, requested {requested}")]
     DeviceMismatch { bound: String, requested: String },
+    /// The new file was installed but parent-directory durability could not be confirmed. Memory and
+    /// revision were reconciled to the installed file; the caller must reload current settings
+    /// before retrying. The original file is **not** guaranteed to be unchanged.
+    #[error("config installed at revision {revision} but durability is unconfirmed: {source}")]
+    DurabilityUncertain {
+        /// The revision actually installed on disk.
+        revision: u64,
+        /// The underlying sync error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The monotonic settings revision is exhausted; no save is possible.
+    #[error("settings revision is exhausted")]
+    RevisionExhausted,
+}
+
+/// The outcome of an atomic write.
+enum PersistOutcome {
+    /// The new file was installed and the parent directory synced.
+    Installed,
+    /// The new file was installed (renamed into place) but the parent-directory sync failed.
+    InstalledUncertain(std::io::Error),
+}
+
+/// A stage at which the atomic writer can be made to fail deterministically in tests. The variants
+/// reachable before the rename leave the prior file untouched; the directory variants are only used
+/// where the platform supports directory handles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteStage {
+    CreateTemp,
+    Write,
+    SyncFile,
+    Rename,
+    #[cfg(unix)]
+    OpenDir,
+    #[cfg(unix)]
+    SyncDir,
 }
 
 /// A transactional, device-bound configuration store.
@@ -61,6 +107,9 @@ pub struct ConfigStore {
     path: PathBuf,
     committed: ConfigV2,
     revision: u64,
+    /// Deterministic fault injection; a private test-only seam with no production API.
+    #[cfg(test)]
+    fault: Option<WriteStage>,
 }
 
 impl ConfigStore {
@@ -76,6 +125,8 @@ impl ConfigStore {
                     path: path.to_path_buf(),
                     committed: empty_config(),
                     revision: 0,
+                    #[cfg(test)]
+                    fault: None,
                 });
             }
             Err(error) => return Err(ConfigError::Io(error)),
@@ -93,26 +144,28 @@ impl ConfigStore {
                 let legacy: Config =
                     serde_json::from_slice(&bytes).map_err(|_| ConfigError::Corrupt)?;
                 let migrated = migrate_v1(legacy)?;
+                // Legacy loads are relaxed: unresolved pairs and unknown layouts are preserved for
+                // the UI. Only decode-level integrity is required here.
+                validate_legacy_load(&migrated)?;
                 let revision = migrated.settings_revision.get();
                 (migrated, revision)
             }
             2 => {
                 let current: ConfigV2 =
                     serde_json::from_slice(&bytes).map_err(|_| ConfigError::Corrupt)?;
-                let revision = current.settings_revision.get();
-                (current, revision)
+                let normalized = normalize_and_validate_v2(current)?;
+                let revision = normalized.settings_revision.get();
+                (normalized, revision)
             }
             other => return Err(ConfigError::Unsupported(other as u32)),
         };
-
-        // Decode-level validation: a duplicate id or index is structurally corrupt. Pair resolution
-        // is deliberately NOT required here, so an unresolved legacy pair still loads for the UI.
-        validate_loadable(&committed)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             committed,
             revision,
+            #[cfg(test)]
+            fault: None,
         })
     }
 
@@ -144,9 +197,11 @@ impl ConfigStore {
 
     /// Commit a candidate configuration, advancing the settings revision.
     ///
-    /// Rejects a stale `expected_revision` and (once bound) a candidate that changes `device_id`.
-    /// The candidate is validated, written atomically and durably, and only then replaces the
-    /// in-memory committed value. On any I/O failure the memory and revision are unchanged.
+    /// Rejects a stale `expected_revision`, (once bound) a candidate that changes `device_id`, and
+    /// (once the layout is verified) any change to the verified channel count or the
+    /// source-id/physical-index binding. The candidate is validated, written atomically and
+    /// durably, and only then replaces the in-memory committed value. A failure before the rename
+    /// leaves memory and the revision unchanged.
     pub fn commit(
         &mut self,
         expected_revision: u64,
@@ -165,34 +220,68 @@ impl ConfigStore {
                     requested: candidate.device_id.clone().unwrap_or_default(),
                 });
             }
+            // The verified layout is immutable through an ordinary commit; a real layout change is
+            // an explicit `bind`.
+            if candidate.input_channels != self.committed.input_channels
+                || binding_pairs(&candidate.channel_map)
+                    != binding_pairs(&self.committed.channel_map)
+            {
+                return Err(ConfigError::Corrupt);
+            }
         }
+
+        // Checked revision advancement *before* any filesystem work.
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ConfigError::RevisionExhausted)?;
 
         candidate.version = CONFIG_VERSION;
         validate_config(&candidate)?;
-
-        // The store owns revision advancement, so memory and disk cannot drift.
-        candidate.settings_revision = SettingsRevision(self.revision + 1);
-        let next_revision = candidate.settings_revision.get();
+        candidate.settings_revision = SettingsRevision(next_revision);
 
         let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| ConfigError::Corrupt)?;
-        write_atomic(&self.path, &bytes)?;
-
-        self.committed = candidate.clone();
-        self.revision = next_revision;
-        Ok(candidate)
+        self.persist_candidate(candidate, next_revision, &bytes)
     }
 
     /// Explicitly (re)bind to a verified capture device and layout.
     ///
-    /// This is the stopped-host rebinding operation and is distinct from an accidental device change
-    /// through `commit`. A different device or layout mints **fresh** source ids and centered
-    /// defaults rather than inheriting the previous map; the same device and layout retain their
-    /// existing ids and map across restarts and pair changes.
+    /// This is the stopped-host rebinding operation. A different device, or a layout change, mints
+    /// **fresh** source ids and centered defaults. A same-device verification (see
+    /// [`verify_layout`](Self::verify_layout)) is expressed by calling `bind` where the existing map
+    /// is already compatible, in which case ids/map/labels are retained.
     pub fn bind(
         &mut self,
         device_id: &str,
         verified_channels: u16,
         expected_revision: u64,
+    ) -> Result<ConfigV2, ConfigError> {
+        self.apply_binding(device_id, verified_channels, expected_revision, true)
+    }
+
+    /// Verify the existing binding against a same-device capture layout, retaining compatible
+    /// ids/map/labels (including unresolved legacy links).
+    ///
+    /// Never mints fresh ids. A different device is a [`DeviceMismatch`](ConfigError::DeviceMismatch);
+    /// an incompatible map is [`Corrupt`](ConfigError::Corrupt) so the caller must explicitly `bind`.
+    /// A resolved configuration is persisted and advances the revision. An unresolved legacy
+    /// configuration is adopted **in memory only** so the operator can choose sides or unlink; it is
+    /// never written as an invalid current-version file.
+    pub fn verify_layout(
+        &mut self,
+        device_id: &str,
+        verified_channels: u16,
+        expected_revision: u64,
+    ) -> Result<ConfigV2, ConfigError> {
+        self.apply_binding(device_id, verified_channels, expected_revision, false)
+    }
+
+    fn apply_binding(
+        &mut self,
+        device_id: &str,
+        verified_channels: u16,
+        expected_revision: u64,
+        explicit: bool,
     ) -> Result<ConfigV2, ConfigError> {
         if expected_revision != self.revision {
             return Err(ConfigError::RevisionConflict {
@@ -204,18 +293,49 @@ impl ConfigStore {
             return Err(ConfigError::Corrupt);
         }
 
-        let same_binding = self.committed.device_id.as_deref() == Some(device_id)
-            && self.committed.input_channels == Some(verified_channels);
+        let same_uid = self.committed.device_id.as_deref() == Some(device_id);
+        if !same_uid && !explicit {
+            return Err(ConfigError::DeviceMismatch {
+                bound: self.committed.device_id.clone().unwrap_or_default(),
+                requested: device_id.to_string(),
+            });
+        }
 
-        let (channel_map, source_defaults) = if same_binding {
+        let compatible = map_compatible(
+            &self.committed.channel_map,
+            self.committed.input_channels,
+            verified_channels,
+        );
+        let retain = same_uid && compatible;
+
+        // Same-device verification with an incompatible map: the operator must explicitly rebind.
+        if !retain && !explicit {
+            return Err(ConfigError::Corrupt);
+        }
+
+        // A redundant verification of an already-valid binding is a no-op (no write, no revision).
+        if retain
+            && self.committed.input_channels == Some(verified_channels)
+            && validate_config(&self.committed).is_ok()
+        {
+            return Ok(self.committed.clone());
+        }
+
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ConfigError::RevisionExhausted)?;
+
+        let (channel_map, source_defaults, labels) = if retain {
             (
                 self.committed.channel_map.clone(),
                 self.committed.source_defaults.clone(),
+                self.committed.labels.clone(),
             )
         } else {
             let map = fresh_channel_map(verified_channels);
             let defaults = centered_defaults(&map);
-            (map, defaults)
+            (map, defaults, Vec::new())
         };
 
         let candidate = ConfigV2 {
@@ -223,20 +343,59 @@ impl ConfigStore {
             device_id: Some(device_id.to_string()),
             selected_interface: self.committed.selected_interface.clone(),
             input_channels: Some(verified_channels),
-            settings_revision: SettingsRevision(self.revision + 1),
+            settings_revision: SettingsRevision(next_revision),
             channel_map,
-            labels: self.committed.labels.clone(),
+            labels,
             source_defaults,
         };
-        validate_config(&candidate)?;
 
-        let next_revision = candidate.settings_revision.get();
-        let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| ConfigError::Corrupt)?;
-        write_atomic(&self.path, &bytes)?;
+        if validate_config(&candidate).is_ok() {
+            let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| ConfigError::Corrupt)?;
+            self.persist_candidate(candidate, next_revision, &bytes)
+        } else if retain {
+            // Unresolved legacy links: preserve them for the UI in memory, but never write an
+            // invalid current-version file to disk. The revision does not advance because nothing
+            // durable changed.
+            let mut adopted = candidate;
+            adopted.settings_revision = SettingsRevision(self.revision);
+            self.committed = adopted.clone();
+            Ok(adopted)
+        } else {
+            Err(ConfigError::Corrupt)
+        }
+    }
 
-        self.committed = candidate.clone();
-        self.revision = next_revision;
-        Ok(candidate)
+    /// Write `candidate` atomically, reconciling memory only on success or durable uncertainty.
+    fn persist_candidate(
+        &mut self,
+        candidate: ConfigV2,
+        next_revision: u64,
+        bytes: &[u8],
+    ) -> Result<ConfigV2, ConfigError> {
+        match self.persist(bytes)? {
+            PersistOutcome::Installed => {
+                self.committed = candidate.clone();
+                self.revision = next_revision;
+                Ok(candidate)
+            }
+            PersistOutcome::InstalledUncertain(source) => {
+                // The new file is installed: adopt the installed revision, then report uncertainty.
+                self.committed = candidate;
+                self.revision = next_revision;
+                Err(ConfigError::DurabilityUncertain {
+                    revision: next_revision,
+                    source,
+                })
+            }
+        }
+    }
+
+    fn persist(&self, bytes: &[u8]) -> Result<PersistOutcome, ConfigError> {
+        #[cfg(test)]
+        let fault = self.fault;
+        #[cfg(not(test))]
+        let fault = None;
+        write_atomic(&self.path, bytes, fault)
     }
 }
 
@@ -298,8 +457,90 @@ pub fn centered_defaults(map: &[ChannelMapEntry]) -> Vec<SourcePanDefault> {
         .collect()
 }
 
-/// Decode-level validation that must hold even for an unresolved legacy load.
-fn validate_loadable(config: &ConfigV2) -> Result<(), ConfigError> {
+/// The sorted `(physical_index, source_id)` binding of a map, used to detect layout changes.
+fn binding_pairs(map: &[ChannelMapEntry]) -> Vec<(u16, SourceId)> {
+    let mut pairs: Vec<(u16, SourceId)> =
+        map.iter().map(|e| (e.physical_index, e.source_id)).collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+/// Whether an existing map is compatible with a verified channel layout: same verified count (when
+/// one was recorded), the same number of entries, and every physical index in bounds.
+fn map_compatible(
+    map: &[ChannelMapEntry],
+    committed_channels: Option<u16>,
+    verified_channels: u16,
+) -> bool {
+    if let Some(recorded) = committed_channels {
+        if recorded != verified_channels {
+            return false;
+        }
+    }
+    map.len() == verified_channels as usize
+        && map.iter().all(|entry| entry.physical_index < verified_channels)
+}
+
+/// Full validation of a current-version config: resolved reciprocal pairs, in-bounds indices,
+/// complete finite defaults, and equal pans within a pair.
+pub fn validate_config(config: &ConfigV2) -> Result<(), ConfigError> {
+    validate_source_map(&config.channel_map)?;
+    if let Some(channels) = config.input_channels {
+        if channels == 0 || channels as usize > MAX_SOURCES {
+            return Err(ConfigError::Corrupt);
+        }
+        if config.channel_map.len() != channels as usize {
+            return Err(ConfigError::Corrupt);
+        }
+        if config
+            .channel_map
+            .iter()
+            .any(|entry| entry.physical_index >= channels)
+        {
+            return Err(ConfigError::Corrupt);
+        }
+    }
+    validate_source_defaults(&config.channel_map, &config.source_defaults)
+}
+
+/// Normalize a loaded current-version config then fully validate it.
+///
+/// Sparse default vectors are allowed on load: a mapped source with no record is centered. Any
+/// duplicate/unknown default, non-finite/out-of-range pan, unresolved pair, or out-of-bounds index
+/// is [`Corrupt`](ConfigError::Corrupt). Canonical save vectors remain complete.
+fn normalize_and_validate_v2(mut config: ConfigV2) -> Result<ConfigV2, ConfigError> {
+    let mut seen = HashSet::new();
+    for default in &config.source_defaults {
+        if !seen.insert(default.source_id)
+            || !config
+                .channel_map
+                .iter()
+                .any(|entry| entry.source_id == default.source_id)
+        {
+            return Err(ConfigError::Corrupt);
+        }
+    }
+    let complete = config
+        .channel_map
+        .iter()
+        .map(|entry| SourcePanDefault {
+            source_id: entry.source_id,
+            pan: config
+                .source_defaults
+                .iter()
+                .find(|default| default.source_id == entry.source_id)
+                .map(|default| default.pan)
+                .unwrap_or(0.0),
+        })
+        .collect();
+    config.source_defaults = complete;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+/// Decode-level validation for a migrated legacy config: unique ids/indices and finite in-range
+/// default values. Pair resolution and layout bounds are intentionally not required.
+fn validate_legacy_load(config: &ConfigV2) -> Result<(), ConfigError> {
     let mut ids = HashSet::new();
     let mut indices = HashSet::new();
     for entry in &config.channel_map {
@@ -307,19 +548,7 @@ fn validate_loadable(config: &ConfigV2) -> Result<(), ConfigError> {
             return Err(ConfigError::Corrupt);
         }
     }
-    validate_source_defaults_values(config)?;
-    Ok(())
-}
-
-/// Full configuration validation, applied before any save.
-pub fn validate_config(config: &ConfigV2) -> Result<(), ConfigError> {
-    validate_source_map(&config.channel_map)?;
-    if let Some(channels) = config.input_channels {
-        if config.channel_map.len() != channels as usize {
-            return Err(ConfigError::Corrupt);
-        }
-    }
-    validate_source_defaults(&config.channel_map, &config.source_defaults)
+    validate_source_defaults_values(&config.channel_map, &config.source_defaults)
 }
 
 /// Validate a configured channel map: unique ids and indices, reciprocal pairs with opposite sides
@@ -370,7 +599,7 @@ pub fn validate_source_defaults(
     map: &[ChannelMapEntry],
     defaults: &[SourcePanDefault],
 ) -> Result<(), ConfigError> {
-    validate_source_defaults_values_raw(map, defaults)?;
+    validate_source_defaults_values(map, defaults)?;
     if defaults.len() != map.len() {
         return Err(ConfigError::Corrupt);
     }
@@ -389,11 +618,7 @@ pub fn validate_source_defaults(
     Ok(())
 }
 
-fn validate_source_defaults_values(config: &ConfigV2) -> Result<(), ConfigError> {
-    validate_source_defaults_values_raw(&config.channel_map, &config.source_defaults)
-}
-
-fn validate_source_defaults_values_raw(
+fn validate_source_defaults_values(
     map: &[ChannelMapEntry],
     defaults: &[SourcePanDefault],
 ) -> Result<(), ConfigError> {
@@ -415,8 +640,9 @@ fn validate_source_defaults_values_raw(
 /// Apply a complete explicit link set, replacing all existing pairs.
 ///
 /// Each pair is `(left_source_id, right_source_id)`; the left member gets [`StereoSide::Left`] and
-/// the right member [`StereoSide::Right`]. Affected members' defaults are reset to center. Nothing
-/// is inferred: an unknown id, self-pair, or a source appearing in two links is rejected.
+/// the right member [`StereoSide::Right`]. A member whose link **membership or side** changed has
+/// its default reset to center, so a reversal recenters both members. Nothing is inferred: an
+/// unknown id, self-pair, or a source appearing in two links is rejected.
 pub fn apply_source_links(
     map: &[ChannelMapEntry],
     defaults: &[SourcePanDefault],
@@ -459,12 +685,14 @@ pub fn apply_source_links(
 
     validate_source_map(&linked)?;
 
-    // Any member whose link membership or peer changed has its default reset to center; a routing
-    // change never resets gains/mutes, only the affected defaults.
+    // A member is "affected" when its peer **or** its side changed (a reversal keeps the peer but
+    // swaps sides), so a reversal recenters both members. Unrelated defaults are untouched.
     let changed: HashSet<SourceId> = map
         .iter()
         .zip(linked.iter())
-        .filter(|(before, after)| before.stereo_pair != after.stereo_pair)
+        .filter(|(before, after)| {
+            before.stereo_pair != after.stereo_pair || before.stereo_side != after.stereo_side
+        })
         .map(|(_, after)| after.source_id)
         .collect();
 
@@ -483,49 +711,98 @@ pub fn apply_source_links(
     Ok((linked, recentered))
 }
 
-/// Write `bytes` to `path` atomically and durably: temp file in the same directory, flush + fsync,
-/// atomic rename, then a parent-directory sync. A failure never leaves a partial file in place.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let directory = parent.unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| ConfigError::Io(std::io::Error::new(
+/// Build a synthetic I/O error for the deterministic test seam.
+fn injected(stage: &str) -> std::io::Error {
+    std::io::Error::other(format!("injected write failure at {stage}"))
+}
+
+/// Write `bytes` to `path` atomically and durably.
+///
+/// The parent directory is opened **before** anything is replaced, so a directory-open failure is a
+/// pre-install failure. The temp file is written and fsynced in the same directory, renamed into
+/// place, and then the already-open directory handle is synced. A failure before the rename leaves
+/// the prior file untouched; a failure syncing the directory after a successful rename reports
+/// [`PersistOutcome::InstalledUncertain`] because the new file is installed but durability is not
+/// confirmed.
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    fault: Option<WriteStage>,
+) -> Result<PersistOutcome, ConfigError> {
+    let directory = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        ConfigError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "config path has no file name",
-        )))?;
+        ))
+    })?;
+
+    // 1. Open the parent directory before replacing anything (pre-install failure).
+    #[cfg(unix)]
+    let dir_handle = {
+        if fault == Some(WriteStage::OpenDir) {
+            return Err(ConfigError::Io(injected("open dir")));
+        }
+        fs::File::open(directory).map_err(ConfigError::Io)?
+    };
+
     let temp = directory.join(format!(
         ".{}.tmp-{}",
         file_name.to_string_lossy(),
         Uuid::new_v4()
     ));
 
-    let write = || -> std::io::Result<()> {
+    // 2. Write + fsync the temp file (pre-install failure; temp removed on error).
+    let write_result = (|| -> std::io::Result<()> {
+        if fault == Some(WriteStage::CreateTemp) {
+            return Err(injected("create temp"));
+        }
         let mut file = fs::File::create(&temp)?;
+        if fault == Some(WriteStage::Write) {
+            return Err(injected("write"));
+        }
         file.write_all(bytes)?;
         file.flush()?;
+        if fault == Some(WriteStage::SyncFile) {
+            return Err(injected("sync file"));
+        }
         file.sync_all()?;
         Ok(())
-    };
-
-    if let Err(error) = write() {
+    })();
+    if let Err(error) = write_result {
         let _ = fs::remove_file(&temp);
         return Err(ConfigError::Io(error));
     }
 
+    // 3. Atomic replacement (pre-install failure; temp removed on error).
+    if fault == Some(WriteStage::Rename) {
+        let _ = fs::remove_file(&temp);
+        return Err(ConfigError::Io(injected("rename")));
+    }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(ConfigError::Io(error));
     }
 
-    // Best-effort parent directory sync so the rename itself is durable on platforms that need it.
+    // 4. Post-install directory sync. A failure here cannot promise the prior file is unchanged.
     #[cfg(unix)]
     {
-        if let Ok(dir) = fs::File::open(directory) {
-            let _ = dir.sync_all();
+        if fault == Some(WriteStage::SyncDir) {
+            return Ok(PersistOutcome::InstalledUncertain(injected("sync dir")));
+        }
+        match dir_handle.sync_all() {
+            Ok(()) => Ok(PersistOutcome::Installed),
+            Err(error) => Ok(PersistOutcome::InstalledUncertain(error)),
         }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = fault;
+        Ok(PersistOutcome::Installed)
+    }
 }
 
 #[cfg(test)]

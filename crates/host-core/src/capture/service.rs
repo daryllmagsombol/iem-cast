@@ -158,17 +158,24 @@ pub struct InputConfigCandidate {
 
 /// The single source of truth for stream-configuration selection.
 ///
-/// Picks the highest-channel configuration that supports `sample_rate_hz`. The same routine backs
-/// both the running capture's [`CaptureCapabilities`] and the persistence identity helper, so the
-/// selected layout cannot drift between them.
+/// Picks the **first** highest-channel configuration that supports `sample_rate_hz` (a tie keeps the
+/// earliest candidate, matching the legacy `channels > best` rule). The same routine backs both the
+/// running capture's [`CaptureCapabilities`] and the persistence identity helper, so the selected
+/// layout cannot drift between them.
 pub fn select_input_configuration(
     candidates: &[InputConfigCandidate],
     sample_rate_hz: u32,
 ) -> Result<(u16, SampleFormat), CaptureFault> {
-    let best = candidates
-        .iter()
-        .filter(|candidate| candidate.supports_rate)
-        .max_by_key(|candidate| candidate.channels);
+    let mut best: Option<&InputConfigCandidate> = None;
+    for candidate in candidates.iter().filter(|candidate| candidate.supports_rate) {
+        let replace = match best {
+            None => true,
+            Some(current) => candidate.channels > current.channels,
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
     match best {
         Some(candidate) => Ok((candidate.channels, candidate.sample_format)),
         None => Err(if !SUPPORTED_RATES.contains(&sample_rate_hz) {
@@ -686,9 +693,31 @@ mod tests {
         );
     }
 
-    /// A fake backend whose advertised capability is the selected layout (no re-selection here).
+    #[test]
+    fn selection_keeps_the_first_equal_channel_candidate() {
+        // A tie on channel count must keep the earliest candidate (legacy `channels > best` rule),
+        // even when a later candidate advertises a different sample format.
+        let candidates = [
+            InputConfigCandidate {
+                channels: 4,
+                sample_format: SampleFormat::I16,
+                supports_rate: true,
+            },
+            InputConfigCandidate {
+                channels: 4,
+                sample_format: SampleFormat::F32,
+                supports_rate: true,
+            },
+        ];
+        let (channels, format) = select_input_configuration(&candidates, 48_000).unwrap();
+        assert_eq!(channels, 4);
+        assert_eq!(format, SampleFormat::I16, "the first equal-channel candidate wins");
+    }
+
+    /// A fake backend that exposes the selected capability and fails if a stream is built.
     struct SelectingFake {
         channels: u16,
+        built: std::sync::atomic::AtomicBool,
     }
 
     impl CaptureBackend for SelectingFake {
@@ -707,16 +736,26 @@ mod tests {
             _caps: &CaptureCapabilities,
             _sink: CaptureSink,
         ) -> Result<Box<dyn CaptureStream>, CaptureFault> {
+            self.built.store(true, Ordering::Relaxed);
             Err(CaptureFault::StreamError)
         }
     }
 
     #[test]
-    fn verified_capture_identity_uses_the_built_stream_channels() {
-        let backend = SelectingFake { channels: 4 };
+    fn verified_capture_identity_delegates_selected_capabilities_without_opening_a_stream() {
+        // The helper resolves the selected capability channels via the backend without building a
+        // stream. Actual startup agreement with the binding is a Task 4 concern.
+        let backend = SelectingFake {
+            channels: 4,
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
         let (uid, channels) =
             verified_capture_identity_with_backend(&backend, "dev-1", 48_000).unwrap();
         assert_eq!(uid, "dev-1");
         assert_eq!(channels, 4);
+        assert!(
+            !backend.built.load(Ordering::Relaxed),
+            "identity resolution must not open or build a capture stream"
+        );
     }
 }
