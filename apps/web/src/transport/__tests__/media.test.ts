@@ -154,14 +154,16 @@ describe('browser media port', () => {
     await expect(readiness).resolves.toBeUndefined();
   });
 
-  test('setJitterBufferTargetMs reports unsupported rather than throwing', async () => {
+  test('a receiver without the property is Unsupported rather than throwing', async () => {
     FakePeerConnection.instances = [];
+    FakePeerConnection.nextReceiver = {};
     const { signaling, offer } = fakeSignaling();
     const media = createBrowserMediaPort(signaling, mediaDeps());
     const readiness = media.createRecvOnlyAudio();
     await vi.waitFor(() => expect(offer).toHaveBeenCalled());
     // The fake receiver has no jitterBufferTarget, so the feature-detect returns false.
     await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Unsupported', requested_ms: 0 });
     media.stop();
     await expect(readiness).resolves.toBeUndefined();
   });
@@ -170,6 +172,37 @@ describe('browser media port', () => {
     const { signaling } = fakeSignaling();
     const media = createBrowserMediaPort(signaling, mediaDeps());
     expect(media.jitterBufferStatus?.()).toEqual({ state: 'Unavailable', requested_ms: null });
+  });
+
+  test('a request with no receiver is Unavailable, not an invented unsupported claim', async () => {
+    const { signaling } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    // No transceiver/receiver exists yet: nothing was observed, so no capability claim is made.
+    await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Unavailable', requested_ms: null });
+  });
+
+  test('a feature-detect has-trap that throws is Unavailable, not an invented Unsupported', async () => {
+    FakePeerConnection.instances = [];
+    // `'x' in receiver` does not invoke getters; only a Proxy `has` trap can throw here. That is an
+    // unknown capability, not an observed absence, so it must not surface as Unsupported.
+    const throwingHas = new Proxy(
+      {},
+      {
+        has() {
+          throw new Error('SecurityError');
+        },
+      },
+    );
+    FakePeerConnection.nextReceiver = throwingHas as { jitterBufferTarget?: number };
+    const { signaling, offer } = fakeSignaling();
+    const media = createBrowserMediaPort(signaling, mediaDeps());
+    const readiness = media.createRecvOnlyAudio();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    await expect(media.setJitterBufferTargetMs(0)).resolves.toBe(false);
+    expect(media.jitterBufferStatus?.()).toEqual({ state: 'Unavailable', requested_ms: null });
+    media.stop();
+    await expect(readiness).resolves.toBeUndefined();
   });
 
   test('a supported receiver accepts the preference and records Accepted (never a forced cap)', async () => {
@@ -192,8 +225,9 @@ describe('browser media port', () => {
     await expect(readiness).resolves.toBeUndefined();
   });
 
-  test('a receiver whose property getter throws is Rejected, not Unsupported', async () => {
+  test('an assignment whose setter/getter path throws is Rejected, not Unsupported', async () => {
     FakePeerConnection.instances = [];
+    // Only a getter exists, so the `in` check passes but the strict-mode assignment throws.
     const throwing: { jitterBufferTarget?: number } = {};
     Object.defineProperty(throwing, 'jitterBufferTarget', {
       configurable: true,

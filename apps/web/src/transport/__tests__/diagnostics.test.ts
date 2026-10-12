@@ -143,6 +143,14 @@ describe('computeConcealmentPercent', () => {
     expect(computeConcealmentPercent(prev, next)).toBe('Unavailable');
   });
 
+  test('concealed samples exceeding total samples is an impossible counter, Unavailable (not >100, not clamped)', () => {
+    const prev = inbound({ totalSamplesReceived: 1000, concealedSamples: 10 });
+    // An asymmetric counter reset: concealed grows by 5000 while total grows by only 100.
+    const next = inbound({ totalSamplesReceived: 1100, concealedSamples: 5010, sampledAtMs: 2000 });
+    expect(computeConcealmentPercent(prev, next)).toBe('Unavailable');
+    expect(computeConcealmentPercent(prev, next)).not.toBe(100);
+  });
+
   test('missing concealment counters are Unavailable', () => {
     const prev = inbound({ totalSamplesReceived: 1000 });
     const next = inbound({ totalSamplesReceived: 2000, sampledAtMs: 2000 });

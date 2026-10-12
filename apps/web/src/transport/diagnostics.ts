@@ -162,6 +162,9 @@ export function computeConcealmentPercent(
   const concealedDelta = concealedSamples - previousConcealed;
   if (!Number.isFinite(totalDelta) || !Number.isFinite(concealedDelta)) return 'Unavailable';
   if (totalDelta <= 0 || concealedDelta < 0) return 'Unavailable';
+  // Concealed samples cannot exceed the samples received in the same interval; a larger delta is an
+  // asymmetric counter reset, so it is `'Unavailable'` rather than a value > 100 (or a clamped 100).
+  if (concealedDelta > totalDelta) return 'Unavailable';
 
   const percent = (100 * concealedDelta) / totalDelta;
   if (!Number.isFinite(percent) || percent < 0) return 'Unavailable';

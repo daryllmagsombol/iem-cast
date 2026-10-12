@@ -223,17 +223,25 @@ export function createBrowserMediaPort(
       const receiver = transceiver?.receiver as
         | (RTCRtpReceiver & { jitterBufferTarget?: number })
         | undefined;
-      // Feature-detect the instance itself: some browsers throw on property access (e.g. a
-      // SecurityError getter), so even reading the property must be guarded.
-      let supported = false;
-      if (receiver) {
-        try {
-          supported = 'jitterBufferTarget' in receiver;
-        } catch {
-          supported = false;
-        }
+      // No receiver observed yet: make no capability claim. `jitterStatus` stays undefined so the
+      // outcome surfaces as `'Unavailable'`, never an invented `'Unsupported'`.
+      if (!receiver) {
+        jitterStatus = undefined;
+        return false;
       }
-      if (!receiver || !supported) {
+      // Feature-detect the instance. `'jitterBufferTarget' in receiver` checks presence and does
+      // NOT invoke a getter; only a `Proxy` `has` trap (or a revoked/hostile proxy) can throw here.
+      // A throwing trap is an unknown capability, not an observed absence, so it must not become
+      // an `'Unsupported'` claim either.
+      let supported: boolean;
+      try {
+        supported = 'jitterBufferTarget' in receiver;
+      } catch {
+        jitterStatus = undefined;
+        return false;
+      }
+      if (!supported) {
+        // The receiver exists and genuinely lacks the property: that IS an observed absence.
         jitterStatus = { supported: false, requestedMs: ms, accepted: false };
         return false;
       }

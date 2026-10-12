@@ -37,8 +37,10 @@ export interface MusicianSignaling {
  *
  * `jitterBufferTarget` is a **preference**, not a cap: `'Accepted'` only means the browser
  * accepted the assignment for later consideration — it never means the actual buffer is that
- * value or that latency is reduced. Fakes without a status accessor report `'Unavailable'`
- * rather than inventing an `'Unsupported'` claim.
+ * value or that latency is reduced. `'Unsupported'` is reserved for a receiver that was actually
+ * observed without the property; a port with no status accessor, no receiver, or a feature-detect
+ * that could not be evaluated reports `'Unavailable'` rather than inventing an `'Unsupported'`
+ * claim.
  */
 export type JitterBufferPreferenceState =
   | 'Not requested'
@@ -58,6 +60,8 @@ export interface JitterBufferPreference {
  *
  * `undefined` (from the optional accessor) means the port did not expose the capability at all —
  * an older or fake port — and is surfaced as `'Unavailable'`, never an invented `'Unsupported'`.
+ * `supported: false` is only set when a receiver was actually observed, so it maps to a real
+ * `'Unsupported'`; no receiver, or an unevaluatable feature-detect, leaves the status `undefined`.
  */
 export interface JitterBufferPreferenceStatus {
   /** Whether the receiver actually exposed a `jitterBufferTarget` property. */
