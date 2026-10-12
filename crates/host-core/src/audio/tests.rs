@@ -1,5 +1,6 @@
 //! DSP / mix / safety unit tests.
 
+use super::engine::ramp::PositionRamp;
 use super::engine::{AudioEngine, MAX_SESSIONS};
 use super::gain::{centered_coefficients, gain_linear, pan_coefficients, validate_gain};
 use super::limiter::Limiter;
@@ -7,7 +8,7 @@ use super::safety::SafetyWorker;
 use super::{BUS_HEADROOM_DB, CODEC_FRAME_FRAMES, MAX_OUT_FRAMES_PER_BLOCK};
 use crate::contract::{
     AudioEvent, AudioFault, CaptureBlock, ChannelMapEntry, MixSnapshot, SessionContext,
-    SourceGain, SourceGainMatrix, SourceRole, StereoFrame,
+    SourceGain, SourceGainMatrix, SourceRole, StereoSide, StereoFrame,
 };
 use crate::ids::{
     AudioEpoch, CatalogRevision, MixRevision, SafetyGeneration, SessionEpoch, SourceId,
@@ -177,6 +178,56 @@ fn pan_coefficients_center_endpoints_and_law() {
     assert_eq!(pan_coefficients(1.0), [0.0, 1.0]);
     assert_eq!(pan_coefficients(-0.25), [1.0, 0.75]);
     assert_eq!(pan_coefficients(0.25), [0.75, 1.0]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Position ramp (pan/balance)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn pan_ramp_reaches_full_travel_in_240_frames() {
+    let mut r = PositionRamp::new(-1.0);
+    r.set_target(1.0);
+    for _ in 0..239 {
+        r.next();
+    }
+    assert!((r.next() - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn pan_step_matches_two_over_240_per_frame() {
+    use super::engine::ramp::{PAN_RAMP_FRAMES_PER_FULL_TRAVEL, PAN_STEP_PER_FRAME};
+    assert_eq!(PAN_RAMP_FRAMES_PER_FULL_TRAVEL, 240.0);
+    assert!((PAN_STEP_PER_FRAME - 2.0 / 240.0).abs() < 1e-9);
+}
+
+#[test]
+fn pan_ramp_reverses_full_travel_in_240_frames() {
+    let mut r = PositionRamp::new(1.0);
+    r.set_target(-1.0);
+    for _ in 0..239 {
+        r.next();
+    }
+    assert!((r.next() - (-1.0)).abs() < 1e-6);
+}
+
+#[test]
+fn pan_ramp_reverses_midway_without_jump() {
+    let step = 2.0 / 240.0;
+    let mut r = PositionRamp::new(0.0);
+    r.set_target(1.0);
+    for _ in 0..120 {
+        r.next();
+    }
+    let before = r.current();
+    // Reverse mid-travel: the next frame continues from the current position by one step.
+    r.set_target(-1.0);
+    let after = r.next();
+    assert!(after < before, "reversal must move toward the new target");
+    assert!(
+        (after - (before - step)).abs() < 1e-6,
+        "reversal must be continuous (no snap): before={before} after={after}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1049,10 +1100,11 @@ fn measure_capture_passthrough_and_bus_headroom_attenuation() {
 
 #[test]
 fn measure_mono_source_has_no_pan_law_attenuation() {
-    // centered_coefficients() == [1.0, 1.0]: a mono InputChannel is placed into BOTH sides at unity
-    // (dual-mono). There is no -3 dB or -6 dB pan-law attenuation in host-core, so this cannot be
-    // the cause of the quiet output.
-    assert_eq!(centered_coefficients(), [1.0, 1.0]);
+    // At the default center pan, `pan_coefficients(0.0) == [1.0, 1.0]`, so a mono InputChannel is
+    // placed into BOTH sides at unity (dual-mono): there is no -3 dB or -6 dB center attenuation and
+    // no boost. Off-center pan attenuates only the opposite side (see the Task 2 pan tests), so a
+    // centered mono source cannot be the cause of the quiet output.
+    assert_eq!(pan_coefficients(0.0), [1.0, 1.0]);
     let map = input_map_source_count(1);
     let (pcm, _) = render_interleaved(&map, &unity_gains(1), 20, |_, start| {
         correlated_sine_block(1, 128, start, 997.0, 1.0)
@@ -1061,7 +1113,7 @@ fn measure_mono_source_has_no_pan_law_attenuation() {
     println!("[measure] mono pan: L_peak={lp:.6} L_rms={lrms:.6} R_peak={rp:.6} (unity dual-mono)");
     assert_eq!(
         lp, rp,
-        "mono must be identical in both sides (no pan attenuation)"
+        "centered mono must be identical in both sides (no pan attenuation)"
     );
 }
 
@@ -1636,4 +1688,415 @@ fn safety_gate_old_context_drops_after_rearm_and_disarm() {
     gate.disarm(disarmed_ctx);
     assert_eq!(gate.decide(&tagged(old_ctx)), GateDecision::Drop);
     assert_eq!(gate.decide(&tagged(new_ctx)), GateDecision::Drop);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pan / balance routing (Task 2)
+//
+// These exercise the real engine over synthetic capture blocks. Mono pan is an attenuation-only
+// law (`[1,1]` at center, no boost); an explicitly linked pair is a balance law with no crossfeed.
+// ---------------------------------------------------------------------------------------------
+
+fn sid(n: u8) -> SourceId {
+    SourceId::from_bytes([n; 16])
+}
+
+fn mono_gain(source: SourceId, gain_db: f32, muted: bool, pan: f32) -> SourceGain {
+    SourceGain {
+        source_id: source,
+        gain_db,
+        muted,
+        pan,
+    }
+}
+
+/// Two unpaired mono `InputChannel`s on physical 0 and 1.
+fn two_mono_map() -> Vec<ChannelMapEntry> {
+    vec![
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(1),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(2),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+    ]
+}
+
+/// One unpaired mono `InputChannel` on physical 0.
+fn one_mono_map() -> Vec<ChannelMapEntry> {
+    vec![ChannelMapEntry {
+        physical_index: 0,
+        source_id: sid(1),
+        stereo_pair: None,
+        stereo_side: None,
+        role: SourceRole::InputChannel,
+    }]
+}
+
+/// One unpaired `MasterLr` on physical `index` (legacy parity split).
+fn one_master_map(index: u16) -> Vec<ChannelMapEntry> {
+    vec![ChannelMapEntry {
+        physical_index: index,
+        source_id: sid(1),
+        stereo_pair: None,
+        stereo_side: None,
+        role: SourceRole::MasterLr,
+    }]
+}
+
+/// A reciprocal, explicit stereo pair of the given role (left physical 3, right physical 1 — a
+/// deliberately non-adjacent pair whose left member carries the higher physical index).
+fn paired_map(role: SourceRole) -> Vec<ChannelMapEntry> {
+    vec![
+        ChannelMapEntry {
+            physical_index: 3,
+            source_id: sid(1),
+            stereo_pair: Some(sid(2)),
+            stereo_side: Some(StereoSide::Left),
+            role,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(2),
+            stereo_pair: Some(sid(1)),
+            stereo_side: Some(StereoSide::Right),
+            role,
+        },
+    ]
+}
+
+/// A 2-channel capture block with per-channel constants, starting at `start_sample`.
+fn stereo_const_block_at(left: f32, right: f32, frames: u32, start_sample: u64) -> CaptureBlock {
+    let mut samples = crate::contract::silent_audio_slot();
+    for frame in 0..frames as usize {
+        samples[frame * 2] = left;
+        samples[frame * 2 + 1] = right;
+    }
+    CaptureBlock {
+        audio_epoch: ctx_a().audio_epoch,
+        start_sample,
+        frame_count: frames,
+        sample_rate_hz: 48_000,
+        channel_count: 2,
+        channel_map_revision: crate::ids::ChannelMapRevision(1),
+        samples,
+    }
+}
+
+fn stereo_const_block(left: f32, right: f32, frames: u32) -> CaptureBlock {
+    stereo_const_block_at(left, right, frames, 0)
+}
+
+/// A `channels`-wide capture block whose per-channel value is `value(channel)`, constant over all
+/// frames.
+fn const_block(channels: usize, frames: u32, value: impl Fn(usize) -> f32) -> CaptureBlock {
+    let mut samples = crate::contract::silent_audio_slot();
+    for frame in 0..frames as usize {
+        for ch in 0..channels {
+            samples[frame * channels + ch] = value(ch);
+        }
+    }
+    CaptureBlock {
+        audio_epoch: ctx_a().audio_epoch,
+        start_sample: 0,
+        frame_count: frames,
+        sample_rate_hz: 48_000,
+        channel_count: channels as u16,
+        channel_map_revision: crate::ids::ChannelMapRevision(1),
+        samples,
+    }
+}
+
+fn snapshot_with(sources: &[SourceGain]) -> MixSnapshot {
+    MixSnapshot {
+        context: ctx_a(),
+        catalog_revision: CatalogRevision(1),
+        mix_revision: MixRevision(1),
+        sources: SourceGainMatrix::from_slice(sources),
+        master_db: 0.0,
+        master_muted: false,
+    }
+}
+
+/// Render exactly one 120-frame codec frame for a map/snapshot/block through the bare engine.
+fn render_frame(map: &[ChannelMapEntry], mix: MixSnapshot, block: &CaptureBlock) -> Vec<f32> {
+    let mut engine = AudioEngine::new(48_000, map);
+    engine.register_session(0, ctx_a(), mix);
+    let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+    let mut iterations = 0;
+    let mut collected = Vec::new();
+    while collected.is_empty() && iterations < 4 {
+        let n = engine.process_block(0, block, &mix, &mut out).unwrap();
+        if n > 0 {
+            let len = out[0].frame_count as usize * 2;
+            collected = out[0].pcm[..len].to_vec();
+        }
+        iterations += 1;
+    }
+    collected
+}
+
+#[test]
+fn mono_pan_endpoints_and_intermediate_coefficients() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = one_mono_map();
+    let block = stereo_const_block(1.0, 0.0, 120); // only physical 0 carries signal
+
+    // Full left: L(-1)=1, R(-1)=0.
+    let full_left = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, -1.0)]), &block);
+    let ((ll, _), (lr, _)) = left_right_stats(&full_left);
+    assert!((ll - headroom).abs() < 1e-3, "pan -1 must place full level left, got {ll}");
+    assert!(lr < 1e-6, "pan -1 must silence the right, got {lr}");
+
+    // Full right.
+    let full_right = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, 1.0)]), &block);
+    let ((rl, _), (rr, _)) = left_right_stats(&full_right);
+    assert!(rl < 1e-6, "pan +1 must silence the left, got {rl}");
+    assert!((rr - headroom).abs() < 1e-3, "pan +1 must place full level right, got {rr}");
+
+    // Center is unity dual-mono with no boost.
+    let center = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]), &block);
+    let ((cl, _), (cr, _)) = left_right_stats(&center);
+    assert!((cl - headroom).abs() < 1e-3 && (cr - headroom).abs() < 1e-3, "center must be unity dual-mono");
+
+    // Intermediate pan attenuates only the opposite side: L(0.5)=0.5, R(0.5)=1.
+    let mid = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.5)]), &block);
+    let ((ml, _), (mr, _)) = left_right_stats(&mid);
+    assert!((ml - headroom * 0.5).abs() < 1e-3, "L(0.5) must be 0.5, got {ml}");
+    assert!((mr - headroom).abs() < 1e-3, "R(0.5) must be 1.0, got {mr}");
+}
+
+#[test]
+fn omitted_engine_source_is_silent_not_unity() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = two_mono_map();
+    let block = stereo_const_block(0.5, 0.5, 120);
+    // Only source 1 is present in the snapshot; source 2 is mapped but omitted.
+    let out = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]), &block);
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    assert!(
+        (lp - headroom * 0.5).abs() < 1e-3,
+        "an omitted mapped source must contribute silence, not unity (L={lp})"
+    );
+    assert!(
+        (rp - headroom * 0.5).abs() < 1e-3,
+        "an omitted mapped source must contribute silence, not unity (R={rp})"
+    );
+    // The old unmuted-unity fallback would have produced ~2x this level.
+    assert!(lp < headroom * 0.75, "omitted source added unexpected gain: {lp}");
+}
+
+#[test]
+fn paired_master_lr_uses_balance_law_not_parity() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = paired_map(SourceRole::MasterLr);
+    let block = const_block(4, 120, |_| 1.0);
+    let out = render_frame(
+        &map,
+        snapshot_with(&[
+            mono_gain(sid(1), 0.0, false, -1.0),
+            mono_gain(sid(2), 0.0, false, -1.0),
+        ]),
+        &block,
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    // Balance law: left member at L(-1)=1 stays; right member at R(-1)=0 is silenced.
+    assert!((lp - headroom).abs() < 1e-3, "paired MasterLr pan -1 left must be full level, got {lp}");
+    assert!(rp < 1e-6, "paired MasterLr pan -1 must silence the right member, got {rp}");
+}
+
+#[test]
+fn unpaired_master_lr_keeps_parity_split() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    // Physical index 0 -> left only (legacy index % 2).
+    let left_map = one_master_map(0);
+    let left_out = render_frame(
+        &left_map,
+        snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.9)]),
+        &stereo_const_block(1.0, 0.0, 120),
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&left_out);
+    assert!((lp - headroom).abs() < 1e-3, "unpaired MasterLr index 0 must go left, got {lp}");
+    assert!(rp < 1e-6, "unpaired MasterLr index 0 must not go right, got {rp}");
+
+    // Physical index 1 -> right only; pan is ignored on the parity path.
+    let right_map = one_master_map(1);
+    let right_out = render_frame(
+        &right_map,
+        snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]),
+        &stereo_const_block(0.0, 1.0, 120),
+    );
+    let ((rp2, _), (rr2, _)) = left_right_stats(&right_out);
+    assert!(rp2 < 1e-6, "unpaired MasterLr index 1 must not go left, got {rp2}");
+    assert!((rr2 - headroom).abs() < 1e-3, "unpaired MasterLr index 1 must go right, got {rr2}");
+}
+
+#[test]
+fn linked_pair_sides_reach_distinct_outputs_without_crossfeed() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = paired_map(SourceRole::InputChannel);
+    // Left member physical 3 = 0.5 at unity; right member physical 1 = 0.25 at -6 dB.
+    let block = const_block(4, 120, |ch| match ch {
+        3 => 0.5,
+        1 => 0.25,
+        _ => 0.0,
+    });
+    let gain_r = -6.0;
+    let out = render_frame(
+        &map,
+        snapshot_with(&[
+            mono_gain(sid(1), 0.0, false, 0.0),
+            mono_gain(sid(2), gain_r, false, 0.0),
+        ]),
+        &block,
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    let expected_left = headroom * 0.5;
+    let expected_right = headroom * 0.25 * 10f32.powf(gain_r / 20.0);
+    // Distinct gains and levels; if there were crossfeed, each side would carry a component of the
+    // other member and these exact equalities would fail.
+    assert!((lp - expected_left).abs() < 1e-3, "left must carry only the left member: {lp} vs {expected_left}");
+    assert!((rp - expected_right).abs() < 1e-3, "right must carry only the right member: {rp} vs {expected_right}");
+}
+
+#[test]
+fn paired_member_mute_silences_only_that_member() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = paired_map(SourceRole::InputChannel);
+    let block = const_block(4, 120, |_| 1.0);
+    let out = render_frame(
+        &map,
+        snapshot_with(&[
+            mono_gain(sid(1), 0.0, false, 0.0),
+            mono_gain(sid(2), 0.0, true, 0.0),
+        ]),
+        &block,
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    assert!((lp - headroom).abs() < 1e-3, "muting the right member must not touch the left: {lp}");
+    assert!(rp < 1e-3, "muting the right member must silence only the right: {rp}");
+}
+
+#[test]
+fn invalid_declared_pair_fails_closed_to_silence() {
+    // The map claims a pair but the reciprocal peer is absent: the member must be silent, never
+    // degraded to a mono source.
+    let map = vec![ChannelMapEntry {
+        physical_index: 0,
+        source_id: sid(1),
+        stereo_pair: Some(sid(9)),
+        stereo_side: Some(StereoSide::Left),
+        role: SourceRole::InputChannel,
+    }];
+    let out = render_frame(&map, snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]), &stereo_const_block(1.0, 0.0, 120));
+    assert!(out.iter().all(|s| s.abs() < 1e-6), "invalid pair must fail closed to silence");
+}
+
+#[test]
+fn pan_edit_within_context_preserves_partial() {
+    let map = one_mono_map();
+    let mut mix = snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]);
+    let mut engine = AudioEngine::new(48_000, &map);
+    engine.register_session(0, ctx_a(), mix);
+    let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+
+    // Hold a 100-frame partial.
+    assert_eq!(
+        engine
+            .process_block(0, &stereo_const_block_at(0.4, 0.0, 100, 0), &mix, &mut out)
+            .unwrap(),
+        0
+    );
+
+    // Ordinary pan edit with the exact same context (metadata only) must preserve the partial.
+    mix.sources.entries[0].pan = 0.5;
+    mix.mix_revision = MixRevision(2);
+    engine.register_session(0, ctx_a(), mix);
+
+    assert_eq!(
+        engine
+            .process_block(0, &stereo_const_block_at(0.4, 0.0, 20, 100), &mix, &mut out)
+            .unwrap(),
+        1,
+        "the held partial must survive a same-context pan edit"
+    );
+    assert_eq!(out[0].start_sample, 0, "the frame must remain anchored at the held start");
+}
+
+#[test]
+fn pan_resets_on_identity_change() {
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = one_mono_map();
+    let mix_a = snapshot_with(&[mono_gain(sid(1), 0.0, false, -1.0)]);
+    let mut engine = AudioEngine::new(48_000, &map);
+    engine.register_session(0, ctx_a(), mix_a);
+    let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+
+    let n = engine
+        .process_block(0, &stereo_const_block(1.0, 0.0, 120), &mix_a, &mut out)
+        .unwrap();
+    assert_eq!(n, 1);
+    let ((lp, _), (rp, _)) = left_right_stats(&out[0].pcm[..240]);
+    assert!((lp - headroom).abs() < 1e-3 && rp < 1e-6, "epoch A must be full left");
+
+    // New identity with the opposite pan must snap immediately, not ramp from A.
+    let mut ctx_b = ctx_a();
+    ctx_b.safety_generation = SafetyGeneration(2);
+    let mut mix_b = snapshot_with(&[mono_gain(sid(1), 0.0, false, 1.0)]);
+    mix_b.context = ctx_b;
+    engine.register_session(0, ctx_b, mix_b);
+
+    let n = engine
+        .process_block(0, &stereo_const_block(1.0, 0.0, 120), &mix_b, &mut out)
+        .unwrap();
+    assert_eq!(n, 1);
+    let ((lp_b, _), (rp_b, _)) = left_right_stats(&out[0].pcm[..240]);
+    assert!(lp_b < 1e-6, "new identity must snap to full right, left should be silent: {lp_b}");
+    assert!((rp_b - headroom).abs() < 1e-3, "new identity must snap to full right: {rp_b}");
+}
+
+#[test]
+fn pan_ramp_resets_for_each_context_component_change() {
+    // Changing any single identity component (session/audio/safety) must clear the held partial and
+    // snap the pan ramp fresh, never re-tag held PCM.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = one_mono_map();
+    for mutate in 0..3 {
+        let mix_a = snapshot_with(&[mono_gain(sid(1), 0.0, false, -1.0)]);
+        let mut engine = AudioEngine::new(48_000, &map);
+        engine.register_session(0, ctx_a(), mix_a);
+        let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+
+        // Hold a 60-frame partial under ctx_a (full-left pan).
+        let mut held = stereo_const_block_at(1.0, 0.0, 60, 0);
+        held.audio_epoch = ctx_a().audio_epoch;
+        assert_eq!(engine.process_block(0, &held, &mix_a, &mut out).unwrap(), 0);
+
+        let mut new_ctx = ctx_a();
+        match mutate {
+            0 => new_ctx.safety_generation = SafetyGeneration(2),
+            1 => new_ctx.audio_epoch = AudioEpoch::from_bytes([0x99; 16]),
+            _ => new_ctx.session_epoch = SessionEpoch::from_bytes([0x77; 16]),
+        }
+        let mut mix_b = snapshot_with(&[mono_gain(sid(1), 0.0, false, 1.0)]);
+        mix_b.context = new_ctx;
+        engine.register_session(0, new_ctx, mix_b);
+
+        let mut block = stereo_const_block_at(1.0, 0.0, 120, 500);
+        block.audio_epoch = new_ctx.audio_epoch;
+        let produced = engine.process_block(0, &block, &mix_b, &mut out).unwrap();
+        assert_eq!(produced, 1, "identity change {mutate} must clear the held partial");
+        assert_eq!(out[0].context, new_ctx);
+        assert_eq!(out[0].start_sample, 500, "held PCM must not be re-tagged");
+        let ((lp, _), (rp, _)) = left_right_stats(&out[0].pcm[..240]);
+        assert!(lp < 1e-6 && (rp - headroom).abs() < 1e-3, "pan must snap full right for change {mutate}");
+    }
 }

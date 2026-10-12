@@ -205,6 +205,10 @@ impl ControlActor {
         let mut canonical: Vec<SourceGain> = Vec::with_capacity(request.sources.len as usize);
         let mut unmute_forbidden = false;
         for entry in request.sources.as_slice() {
+            // Duplicate source IDs in one patch are an inconsistent absolute mix: reject.
+            if canonical.iter().any(|g| g.source_id == entry.source_id) {
+                return Err(ControlError::Internal);
+            }
             let info = self
                 .catalog_source(entry.source_id)
                 .ok_or(ControlError::SourceForbidden)?;
@@ -219,6 +223,45 @@ impl ControlActor {
                 muted: entry.muted,
                 pan,
             });
+        }
+        // The patch must target the catalog revision the actor currently serves.
+        if request.catalog_revision != catalog_revision {
+            return Err(ControlError::RevisionConflict);
+        }
+        // Linked-pair integrity: validate the catalog's reciprocal metadata and require the patch to
+        // carry the pair as a unit with one canonical pan. Any inconsistent or half pair is
+        // rejected wholesale, never routed as a silently degraded mono source.
+        for entry in &canonical {
+            let info = self
+                .catalog_source(entry.source_id)
+                .ok_or(ControlError::SourceForbidden)?;
+            let Some(peer_id) = info.stereo_pair else {
+                // An unpaired source must carry no side.
+                if info.stereo_side.is_some() {
+                    return Err(ControlError::Internal);
+                }
+                continue;
+            };
+            // A pair member present without its reciprocal peer is an incomplete (half) pair.
+            let peer = canonical
+                .iter()
+                .find(|g| g.source_id == peer_id)
+                .ok_or(ControlError::Internal)?;
+            let peer_info = self
+                .catalog_source(peer_id)
+                .ok_or(ControlError::SourceForbidden)?;
+            let reciprocal = peer_info.stereo_pair == Some(entry.source_id)
+                && peer_info.role == info.role
+                && info.stereo_side.is_some()
+                && peer_info.stereo_side.is_some()
+                && info.stereo_side != peer_info.stereo_side;
+            if !reciprocal {
+                return Err(ControlError::Internal);
+            }
+            // Both members must carry the same canonical pan (compare after clamping).
+            if (entry.pan - peer.pan).abs() > f32::EPSILON {
+                return Err(ControlError::Internal);
+            }
         }
         let master_db = canonicalize_gain(request.master_db)?;
 
