@@ -27,8 +27,9 @@ branch analysis is effectively main-only, and a configured community/PR plugin
 still requires that baseline to exist. In the observed run the base `main` baseline
 did not exist, so the scanner failed with
 `ERROR No branch exists in Sonarqube with the name main` (exit code 3) during branch
-configuration. No scan or merge has happened in this repository yet, so this must be
-established (typically by a first scan of `main`) before PR scans are meaningful.
+configuration. The initial PR scans failed before establishing a baseline; `main`
+has not yet been successfully analyzed. Establish that baseline before PR scans
+can compare new code against it.
 
 ## Tests workflow (`tests.yml`)
 
