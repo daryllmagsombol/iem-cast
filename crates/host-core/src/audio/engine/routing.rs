@@ -48,11 +48,13 @@ pub struct RoutingPlan {
 impl RoutingPlan {
     /// Build a plan from a channel map, truncating anything beyond [`MAX_SOURCES`].
     ///
-    /// Structural validity is resolved **first**, before any audible route is assigned. Ambiguous
-    /// metadata (duplicate source identities, duplicate physical bindings, orphan sides, one-sided
-    /// or non-reciprocal links, overlapping pair claims, and peers outside the bounded map) marks
-    /// every implicated entry invalid; those entries become [`Route::Silent`]. Only then are the
-    /// remaining, structurally sound entries routed. Unrelated valid sources are preserved.
+    /// Structural validity is resolved to a **fixpoint** before any audible route is assigned.
+    /// Ambiguous metadata (duplicate source identities, duplicate physical bindings, orphan sides,
+    /// one-sided or non-reciprocal links, ambiguous peer matches, and peers outside the bounded map)
+    /// marks its implicated entries invalid, and invalidity then **propagates through reciprocal
+    /// partners** (a valid pair whose partner is invalid for any reason is itself closed) until
+    /// stable. Only entries that survive — and whose pair peer also survives — are routed. Unrelated
+    /// valid sources are preserved.
     pub fn build(channel_map: &[ChannelMapEntry]) -> Self {
         let map: &[ChannelMapEntry] = &channel_map[..channel_map.len().min(MAX_SOURCES)];
         let count = map.len();
@@ -71,41 +73,85 @@ impl RoutingPlan {
             }
         }
 
-        // Link integrity. A side without a pair is an orphan and invalid. A link is only valid when
-        // it is a reciprocal pair with matched roles and opposite sides. Any invalid link closes
-        // both endpoints (the peer is looked up within the bounded map; a peer outside it closes the
-        // source). Iterating every link source marks overlapping components correctly: each invalid
-        // link closes both of its endpoints, so a member of two conflicting links is closed by both.
+        // Unique peer lookup: `None` when the peer id is absent **or ambiguous** (multiple entries
+        // share it). An ambiguous match is an invalid link, never a first-match guess.
+        let peer_of = |i: usize| -> Option<usize> {
+            let peer_id = map[i].stereo_pair?;
+            let mut found: Option<usize> = None;
+            for (j, entry) in map.iter().enumerate() {
+                if j != i && entry.source_id == peer_id {
+                    if found.is_some() {
+                        return None; // ambiguous identity match
+                    }
+                    found = Some(j);
+                }
+            }
+            found
+        };
+
+        // Base link validity: an orphan side, an absent/ambiguous peer, or a non-reciprocal / role-
+        // mismatched / same-side link closes the endpoint(s) it implicates.
         for i in 0..count {
-            let entry = &map[i];
-            match entry.stereo_pair {
+            match map[i].stereo_pair {
                 None => {
-                    if entry.stereo_side.is_some() {
+                    if map[i].stereo_side.is_some() {
                         invalid[i] = true;
                     }
                 }
-                Some(peer_id) => {
-                    let peer_index = (0..count).find(|&j| j != i && map[j].source_id == peer_id);
-                    match peer_index {
-                        Some(j) => {
-                            let peer = &map[j];
-                            let valid = peer.stereo_pair == Some(entry.source_id)
-                                && peer.role == entry.role
-                                && entry.stereo_side.is_some()
-                                && peer.stereo_side.is_some()
-                                && entry.stereo_side != peer.stereo_side;
-                            if !valid {
-                                invalid[i] = true;
-                                invalid[j] = true;
-                            }
+                Some(_) => match peer_of(i) {
+                    Some(j) => {
+                        let peer = &map[j];
+                        let valid = peer.stereo_pair == Some(map[i].source_id)
+                            && peer.role == map[i].role
+                            && map[i].stereo_side.is_some()
+                            && peer.stereo_side.is_some()
+                            && map[i].stereo_side != peer.stereo_side;
+                        if !valid {
+                            invalid[i] = true;
+                            invalid[j] = true;
                         }
-                        None => invalid[i] = true,
                     }
-                }
+                    None => invalid[i] = true,
+                },
             }
         }
 
-        // Assign audible routes only to entries that survived structural validation.
+        // Propagate invalidity to a fixpoint through reciprocal partners. A conflicting incoming
+        // claim (e.g. C -> A alongside a valid reciprocal A <-> B) leaves A invalid; that must close
+        // B as well, not leave B audible. Bounded `n <= MAX_SOURCES`, no graph framework.
+        loop {
+            let mut changed = false;
+            for i in 0..count {
+                if map[i].stereo_pair.is_none() {
+                    continue;
+                }
+                match peer_of(i) {
+                    Some(j) => {
+                        if invalid[i] || invalid[j] {
+                            if !invalid[i] {
+                                invalid[i] = true;
+                                changed = true;
+                            }
+                            if !invalid[j] {
+                                invalid[j] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    None => {
+                        if !invalid[i] {
+                            invalid[i] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Assign audible routes only to entries (and pair endpoints) that survived validation.
         let mut routes = vec![Route::Silent; count];
         let mut assigned: Vec<Option<u8>> = vec![None; count];
         let mut group_anchor: Vec<SourceId> = Vec::with_capacity(count);
@@ -131,15 +177,18 @@ impl RoutingPlan {
                     assigned[index] = Some(group);
                     routes[index] = Route::MonoPan { group };
                 }
-                Some(peer_id) => {
+                Some(_) => {
                     if let Some(group) = assigned[index] {
                         routes[index] = side_route(entry.stereo_side, group);
                         continue;
                     }
-                    // Valid pair (validation above guarantees this): share one pan/balance group.
-                    let peer_index = (0..count)
-                        .find(|&j| j != index && map[j].source_id == peer_id)
-                        .expect("validated pair has an in-map peer");
+                    // A validated pair has a unique in-map peer; require **both** endpoints valid
+                    // before assigning the shared group.
+                    let peer_index = peer_of(index)
+                        .expect("a valid pair entry has a unique in-map peer");
+                    if invalid[peer_index] {
+                        continue;
+                    }
                     let group = group_anchor.len() as u8;
                     group_anchor.push(entry.source_id);
                     assigned[index] = Some(group);

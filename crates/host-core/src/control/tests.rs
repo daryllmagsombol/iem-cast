@@ -771,4 +771,21 @@ fn rejected_pair_preserves_seeded_accepted_snapshot_revision_and_ack_cache() {
     };
     assert_eq!(a.apply_patch(sess(), retry), Err(ControlError::Internal));
     assert_eq!(dsp.installs.lock().unwrap().len(), 1);
+
+    // A *valid* follow-up with the base revision the seed left behind (1) must be accepted as
+    // revision 2. This proves the rejected edits (which fail at pair validation, before revision
+    // validation) did not corrupt the accepted counter, rather than only that a same-base retry
+    // still fails.
+    let valid = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.25),
+            pair_gain(pair_right(), -6.0, 0.25),
+        ])
+    };
+    let ack2 = a
+        .apply_patch(sess(), valid)
+        .expect("a valid follow-up at base revision 1 must be accepted");
+    assert_eq!(ack2.accepted_revision, MixRevision(2));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 2, "the valid follow-up installs once");
 }

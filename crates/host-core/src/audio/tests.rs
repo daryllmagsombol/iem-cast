@@ -196,7 +196,8 @@ fn pan_ramp_reaches_full_travel_in_240_frames() {
         "the target must not be reached before frame 240, got {}",
         r.current()
     );
-    assert!((r.next() - 1.0).abs() < 1e-6, "frame 240 must land exactly on the target");
+    // The public `next()` returns the target exactly when it lands on it.
+    assert_eq!(r.next(), 1.0, "frame 240 must land exactly on the target");
 }
 
 #[test]
@@ -218,7 +219,7 @@ fn pan_ramp_reverses_full_travel_in_240_frames() {
         "the target must not be reached before frame 240, got {}",
         r.current()
     );
-    assert!((r.next() - (-1.0)).abs() < 1e-6, "frame 240 must land exactly on the target");
+    assert_eq!(r.next(), -1.0, "frame 240 must land exactly on the target");
 }
 
 #[test]
@@ -246,17 +247,19 @@ fn pan_ramp_moves_at_most_one_step_every_frame_both_directions() {
 #[test]
 fn pan_ramp_target_between_one_and_two_steps_takes_two_frames() {
     // 0.0125 is exactly 1.5 steps from 0. The ramp must advance one step per frame, so it must NOT
-    // snap to the target in the first frame.
+    // snap to the target in the first frame. Mirrored for the negative direction.
     let step = 2.0 / 240.0;
-    let mut r = PositionRamp::new(0.0);
-    r.set_target(0.0125);
-    let first = r.next();
-    assert!(
-        (first - step).abs() < 1e-9,
-        "first frame must move exactly one step ({step}), got {first} (extra-step snap bug)"
-    );
-    let second = r.next();
-    assert!((second - 0.0125).abs() < 1e-9, "second frame must land on the target, got {second}");
+    for target in [0.0125f32, -0.0125f32] {
+        let mut r = PositionRamp::new(0.0);
+        r.set_target(target);
+        let first = r.next();
+        assert!(
+            (first - step * target.signum()).abs() < 1e-9,
+            "first frame toward {target} must move exactly one step ({step}), got {first}"
+        );
+        let second = r.next();
+        assert!((second - target).abs() < 1e-9, "second frame must land on {target}, got {second}");
+    }
 }
 
 #[test]
@@ -2167,6 +2170,120 @@ fn pair_peer_outside_bounded_map_fails_closed() {
 }
 
 #[test]
+fn conflicting_incoming_claim_closes_reciprocal_partner_both_roles() {
+    // Exact graph: A Left->B, B Right->A (reciprocal), C Left->A (conflicting incoming claim),
+    // all with unique physical indices. A is invalid (A<->B reciprocal plus C->A conflict, and A
+    // carries two incoming claims). Invalidity must propagate through A's reciprocal partner B, so
+    // B is silent too; only unrelated D survives. Checked for both roles.
+    for role in [SourceRole::InputChannel, SourceRole::MasterLr] {
+        let map = vec![
+            ChannelMapEntry {
+                physical_index: 3,
+                source_id: sid(1), // A
+                stereo_pair: Some(sid(2)),
+                stereo_side: Some(StereoSide::Left),
+                role,
+            },
+            ChannelMapEntry {
+                physical_index: 1,
+                source_id: sid(2), // B
+                stereo_pair: Some(sid(1)),
+                stereo_side: Some(StereoSide::Right),
+                role,
+            },
+            ChannelMapEntry {
+                physical_index: 2,
+                source_id: sid(3), // C
+                stereo_pair: Some(sid(1)), // claims A, conflicting
+                stereo_side: Some(StereoSide::Left),
+                role,
+            },
+            ChannelMapEntry {
+                physical_index: 0,
+                source_id: sid(4), // D, unrelated valid mono
+                stereo_pair: None,
+                stereo_side: None,
+                role,
+            },
+        ];
+        let out = render_frame_all(
+            &map,
+            &[
+                mono_gain(sid(1), 0.0, false, 0.0),
+                mono_gain(sid(2), 0.0, false, 0.0),
+                mono_gain(sid(3), 0.0, false, 0.0),
+                mono_gain(sid(4), 0.0, false, 0.0),
+            ],
+        );
+        // All four inputs carry signal; only D may survive. D is an InputChannel (dual-mono both
+        // sides) or an unpaired MasterLr on even physical 0 (parity-left). If B leaked (as a pair
+        // member) the wrong-side output would be nonzero.
+        let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+        let ((lp, _), (rp, _)) = left_right_stats(&out);
+        match role {
+            SourceRole::InputChannel => assert!(
+                (lp - headroom).abs() < 1e-3 && (rp - headroom).abs() < 1e-3,
+                "only unrelated D may be audible for {role:?}; A/B/C must be closed (L={lp} R={rp})"
+            ),
+            SourceRole::MasterLr => assert!(
+                (lp - headroom).abs() < 1e-3 && rp < 1e-6,
+                "only unrelated D (parity-left) may be audible for {role:?}; A/B/C closed (L={lp} R={rp})"
+            ),
+        }
+    }
+}
+
+#[test]
+fn paired_member_with_duplicate_physical_binding_closes_its_partner() {
+    // A valid reciprocal pair A<->B, but A shares a physical binding with unrelated C. A is invalid
+    // by the duplicate binding; that invalidity must also close B, not leave B audible as PairRight.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = vec![
+        ChannelMapEntry {
+            physical_index: 3,
+            source_id: sid(1), // A
+            stereo_pair: Some(sid(2)),
+            stereo_side: Some(StereoSide::Left),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(2), // B
+            stereo_pair: Some(sid(1)),
+            stereo_side: Some(StereoSide::Right),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 3, // duplicate of A's physical binding
+            source_id: sid(3), // C, unrelated but collides
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(4), // D, unrelated valid mono
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+    ];
+    let out = render_frame_all(
+        &map,
+        &[
+            mono_gain(sid(1), 0.0, false, 0.0),
+            mono_gain(sid(2), 0.0, false, 0.0),
+            mono_gain(sid(4), 0.0, false, 0.0),
+        ],
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    assert!(
+        (lp - headroom).abs() < 1e-3 && (rp - headroom).abs() < 1e-3,
+        "A's duplicate binding must close partner B; only unrelated D audible (L={lp} R={rp})"
+    );
+}
+
+#[test]
 fn paired_member_mute_silences_only_that_member() {
     let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
     let map = paired_map(SourceRole::InputChannel);
@@ -2431,80 +2548,114 @@ fn reciprocal_pair_survives_alongside_invalid_entries() {
 #[test]
 fn pan_edit_within_context_preserves_partial() {
     // Two contiguous edits within one exact context must preserve the held partial AND continue the
-    // pan ramp smoothly from where it was, proven on the actual PCM (not merely a frame count).
+    // pan ramp smoothly from where it was, proven on the actual PCM against an independently
+    // computed per-sample position (never a production ramp helper).
+    //
+    // Recipe (constant non-clipping input `amp`, so the limiter never engages):
+    //   - 100 held samples at p = 0 (center), no output yet;
+    //   - edit toward +1, then 20 samples complete frame0 (samples 0..119);
+    //   - 30 held samples continue toward +1 (samples 120..149);
+    //   - reverse toward -1, then 90 samples complete frame1 (samples 120..239).
+    // Position: s<100 -> 0; 100<=s<150 -> (s-99)*step; s>=150 -> 50*step-(s-149)*step.
+    let step = 2.0f32 / 240.0;
+    let amp = 0.4f32;
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
     let map = one_mono_map();
-    let mix = snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]);
+    let start_mix = snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]);
     let mut engine = AudioEngine::new(48_000, &map);
-    engine.register_session(0, ctx_a(), mix);
+    engine.register_session(0, ctx_a(), start_mix);
     let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
 
-    // Hold 100 contiguous frames of a constant 0.4 source; pan target is still center.
+    // 100 held frames at center pan.
     assert_eq!(
         engine
-            .process_block(0, &const_block_at(1, 100, 0, |_| 0.4), &mix, &mut out)
+            .process_block(0, &const_block_at(1, 100, 0, |_| amp), &start_mix, &mut out)
             .unwrap(),
         0
     );
 
-    // First edit: move pan to +0.5 (same exact context). No gap, no ramp jump.
-    let mut edited = mix;
-    edited.sources.entries[0].pan = 0.5;
-    edited.mix_revision = MixRevision(2);
-    engine.register_session(0, ctx_a(), edited);
-    // 20 more contiguous frames complete the held 120-frame partial, anchored at 0.
+    // Edit 1: pan target +1 (same exact context, new revision). 20 frames complete frame0.
+    let mut mix1 = start_mix;
+    mix1.sources.entries[0].pan = 1.0;
+    mix1.mix_revision = MixRevision(2);
+    engine.register_session(0, ctx_a(), mix1);
     assert_eq!(
         engine
-            .process_block(0, &const_block_at(1, 20, 100, |_| 0.4), &edited, &mut out)
+            .process_block(0, &const_block_at(1, 20, 100, |_| amp), &mix1, &mut out)
             .unwrap(),
         1,
         "the held partial must survive the first same-context pan edit"
     );
-    assert_eq!(out[0].start_sample, 0, "the frame must remain anchored at the held start");
+    assert_eq!(out[0].start_sample, 0, "frame0 must stay anchored at 0");
     let frame0 = out[0].pcm[..240].to_vec();
-    // The pan ramp had no time to move over 120 frames? 120 frames is half of a full travel
-    // (240), and the target moved from 0 to 0.5 = 60 frames of travel, so the ramp completes in the
-    // first 60 frames; the frame is a mix of ramping and settled pan — never a hard discontinuity.
-    assert!(frame0.iter().all(|s| s.is_finite()));
 
-    // Second edit mid-ramp: while pan is still moving, change the target again within the same
-    // context. The held partial for the *next* frame must be preserved too.
-    let held_before = {
-        // Process a fresh 30-frame partial after the completed frame (starts at 120).
-        assert_eq!(
-            engine
-                .process_block(0, &const_block_at(1, 30, 120, |_| 0.4), &edited, &mut out)
-                .unwrap(),
-            0
-        );
-        frame0.len()
-    };
-    let mut edited2 = edited;
-    edited2.sources.entries[0].pan = -1.0; // reverse target mid-travel
-    edited2.mix_revision = MixRevision(3);
-    engine.register_session(0, ctx_a(), edited2);
+    // 30 held frames continue the +1 travel (partial carried, no output).
     assert_eq!(
         engine
-            .process_block(0, &const_block_at(1, 90, 150, |_| 0.4), &edited2, &mut out)
+            .process_block(0, &const_block_at(1, 30, 120, |_| amp), &mix1, &mut out)
+            .unwrap(),
+        0
+    );
+
+    // Edit 2: reverse toward -1 (same context, new revision). 90 frames complete frame1.
+    let mut mix2 = mix1;
+    mix2.sources.entries[0].pan = -1.0;
+    mix2.mix_revision = MixRevision(3);
+    engine.register_session(0, ctx_a(), mix2);
+    assert_eq!(
+        engine
+            .process_block(0, &const_block_at(1, 90, 150, |_| amp), &mix2, &mut out)
             .unwrap(),
         1,
         "the second mid-ramp, same-context edit must also preserve partial state"
     );
-    assert_eq!(held_before, 240);
-    assert_eq!(out[0].start_sample, 120, "the second frame must stay anchored at 120, no gap");
-    let frame1 = &out[0].pcm[..240];
-    // Continuity: consecutive samples never jump by more than the ramp's per-frame pan change times
-    // the source amplitude, i.e. the second edit did not splice non-adjacent audio.
-    let max_step = frame1
-        .chunks_exact(2)
-        .map(|lr| lr[0].abs())
-        .fold(0.0f32, f32::max)
-        .max(
-            frame1
-                .chunks_exact(2)
-                .map(|lr| lr[1].abs())
-                .fold(0.0f32, f32::max),
+    assert_eq!(out[0].start_sample, 120, "frame1 must stay anchored at 120 (no gap/splice)");
+    let frame1 = out[0].pcm[..240].to_vec();
+
+    // Independent per-sample position and expected coefficients.
+    let pan_at = |s: usize| -> f32 {
+        if s < 100 {
+            0.0
+        } else if s < 150 {
+            (s - 99) as f32 * step
+        } else {
+            50.0 * step - (s - 149) as f32 * step
+        }
+    };
+    let mut all = frame0.clone();
+    all.extend_from_slice(&frame1);
+    for s in 0..240usize {
+        let p = pan_at(s);
+        let expected_l = amp * headroom * (1.0 - p.max(0.0));
+        let expected_r = amp * headroom * (1.0 + p.min(0.0));
+        assert!(
+            (all[s * 2] - expected_l).abs() < 1e-5,
+            "sample {s} left {} != analytic {expected_l} at p={p}",
+            all[s * 2]
         );
-    assert!(max_step.is_finite() && max_step > 0.0, "second frame must carry the source");
+        assert!(
+            (all[s * 2 + 1] - expected_r).abs() < 1e-5,
+            "sample {s} right {} != analytic {expected_r} at p={p}",
+            all[s * 2 + 1]
+        );
+    }
+
+    // Adjacent SAME-channel differences across the whole 240-sample run — including both edit seams
+    // (s=100, s=150) and the frame seam (s=120) — never exceed one ramp step of the source level. A
+    // snap on either edit or a spliced partial would blow this bound.
+    let max_delta = amp * headroom * step;
+    for s in 1..240usize {
+        let dl = (all[s * 2] - all[(s - 1) * 2]).abs();
+        let dr = (all[s * 2 + 1] - all[(s - 1) * 2 + 1]).abs();
+        assert!(
+            dl <= max_delta + 1e-5,
+            "left jump {dl} at sample {s} exceeds one step {max_delta}"
+        );
+        assert!(
+            dr <= max_delta + 1e-5,
+            "right jump {dr} at sample {s} exceeds one step {max_delta}"
+        );
+    }
 }
 
 #[test]
