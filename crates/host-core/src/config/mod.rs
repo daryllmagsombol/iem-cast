@@ -481,26 +481,54 @@ fn map_compatible(
         && map.iter().all(|entry| entry.physical_index < verified_channels)
 }
 
-/// Full validation of a current-version config: resolved reciprocal pairs, in-bounds indices,
-/// complete finite defaults, and equal pans within a pair.
+/// Full validation of a current-version config: a verified supported channel count for any
+/// populated device-bound state, resolved reciprocal pairs, in-bounds indices, complete finite
+/// defaults, and equal pans within a pair.
+///
+/// Only an **empty, unbound** base state may omit the layout (`device_id: None` +
+/// `input_channels: None` + empty map). A populated map without a verified count, a bound device
+/// without a count, or a count without a device are inconsistent bindings and rejected. This is the
+/// single gate used by both `open` (through [`normalize_and_validate_v2`]) and `commit`.
 pub fn validate_config(config: &ConfigV2) -> Result<(), ConfigError> {
+    validate_binding_layout(config)?;
     validate_source_map(&config.channel_map)?;
-    if let Some(channels) = config.input_channels {
-        if channels == 0 || channels as usize > MAX_SOURCES {
-            return Err(ConfigError::Corrupt);
-        }
-        if config.channel_map.len() != channels as usize {
-            return Err(ConfigError::Corrupt);
-        }
-        if config
-            .channel_map
-            .iter()
-            .any(|entry| entry.physical_index >= channels)
-        {
-            return Err(ConfigError::Corrupt);
-        }
-    }
     validate_source_defaults(&config.channel_map, &config.source_defaults)
+}
+
+/// Require a verified supported count for populated/device-bound canonical states.
+///
+/// Allowed combinations only:
+/// - `(None, None)` with an empty map — the fresh unbound base state.
+/// - `(Some(device), Some(channels))` — a bound, verified layout, fully bounds-checked.
+///
+/// Everything else (populated map with no count, bound device with no count, a count without a
+/// device) is an inconsistent binding.
+fn validate_binding_layout(config: &ConfigV2) -> Result<(), ConfigError> {
+    match (config.device_id.as_deref(), config.input_channels) {
+        (None, None) => {
+            if !config.channel_map.is_empty() {
+                return Err(ConfigError::Corrupt);
+            }
+            Ok(())
+        }
+        (Some(_), Some(channels)) => {
+            if channels == 0 || channels as usize > MAX_SOURCES {
+                return Err(ConfigError::Corrupt);
+            }
+            if config.channel_map.len() != channels as usize {
+                return Err(ConfigError::Corrupt);
+            }
+            if config
+                .channel_map
+                .iter()
+                .any(|entry| entry.physical_index >= channels)
+            {
+                return Err(ConfigError::Corrupt);
+            }
+            Ok(())
+        }
+        _ => Err(ConfigError::Corrupt),
+    }
 }
 
 /// Normalize a loaded current-version config then fully validate it.

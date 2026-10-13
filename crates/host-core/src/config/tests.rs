@@ -192,6 +192,87 @@ fn sparse_v2_defaults_load_centered_then_full_validation_applies() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn populated_v2_null_layout_is_corrupt_and_bytes_unchanged() {
+    // A device-bound map with an out-of-bounds index but `inputChannels: null` no longer bypasses
+    // count/index validation: it is corrupt and its bytes are left untouched.
+    let dir = temp_dir("v2-null-layout");
+    let path = dir.join("config.json");
+    let body = r#"{"version":2,"deviceId":"deviceA","selectedInterface":null,"inputChannels":null,"settingsRevision":"1","channelMap":[{"physicalIndex":0,"sourceId":"11111111-1111-4111-8111-111111111111","stereoPair":null,"stereoSide":null,"role":"inputChannel"},{"physicalIndex":99,"sourceId":"22222222-2222-4222-8222-222222222222","stereoPair":null,"stereoSide":null,"role":"inputChannel"}],"labels":[],"sourceDefaults":[{"sourceId":"11111111-1111-4111-8111-111111111111","pan":0.0},{"sourceId":"22222222-2222-4222-8222-222222222222","pan":0.0}]}"#;
+    fs::write(&path, body.as_bytes()).expect("write populated null-layout v2");
+
+    let result = ConfigStore::open(&path);
+    assert!(
+        matches!(result, Err(ConfigError::Corrupt)),
+        "a populated v2 map without a count must be corrupt, got {result:?}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("read back"),
+        body.as_bytes(),
+        "bytes must be unchanged"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unbound_populated_v2_is_corrupt() {
+    // No device, no count, but a populated map: an inconsistent unbound binding.
+    let dir = temp_dir("v2-unbound-populated");
+    let path = dir.join("config.json");
+    let body = r#"{"version":2,"deviceId":null,"selectedInterface":null,"inputChannels":null,"settingsRevision":"1","channelMap":[{"physicalIndex":0,"sourceId":"11111111-1111-4111-8111-111111111111","stereoPair":null,"stereoSide":null,"role":"inputChannel"}],"labels":[],"sourceDefaults":[{"sourceId":"11111111-1111-4111-8111-111111111111","pan":0.0}]}"#;
+    fs::write(&path, body.as_bytes()).expect("write unbound populated v2");
+
+    let result = ConfigStore::open(&path);
+    assert!(
+        matches!(result, Err(ConfigError::Corrupt)),
+        "an unbound populated v2 must be corrupt, got {result:?}"
+    );
+    assert_eq!(fs::read(&path).expect("read back"), body.as_bytes());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn empty_unbound_v2_loads_valid() {
+    // Only the empty unbound base state may omit the layout.
+    let dir = temp_dir("v2-empty");
+    let path = dir.join("config.json");
+    let body = r#"{"version":2,"deviceId":null,"selectedInterface":null,"inputChannels":null,"settingsRevision":"0","channelMap":[],"labels":[],"sourceDefaults":[]}"#;
+    fs::write(&path, body.as_bytes()).expect("write empty unbound v2");
+
+    let store = ConfigStore::open(&path).expect("an empty unbound v2 is valid");
+    assert_eq!(store.revision(), 0);
+    assert_eq!(store.binding(), None);
+    assert!(store.committed().channel_map.is_empty());
+    assert!(store.committed().source_defaults.is_empty());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unbound_candidate_with_a_count_but_no_device_is_rejected() {
+    // A count without a bound device is an inconsistent binding; nothing is written.
+    let dir = temp_dir("none-device-count-some");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    let map = vec![entry(0, 0x11)];
+    let cand = candidate(
+        None,
+        Some(1),
+        map.clone(),
+        vec![SourcePanDefault { source_id: sid(0x11), pan: 0.0 }],
+    );
+    assert!(
+        matches!(store.commit(0, cand), Err(ConfigError::Corrupt)),
+        "a count without a bound device must be rejected"
+    );
+    assert_eq!(store.revision(), 0);
+    assert!(!path.exists(), "no file written on rejection");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------------------------
 // migration
 // ---------------------------------------------------------------------------------------------
@@ -310,6 +391,43 @@ fn v1_unresolved_pair_loads_for_ui_but_cannot_be_committed() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn v1_resolved_map_cannot_commit_directly_before_verification() {
+    // A migrated v1 state is device-bound but has no verified count. Committing it directly (without
+    // `verify_layout`) is rejected and leaves the original bytes/revision unchanged; verification
+    // then produces a committed layout.
+    let dir = temp_dir("v1-direct");
+    let path = dir.join("config.json");
+    let v1 = Config {
+        version: 1,
+        device_id: Some("dev-A".to_string()),
+        selected_interface: None,
+        channel_map: vec![entry(0, 0x11), entry(1, 0x22)],
+        labels: vec![(sid(0x11), "Kick".to_string())],
+    };
+    fs::write(&path, serde_json::to_vec(&v1).unwrap()).expect("write v1");
+    let original_bytes = fs::read(&path).unwrap();
+
+    let mut store = ConfigStore::open(&path).expect("legacy load");
+    let direct = candidate(
+        Some("dev-A"),
+        None,
+        store.committed().channel_map.clone(),
+        store.committed().source_defaults.clone(),
+    );
+    assert!(
+        matches!(store.commit(0, direct), Err(ConfigError::Corrupt)),
+        "a migrated unverified layout must not commit directly"
+    );
+    assert_eq!(store.revision(), 0);
+    assert_eq!(fs::read(&path).unwrap(), original_bytes, "bytes unchanged");
+
+    store.verify_layout("dev-A", 2, 0).expect("verified layout saves");
+    assert_eq!(store.revision(), 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------------------------
 // binding / commit
 // ---------------------------------------------------------------------------------------------
@@ -400,7 +518,7 @@ fn commit_with_stale_revision_is_rejected_and_memory_unchanged() {
     let path = dir.join("config.json");
     let mut store = ConfigStore::open(&path).unwrap();
     let map = vec![entry(0, 0x11)];
-    let cand = candidate(None, Some(1), map.clone(), centered(&map));
+    let cand = candidate(Some("dev"), Some(1), map.clone(), centered(&map));
     store.commit(0, cand.clone()).expect("first commit");
     assert_eq!(store.revision(), 1);
     let before = store.committed().clone();
@@ -426,17 +544,19 @@ fn failed_commit_retains_committed_revision_and_memory() {
     fs::create_dir_all(&conf).unwrap();
     let path = conf.join("config.json");
     let mut store = ConfigStore::open(&path).unwrap();
+    // Establish a valid bound baseline before breaking the directory.
+    store.bind("dev", 1, 0).expect("bind baseline");
 
     // Replace the parent directory with a regular file so the temp-file write cannot succeed.
     fs::remove_dir_all(&conf).unwrap();
     fs::write(&conf, b"not a directory").unwrap();
 
-    let map = vec![entry(0, 0x11)];
-    let cand = candidate(None, Some(1), map.clone(), centered(&map));
-    let error = store.commit(0, cand).expect_err("unwritable path must fail");
+    let map = store.committed().channel_map.clone();
+    let cand = candidate(Some("dev"), Some(1), map.clone(), centered(&map));
+    let error = store.commit(1, cand).expect_err("unwritable path must fail");
     assert!(matches!(error, ConfigError::Io(_)), "expected Io, got {error:?}");
-    assert_eq!(store.revision(), 0, "revision must not advance on a failed save");
-    assert!(store.committed().channel_map.is_empty());
+    assert_eq!(store.revision(), 1, "revision must not advance on a failed save");
+    assert_eq!(store.committed().device_id.as_deref(), Some("dev"));
 
     fs::remove_file(&conf).ok();
     fs::remove_dir_all(&root).ok();
@@ -503,7 +623,7 @@ fn committed_revision_and_settings_revision_stay_in_sync() {
     let mut store = ConfigStore::open(&path).unwrap();
     let map = vec![entry(0, 0x11)];
     store
-        .commit(0, candidate(None, Some(1), map.clone(), centered(&map)))
+        .commit(0, candidate(Some("dev"), Some(1), map.clone(), centered(&map)))
         .unwrap();
     assert_eq!(store.revision(), store.committed().settings_revision.get());
 
@@ -523,7 +643,7 @@ fn revision_overflow_is_rejected_before_any_io() {
     let map = vec![entry(0, 0x11)];
 
     let error = store
-        .commit(u64::MAX, candidate(None, Some(1), map.clone(), centered(&map)))
+        .commit(u64::MAX, candidate(Some("dev"), Some(1), map.clone(), centered(&map)))
         .expect_err("an exhausted counter must reject");
     assert!(matches!(error, ConfigError::RevisionExhausted));
     assert!(!path.exists(), "checked overflow must reject before any write");
@@ -556,7 +676,7 @@ fn pre_install_write_failures_leave_file_memory_and_revision_unchanged() {
         // Establish a committed baseline.
         let base_map = vec![entry(0, 0x11)];
         store
-            .commit(0, candidate(None, Some(1), base_map.clone(), centered(&base_map)))
+            .commit(0, candidate(Some("dev"), Some(1), base_map.clone(), centered(&base_map)))
             .expect("baseline commit");
         let bytes_before = fs::read(&path).unwrap();
         let committed_before = store.committed().clone();
@@ -564,7 +684,7 @@ fn pre_install_write_failures_leave_file_memory_and_revision_unchanged() {
 
         // A candidate that would change the stored defaults.
         let next = candidate(
-            None,
+            Some("dev"),
             Some(1),
             base_map.clone(),
             vec![SourcePanDefault { source_id: sid(0x11), pan: 0.5 }],
@@ -589,7 +709,11 @@ fn pre_install_write_failures_leave_file_memory_and_revision_unchanged() {
 }
 
 #[test]
+#[cfg(unix)]
 fn rename_installed_directory_sync_failure_adopts_candidate_and_reports_uncertain() {
+    // Unix-only: the directory-handle sync stage (`WriteStage::SyncDir`) exists only where directory
+    // handles are available. Windows durability has not been qualified, so this is not asserted
+    // there.
     // The file is installed by the rename, but the parent-directory sync fails. The store must
     // adopt the installed revision (not roll back) and return DurabilityUncertain, with the file
     // bytes holding the new candidate and the revision advanced.
@@ -598,11 +722,11 @@ fn rename_installed_directory_sync_failure_adopts_candidate_and_reports_uncertai
     let mut store = ConfigStore::open(&path).unwrap();
     let base_map = vec![entry(0, 0x11)];
     store
-        .commit(0, candidate(None, Some(1), base_map.clone(), centered(&base_map)))
+        .commit(0, candidate(Some("dev"), Some(1), base_map.clone(), centered(&base_map)))
         .expect("baseline commit");
 
     let next = candidate(
-        None,
+        Some("dev"),
         Some(1),
         base_map.clone(),
         vec![SourcePanDefault { source_id: sid(0x11), pan: 0.75 }],
@@ -690,7 +814,7 @@ fn valid_nonadjacent_higher_index_left_pair_persists_with_matching_default() {
         SourcePanDefault { source_id: sid(0x44), pan: 0.25 },
     ];
     store
-        .commit(0, candidate(None, Some(4), map, defaults))
+        .commit(0, candidate(Some("dev"), Some(4), map, defaults))
         .expect("an explicit non-adjacent pair is valid");
 
     let reopened = ConfigStore::open(&path).unwrap();
@@ -724,10 +848,12 @@ fn invalid_pan_or_metadata_fails_closed() {
     let dir = temp_dir("invalid");
     let path = dir.join("config.json");
 
+    // The store is unbound; each candidate carries a consistent (device, count) binding so the
+    // rejection is exercised by the pan/metadata/validation rule under test, not the binding rule.
     let mut store = ConfigStore::open(&path).unwrap();
     let map = vec![entry(0, 0x11)];
     let nan = candidate(
-        None,
+        Some("dev"),
         Some(1),
         map.clone(),
         vec![SourcePanDefault { source_id: sid(0x11), pan: f32::NAN }],
@@ -735,14 +861,14 @@ fn invalid_pan_or_metadata_fails_closed() {
     assert!(store.commit(0, nan).is_err(), "NaN pan must fail closed");
 
     let out_of_bounds = candidate(
-        None,
+        Some("dev"),
         Some(1),
         map.clone(),
         vec![SourcePanDefault { source_id: sid(0x11), pan: 1.5 }],
     );
     assert!(store.commit(0, out_of_bounds).is_err(), "out-of-bounds pan must fail closed");
 
-    let dup = candidate(None, Some(2), vec![entry(0, 0x11), entry(1, 0x11)], vec![]);
+    let dup = candidate(Some("dev"), Some(2), vec![entry(0, 0x11), entry(1, 0x11)], vec![]);
     assert!(store.commit(0, dup).is_err(), "duplicate source ids must fail closed");
 
     let mut non_reciprocal = vec![entry(0, 0x11), entry(1, 0x22)];
@@ -751,7 +877,7 @@ fn invalid_pan_or_metadata_fails_closed() {
     non_reciprocal[1].stereo_pair = Some(sid(0x11));
     non_reciprocal[1].stereo_side = Some(StereoSide::Left);
     let bad_pair = candidate(
-        None,
+        Some("dev"),
         Some(2),
         non_reciprocal,
         vec![
@@ -761,11 +887,11 @@ fn invalid_pan_or_metadata_fails_closed() {
     );
     assert!(store.commit(0, bad_pair).is_err(), "equal sides must fail closed");
 
-    let incomplete = candidate(None, Some(1), map.clone(), vec![]);
+    let incomplete = candidate(Some("dev"), Some(1), map.clone(), vec![]);
     assert!(store.commit(0, incomplete).is_err(), "an incomplete defaults vector must fail closed");
 
     // Physical index 99 in a 2-channel layout.
-    let bad_index = candidate(None, Some(2), vec![entry(0, 0x11), entry(99, 0x22)], vec![]);
+    let bad_index = candidate(Some("dev"), Some(2), vec![entry(0, 0x11), entry(99, 0x22)], vec![]);
     assert!(store.commit(0, bad_index).is_err(), "an out-of-bounds index must fail closed");
 
     fs::remove_dir_all(&dir).ok();
