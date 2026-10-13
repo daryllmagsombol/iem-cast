@@ -35,6 +35,9 @@ export function AdminRoot({ bridge }: AdminRootProps) {
   );
   const [hostBusy, setHostBusy] = useState(false);
   const [hostError, setHostError] = useState<string | null>(null);
+  // Reported by SourcesView: true while its default/link edits are not yet committed. Starting the
+  // host reads the COMMITTED store, so this only prevents implying unsaved edits will be applied.
+  const [sourceEditsUnsaved, setSourceEditsUnsaved] = useState(false);
   // Backend-discovered defaults are applied once per bridge; a rescan must not clobber edits.
   const defaultsAppliedFor = useRef<HostBridge | null>(null);
   useEffect(() => {
@@ -86,7 +89,7 @@ export function AdminRoot({ bridge }: AdminRootProps) {
   const pathsEntered = certificate.trim() !== '' && key.trim() !== '';
   const hostRunning = host !== null;
   const canStartHost =
-    Boolean(bridge) && device !== null && selectedInterface !== null && pathsEntered && !hostRunning && !hostBusy;
+    Boolean(bridge) && device !== null && selectedInterface !== null && pathsEntered && !hostRunning && !hostBusy && !sourceEditsUnsaved;
 
   async function startHost() {
     if (!bridge || !device || !selectedInterface || !pathsEntered) return;
@@ -269,11 +272,13 @@ export function AdminRoot({ bridge }: AdminRootProps) {
                       ? 'The host is already running.'
                       : !device
                         ? 'Select a capture device first.'
-                        : !selectedInterface
-                          ? 'Select a network interface first.'
-                          : !pathsEntered
-                            ? 'Enter both a certificate path and a key path.'
-                            : undefined
+                        : sourceEditsUnsaved
+                          ? 'Save or reload your source default edits before starting.'
+                          : !selectedInterface
+                            ? 'Select a network interface first.'
+                            : !pathsEntered
+                              ? 'Enter both a certificate path and a key path.'
+                              : undefined
                 }
                 onClick={startHost}
               >
@@ -313,7 +318,12 @@ export function AdminRoot({ bridge }: AdminRootProps) {
             )}
           </section>
           <section id="setup-4" className="iem-panel">
-            <SourcesView bridge={bridge} device={device} hostRunning={hostRunning} />
+            <SourcesView
+              bridge={bridge}
+              device={device}
+              hostRunning={hostRunning}
+              onUnsavedChange={setSourceEditsUnsaved}
+            />
           </section>
           <section id="setup-5" className="iem-panel">
             <PairingView bridge={bridge} hostRunning={hostRunning} />

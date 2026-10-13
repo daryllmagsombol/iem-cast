@@ -18,6 +18,13 @@ export interface SourcesViewProps {
    * component never infers whether the host is running: it only trusts the prop.
    */
   hostRunning?: boolean;
+  /**
+   * Reports whether this panel currently holds edits that are not yet committed: a draft that
+   * differs from the committed defaults, or an uncertain/conflict/failed/consent-pending state.
+   * The parent uses it to avoid implying unsaved edits are applied (e.g. disabling Start). Purely
+   * additive: the component works unchanged when the prop is absent.
+   */
+  onUnsavedChange?(hasUnsaved: boolean): void;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed' | 'uncertain' | 'conflict';
@@ -27,12 +34,13 @@ type PendingConsent = { kind: 'defaults' } | { kind: 'links'; pairs: SourceLinkP
 
 interface DefaultEntry {
   key: string;
-  kind: 'mono' | 'pair';
+  /** `unresolved` = stereo-pair metadata that is present but not a valid reciprocal pair. */
+  kind: 'mono' | 'pair' | 'unresolved';
   sourceIds: string[];
   labels: string[];
   /** Committed catalog default for this entry, normalized `[-1, 1]`. */
   committed: number;
-  /** Unpaired `masterLr` keeps its parity split and exposes no default pan control. */
+  /** `true` for an unpaired `masterLr` (parity split) or an unresolved pair member. */
   disabled: boolean;
 }
 
@@ -63,6 +71,19 @@ function buildEntries(sources: SourceInfo[]): DefaultEntry[] {
         // Both members carry the same committed pan; the left member is the canonical source.
         committed: left.defaultPan,
         disabled: false,
+      });
+    } else if (source.stereoPair !== null) {
+      // Pair metadata is present but unresolved (dangling peer, one-sided link, or no explicit
+      // side). The host treats it as an unresolved link, so an editable mono "Default pan" here
+      // would imply a save the host may reject: keep it truthful and non-editable instead.
+      used.add(source.sourceId);
+      entries.push({
+        key: `unresolved:${source.sourceId}`,
+        kind: 'unresolved',
+        sourceIds: [source.sourceId],
+        labels: [source.label],
+        committed: source.defaultPan,
+        disabled: true,
       });
     } else {
       used.add(source.sourceId);
@@ -154,7 +175,7 @@ function currentPairs(entries: DefaultEntry[]): SourceLinkPair[] {
 // The catalog is read-only in this build: it mirrors the SELECTED device's real channels, derived
 // by the host exactly as it does for phones. Nothing here is fabricated. The defaults section
 // below is the only mutation surface, and it only writes saved defaults for NEW personal mixes.
-export function SourcesView({ bridge, device, hostRunning = false }: SourcesViewProps) {
+export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChange }: SourcesViewProps) {
   const [sources, setSources] = useState<SourceInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const deviceId = device?.deviceId ?? null;
@@ -192,6 +213,26 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
   const entries = useMemo(() => buildEntries(settings?.catalog.sources ?? []), [settings]);
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
+
+  const onUnsavedChangeRef = useRef(onUnsavedChange);
+  onUnsavedChangeRef.current = onUnsavedChange;
+
+  // "Unsaved" means an intent the host has not committed: a draft that differs from the committed
+  // value, or any state that still needs a save/reload (uncertain, conflict, failed, consent).
+  const hasUnsaved = useMemo(() => {
+    if (settings === null) return false;
+    const dirty = dirtyKeys(entries, drafts, settings).length > 0;
+    const defaultsBlocked = Object.values(status).some(
+      value => value === 'uncertain' || value === 'conflict' || value === 'failed',
+    );
+    const linkBlocked =
+      linkStatus === 'uncertain' || linkStatus === 'conflict' || linkStatus === 'failed';
+    return dirty || defaultsBlocked || linkBlocked || consentPending !== null;
+  }, [settings, entries, drafts, status, linkStatus, consentPending]);
+
+  useEffect(() => {
+    onUnsavedChangeRef.current?.(hasUnsaved);
+  }, [hasUnsaved]);
 
   useEffect(() => {
     if (!bridge || deviceId === null) {
@@ -280,7 +321,11 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
     const current = settingsRef.current;
     if (!activeBridge || !current) return;
     const pending = dirtyKeys(entriesRef.current, draftsRef.current, current);
-    if (pending.length === 0) return;
+    if (pending.length === 0) {
+      // Nothing to commit: never leave a stale replacement consent armed.
+      replaceConfirmedRef.current = false;
+      return;
+    }
     if (current.bindingStatus === 'replacement' && !replaceConfirmedRef.current) {
       setConsentPending({ kind: 'defaults' });
       return;
@@ -355,6 +400,8 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       const fallback = errorMessage(error, 'Could not save the defaults.');
       if (code === 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN') {
         markDefaults(pending, 'uncertain', 'Installed, but restart durability was not confirmed. Reload before retrying.');
+      } else if (code === 'SOURCE_SETTINGS_HOST_RUNNING') {
+        markDefaults(pending, 'failed', 'Stop the host before replacing source settings.');
       } else if (RELOAD_CODES.has(code ?? '')) {
         markDefaults(pending, 'conflict', fallback);
       } else {
@@ -424,12 +471,13 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
 
   function confirmConsent() {
     const pending = consentPending;
-    replaceConfirmedRef.current = true;
     setConsentPending(null);
     if (pending?.kind === 'links') {
+      replaceConfirmedRef.current = true;
       void runLinkSave(pending.pairs, true);
       return;
     }
+    replaceConfirmedRef.current = true;
     void flush();
   }
 
@@ -456,7 +504,15 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
   async function runLinkSave(pairs: SourceLinkPair[], confirmed: boolean) {
     const activeBridge = bridgeRef.current;
     const current = settingsRef.current;
-    if (!activeBridge || !current || hostRunning) return;
+    if (!activeBridge || !current || hostRunning) {
+      // Any abort must drop an armed replacement consent, or a later link edit would silently
+      // reuse it. Surface the real reason instead of a silent no-op.
+      if (replaceConfirmedRef.current) {
+        replaceConfirmedRef.current = false;
+        setLinkMessage('Stop the host before replacing source settings.');
+      }
+      return;
+    }
     if (current.bindingStatus === 'replacement' && !confirmed) {
       // Reuse the same explicit consent step for link saves; the intended mutation is preserved.
       linkIntentRef.current = pairs;
@@ -512,6 +568,9 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
         setLinkStatus('uncertain');
         setLinkReloadNeeded(true);
         setLinkMessage('Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.');
+      } else if (code === 'SOURCE_SETTINGS_HOST_RUNNING') {
+        setLinkStatus('idle');
+        setLinkMessage('Stop the host before replacing source settings.');
       } else if (RELOAD_CODES.has(code ?? '')) {
         setLinkStatus('conflict');
         setLinkReloadNeeded(true);
@@ -685,12 +744,18 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
                       <div className="iem-row">
                         <span className="text-label">{entry.labels.join(' + ')}</span>
                         <span className="text-caption text-text-secondary">
-                          {entry.kind === 'pair' ? 'Stereo pair' : 'Mono source'}
+                          {entry.kind === 'pair'
+                            ? 'Stereo pair'
+                            : entry.kind === 'unresolved'
+                              ? 'Unresolved link'
+                              : 'Mono source'}
                         </span>
                       </div>
                       {entry.disabled ? (
                         <p className="text-caption text-text-secondary">
-                          This master output keeps its fixed stereo split and has no default pan.
+                          {entry.kind === 'unresolved'
+                            ? 'This channel has incomplete stereo-link metadata. Resolve or unlink the pair before setting a default pan.'
+                            : 'This master output keeps its fixed stereo split and has no default pan.'}
                         </p>
                       ) : (
                         <PanControl

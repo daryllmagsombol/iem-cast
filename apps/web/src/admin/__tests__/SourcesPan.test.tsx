@@ -2,9 +2,11 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import { SourcesView } from '../SourcesView';
+import { AdminRoot } from '../AdminRoot';
 import type {
   CounterString,
   DeviceInfo,
+  InterfaceInfo,
   SourceInfo,
   SourceLinkPair,
   SourcePanDefault,
@@ -383,4 +385,78 @@ test('switching device mid-flight discards the previous device save response', a
 
   expect(screen.getByRole('slider', { name: /Device B input default pan/ })).toHaveValue('25');
   expect(screen.queryByText('Saved')).not.toBeInTheDocument();
+});
+
+test('a link confirm that aborts because the host started clears consent and re-confirms later', async () => {
+  const replacement = makeSettings('dev-a', '1', [sourceA, sourceB], { bindingStatus: 'replacement' });
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': replacement });
+  const { rerender } = render(<SourcesView bridge={bridge} device={deviceA} />);
+
+  fireEvent.change(await screen.findByLabelText('Left source'), { target: { value: 'src-a' } });
+  fireEvent.change(screen.getByLabelText('Right source'), { target: { value: 'src-b' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+  expect(await screen.findByText('Replace the saved profile?')).toBeInTheDocument();
+
+  // The host starts between the banner and the confirm; the click must abort truthfully.
+  rerender(<SourcesView bridge={bridge} device={deviceA} hostRunning />);
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm save' }));
+  expect(await screen.findByText('Stop the host before replacing source settings.')).toBeInTheDocument();
+  expect(bridge.saveSourceLinks).not.toHaveBeenCalled();
+
+  // A later link edit must re-confirm rather than silently reuse the abandoned consent.
+  rerender(<SourcesView bridge={bridge} device={deviceA} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+  expect(await screen.findByText('Replace the saved profile?')).toBeInTheDocument();
+  expect(bridge.saveSourceLinks).not.toHaveBeenCalled();
+});
+
+test('a channel with unresolved pair metadata is not offered an editable mono default pan', async () => {
+  const dangling: SourceInfo = { ...mono('src-x', 0, 'Dangling channel'), stereoPair: 'missing-peer', stereoSide: 'left' };
+  const bridge = bridgeWith({ 'dev-a': [dangling] }, { 'dev-a': makeSettings('dev-a', '1', [dangling]) });
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+
+  expect(await screen.findByText(/incomplete stereo-link metadata/i)).toBeInTheDocument();
+  expect(screen.queryByRole('slider', { name: /Dangling channel default pan/ })).not.toBeInTheDocument();
+});
+
+test('AdminRoot disables Start host while an unsaved source default draft exists', async () => {
+  const iface: InterfaceInfo = { name: 'Ethernet', ipAddress: '192.168.1.10', prefix: 24 };
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': makeSettings('dev-a', '7', [sourceA, sourceB]) });
+  bridge.listDevices = vi.fn(async () => [deviceA]);
+  bridge.listInterfaces = vi.fn(async () => [iface]);
+  bridge.hostDefaults = vi.fn(async () => ({
+    interfaceName: null,
+    interfaceIp: null,
+    certificatePath: null,
+    keyPath: null,
+  }));
+  const pending = deferred<SourceSettings>();
+  (bridge.saveSourceDefaults as ReturnType<typeof vi.fn>).mockReturnValueOnce(pending.promise);
+
+  render(<AdminRoot bridge={bridge} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Select device' }));
+  fireEvent.change(screen.getByLabelText('Host network interface'), { target: { value: '192.168.1.10' } });
+  fireEvent.change(screen.getByLabelText('Certificate path'), { target: { value: '/cert.pem' } });
+  fireEvent.change(screen.getByLabelText('Key path'), { target: { value: '/key.pem' } });
+
+  const start = () => screen.getByRole('button', { name: 'Start host' });
+  await waitFor(() => expect(start()).toBeEnabled());
+
+  // An unsaved draft blocks Start, with a truthful explanation.
+  const slider = await screen.findByRole('slider', { name: /Channel 1 default pan/ });
+  fireEvent.change(slider, { target: { value: '-50' } });
+  await waitFor(() => expect(start()).toBeDisabled());
+  expect(screen.getByText(/Save or reload your source default edits before starting/i)).toBeInTheDocument();
+
+  // Once the edit round-trips to the committed store, Start is available again.
+  const committed = applyDefaults(
+    makeSettings('dev-a', '7', [sourceA, sourceB]),
+    [
+      { sourceId: 'src-a', pan: -0.5 },
+      { sourceId: 'src-b', pan: 0 },
+    ],
+    '8',
+  );
+  pending.resolve(committed);
+  await waitFor(() => expect(start()).toBeEnabled());
 });
