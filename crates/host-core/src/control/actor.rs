@@ -258,8 +258,9 @@ impl ControlActor {
             if !reciprocal {
                 return Err(ControlError::Internal);
             }
-            // Both members must carry the same canonical pan (compare after clamping).
-            if (entry.pan - peer.pan).abs() > f32::EPSILON {
+            // Both members must carry the exact same canonical pan (compare after clamping): one
+            // atomic pair edit has one shared balance value, not a tolerance-window match.
+            if entry.pan != peer.pan {
                 return Err(ControlError::Internal);
             }
         }

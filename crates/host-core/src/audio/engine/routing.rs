@@ -47,15 +47,75 @@ pub struct RoutingPlan {
 
 impl RoutingPlan {
     /// Build a plan from a channel map, truncating anything beyond [`MAX_SOURCES`].
+    ///
+    /// Structural validity is resolved **first**, before any audible route is assigned. Ambiguous
+    /// metadata (duplicate source identities, duplicate physical bindings, orphan sides, one-sided
+    /// or non-reciprocal links, overlapping pair claims, and peers outside the bounded map) marks
+    /// every implicated entry invalid; those entries become [`Route::Silent`]. Only then are the
+    /// remaining, structurally sound entries routed. Unrelated valid sources are preserved.
     pub fn build(channel_map: &[ChannelMapEntry]) -> Self {
         let map: &[ChannelMapEntry] = &channel_map[..channel_map.len().min(MAX_SOURCES)];
-        let mut routes = vec![Route::Silent; map.len()];
-        let mut assigned: Vec<Option<u8>> = vec![None; map.len()];
-        let mut group_anchor: Vec<SourceId> = Vec::with_capacity(map.len());
+        let count = map.len();
+        let mut invalid = vec![false; count];
+
+        // Duplicate source identities: every entry sharing an identity is ambiguous.
+        for i in 0..count {
+            if (0..count).any(|j| j != i && map[j].source_id == map[i].source_id) {
+                invalid[i] = true;
+            }
+        }
+        // Duplicate physical bindings: every entry on the shared index is ambiguous.
+        for i in 0..count {
+            if (0..count).any(|j| j != i && map[j].physical_index == map[i].physical_index) {
+                invalid[i] = true;
+            }
+        }
+
+        // Link integrity. A side without a pair is an orphan and invalid. A link is only valid when
+        // it is a reciprocal pair with matched roles and opposite sides. Any invalid link closes
+        // both endpoints (the peer is looked up within the bounded map; a peer outside it closes the
+        // source). Iterating every link source marks overlapping components correctly: each invalid
+        // link closes both of its endpoints, so a member of two conflicting links is closed by both.
+        for i in 0..count {
+            let entry = &map[i];
+            match entry.stereo_pair {
+                None => {
+                    if entry.stereo_side.is_some() {
+                        invalid[i] = true;
+                    }
+                }
+                Some(peer_id) => {
+                    let peer_index = (0..count).find(|&j| j != i && map[j].source_id == peer_id);
+                    match peer_index {
+                        Some(j) => {
+                            let peer = &map[j];
+                            let valid = peer.stereo_pair == Some(entry.source_id)
+                                && peer.role == entry.role
+                                && entry.stereo_side.is_some()
+                                && peer.stereo_side.is_some()
+                                && entry.stereo_side != peer.stereo_side;
+                            if !valid {
+                                invalid[i] = true;
+                                invalid[j] = true;
+                            }
+                        }
+                        None => invalid[i] = true,
+                    }
+                }
+            }
+        }
+
+        // Assign audible routes only to entries that survived structural validation.
+        let mut routes = vec![Route::Silent; count];
+        let mut assigned: Vec<Option<u8>> = vec![None; count];
+        let mut group_anchor: Vec<SourceId> = Vec::with_capacity(count);
 
         for (index, entry) in map.iter().enumerate() {
-            // An unpaired legacy master keeps the parity split, unchanged, and ignores pan.
-            if entry.role == SourceRole::MasterLr && entry.stereo_pair.is_none() {
+            if invalid[index] {
+                continue;
+            }
+            // An unpaired legacy master keeps the parity split unchanged and ignores pan.
+            if entry.stereo_pair.is_none() && entry.role == SourceRole::MasterLr {
                 routes[index] = if entry.physical_index % 2 == 0 {
                     Route::ParityLeft
                 } else {
@@ -63,15 +123,9 @@ impl RoutingPlan {
                 };
                 continue;
             }
-
             match entry.stereo_pair {
                 None => {
-                    // An unpaired source must carry no side. A side without a pair is inconsistent
-                    // and fails closed rather than being treated as a mono source.
-                    if entry.stereo_side.is_some() {
-                        routes[index] = Route::Silent;
-                        continue;
-                    }
+                    // Unpaired, no side: a mono pan source with its own shared ramp group.
                     let group = group_anchor.len() as u8;
                     group_anchor.push(entry.source_id);
                     assigned[index] = Some(group);
@@ -82,22 +136,10 @@ impl RoutingPlan {
                         routes[index] = side_route(entry.stereo_side, group);
                         continue;
                     }
-                    let Some(peer_index) = map.iter().position(|c| c.source_id == peer_id) else {
-                        routes[index] = Route::Silent;
-                        continue;
-                    };
-                    let peer = &map[peer_index];
-                    let valid = peer_index != index
-                        && peer.stereo_pair == Some(entry.source_id)
-                        && peer.role == entry.role
-                        && entry.stereo_side.is_some()
-                        && peer.stereo_side.is_some()
-                        && entry.stereo_side != peer.stereo_side;
-                    if !valid {
-                        routes[index] = Route::Silent;
-                        continue;
-                    }
-                    // The pair shares exactly one pan/balance ramp group.
+                    // Valid pair (validation above guarantees this): share one pan/balance group.
+                    let peer_index = (0..count)
+                        .find(|&j| j != index && map[j].source_id == peer_id)
+                        .expect("validated pair has an in-map peer");
                     let group = group_anchor.len() as u8;
                     group_anchor.push(entry.source_id);
                     assigned[index] = Some(group);

@@ -10,6 +10,11 @@ pub const PAN_RAMP_FRAMES_PER_FULL_TRAVEL: f32 = 240.0;
 /// [`PAN_RAMP_FRAMES_PER_FULL_TRAVEL`] frames.
 pub const PAN_STEP_PER_FRAME: f32 = 2.0 / PAN_RAMP_FRAMES_PER_FULL_TRAVEL;
 
+/// Narrow endpoint-rounding allowance: a single step landing within this of the target lands exactly
+/// on it. It is a tiny fraction of one step (`f32` epsilon scale) so it can never absorb a whole
+/// extra step — that would let one frame advance `1.5` steps.
+pub const POSITION_SNAP_EPSILON: f64 = PAN_STEP_PER_FRAME as f64 * 1e-6;
+
 /// A linear-in-dB ramp toward a target.
 #[derive(Debug, Clone, Copy)]
 pub struct Ramp {
@@ -57,16 +62,19 @@ impl Ramp {
 ///
 /// Unlike the dB [`Ramp`], this steps by a fixed absolute amount ([`PAN_STEP_PER_FRAME`]) so a full
 /// `-1 -> +1` travel takes exactly [`PAN_RAMP_FRAMES_PER_FULL_TRAVEL`] frames independent of the
-/// starting position.
+/// starting position. The accumulator is kept in `f64` internally (the public API stays `f32`) so a
+/// single frame never moves more than one step; the only rounding allowance is a narrow
+/// endpoint snap ([`POSITION_SNAP_EPSILON`]) that lands on the target rather than a f32 remainder.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionRamp {
-    current: f32,
-    target: f32,
+    current: f64,
+    target: f64,
 }
 
 impl PositionRamp {
     /// A ramp initialized exactly at `position`.
     pub fn new(position: f32) -> Self {
+        let position = position as f64;
         Self {
             current: position,
             target: position,
@@ -75,7 +83,7 @@ impl PositionRamp {
 
     /// Set the destination without jumping.
     pub fn set_target(&mut self, target: f32) {
-        self.target = target;
+        self.target = target as f64;
     }
 
     /// Jump directly to the target (used when identity changes reset state).
@@ -85,7 +93,7 @@ impl PositionRamp {
 
     /// The current position.
     pub fn current(&self) -> f32 {
-        self.current
+        self.current as f32
     }
 
     /// Advance one frame and return the current position.
@@ -95,18 +103,18 @@ impl PositionRamp {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> f32 {
         let delta = self.target - self.current;
-        if delta.abs() <= PAN_STEP_PER_FRAME {
+        if delta.abs() <= PAN_STEP_PER_FRAME as f64 {
             self.current = self.target;
         } else {
-            let stepped = self.current + PAN_STEP_PER_FRAME * delta.signum();
-            // Snap when this step lands within one step of the target so the full-travel frame
-            // count is exact despite f32 accumulation.
-            self.current = if (self.target - stepped).abs() <= PAN_STEP_PER_FRAME {
+            let stepped = self.current + PAN_STEP_PER_FRAME as f64 * delta.signum();
+            // Endpoint rounding only: if this single step lands within the narrow epsilon of the
+            // target, land exactly on it. Never advances a whole extra step.
+            self.current = if (self.target - stepped).abs() <= POSITION_SNAP_EPSILON {
                 self.target
             } else {
                 stepped
             };
         }
-        self.current
+        self.current as f32
     }
 }

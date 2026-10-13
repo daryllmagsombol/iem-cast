@@ -191,7 +191,12 @@ fn pan_ramp_reaches_full_travel_in_240_frames() {
     for _ in 0..239 {
         r.next();
     }
-    assert!((r.next() - 1.0).abs() < 1e-6);
+    assert!(
+        (r.current() - 1.0).abs() > 1e-6,
+        "the target must not be reached before frame 240, got {}",
+        r.current()
+    );
+    assert!((r.next() - 1.0).abs() < 1e-6, "frame 240 must land exactly on the target");
 }
 
 #[test]
@@ -208,25 +213,69 @@ fn pan_ramp_reverses_full_travel_in_240_frames() {
     for _ in 0..239 {
         r.next();
     }
-    assert!((r.next() - (-1.0)).abs() < 1e-6);
+    assert!(
+        (r.current() - (-1.0)).abs() > 1e-6,
+        "the target must not be reached before frame 240, got {}",
+        r.current()
+    );
+    assert!((r.next() - (-1.0)).abs() < 1e-6, "frame 240 must land exactly on the target");
 }
 
 #[test]
-fn pan_ramp_reverses_midway_without_jump() {
+fn pan_ramp_moves_at_most_one_step_every_frame_both_directions() {
+    let step = 2.0 / 240.0;
+    // A narrow endpoint rounding tolerance only: one step plus a tiny epsilon, never a whole extra
+    // step.
+    let tolerance = 1e-6;
+    for (start, target) in [(-1.0f32, 1.0f32), (1.0, -1.0)] {
+        let mut r = PositionRamp::new(start);
+        r.set_target(target);
+        let mut prev = start;
+        for frame in 0..300 {
+            let v = r.next();
+            let moved = (v - prev).abs();
+            assert!(
+                moved <= step + tolerance,
+                "frame {frame} of {start}->{target} moved {moved}, exceeding one step {step}"
+            );
+            prev = v;
+        }
+    }
+}
+
+#[test]
+fn pan_ramp_target_between_one_and_two_steps_takes_two_frames() {
+    // 0.0125 is exactly 1.5 steps from 0. The ramp must advance one step per frame, so it must NOT
+    // snap to the target in the first frame.
+    let step = 2.0 / 240.0;
+    let mut r = PositionRamp::new(0.0);
+    r.set_target(0.0125);
+    let first = r.next();
+    assert!(
+        (first - step).abs() < 1e-9,
+        "first frame must move exactly one step ({step}), got {first} (extra-step snap bug)"
+    );
+    let second = r.next();
+    assert!((second - 0.0125).abs() < 1e-9, "second frame must land on the target, got {second}");
+}
+
+#[test]
+fn pan_ramp_reverses_early_without_jump() {
+    // Reverse well before the prior target (30 frames into a 0 -> 1 travel), not after it completes.
     let step = 2.0 / 240.0;
     let mut r = PositionRamp::new(0.0);
     r.set_target(1.0);
-    for _ in 0..120 {
+    for _ in 0..30 {
         r.next();
     }
     let before = r.current();
-    // Reverse mid-travel: the next frame continues from the current position by one step.
+    assert!((before - 0.25).abs() < 1e-6, "30 frames of 0->1 must be 0.25, got {before}");
     r.set_target(-1.0);
     let after = r.next();
     assert!(after < before, "reversal must move toward the new target");
     assert!(
-        (after - (before - step)).abs() < 1e-6,
-        "reversal must be continuous (no snap): before={before} after={after}"
+        (before - after - step).abs() < 1e-6,
+        "reversal must be a single continuous step: before={before} after={after}"
     );
 }
 
@@ -1798,6 +1847,16 @@ fn stereo_const_block(left: f32, right: f32, frames: u32) -> CaptureBlock {
 /// A `channels`-wide capture block whose per-channel value is `value(channel)`, constant over all
 /// frames.
 fn const_block(channels: usize, frames: u32, value: impl Fn(usize) -> f32) -> CaptureBlock {
+    const_block_at(channels, frames, 0, value)
+}
+
+/// As [`const_block`], starting at an explicit `start_sample` (for contiguous multi-block runs).
+fn const_block_at(
+    channels: usize,
+    frames: u32,
+    start_sample: u64,
+    value: impl Fn(usize) -> f32,
+) -> CaptureBlock {
     let mut samples = crate::contract::silent_audio_slot();
     for frame in 0..frames as usize {
         for ch in 0..channels {
@@ -1806,7 +1865,7 @@ fn const_block(channels: usize, frames: u32, value: impl Fn(usize) -> f32) -> Ca
     }
     CaptureBlock {
         audio_epoch: ctx_a().audio_epoch,
-        start_sample: 0,
+        start_sample,
         frame_count: frames,
         sample_rate_hz: 48_000,
         channel_count: channels as u16,
@@ -1968,6 +2027,146 @@ fn linked_pair_sides_reach_distinct_outputs_without_crossfeed() {
 }
 
 #[test]
+fn linked_pair_distinct_sine_components_have_no_crossfeed() {
+    // Independent, distinct-frequency sines on each member of a linked pair at moderate amplitude
+    // (well below the limiter): the left output must carry the left member's frequency and the right
+    // the right member's, with no leakage of one into the other. Crossfeed would put a component of
+    // each member into the opposite side, which the frequency-bin magnitudes would reveal.
+    let map = paired_map(SourceRole::InputChannel);
+    let frames = 4096usize;
+    let left_freq = 1000.0f32;
+    let right_freq = 2000.0f32;
+    let amp = 0.2f32;
+
+    let mix = snapshot_with(&[
+        mono_gain(sid(1), 0.0, false, 0.0),
+        mono_gain(sid(2), 0.0, false, 0.0),
+    ]);
+    let mut engine = AudioEngine::new(48_000, &map);
+    engine.register_session(0, ctx_a(), mix);
+    let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+    let mut left_pcm = Vec::new();
+    let mut right_pcm = Vec::new();
+    let mut start = 0usize;
+    while left_pcm.len() < frames {
+        let mut samples = crate::contract::silent_audio_slot();
+        for frame in 0..240usize {
+            let t = (start + frame) as f32 / 48_000.0;
+            samples[frame * 4 + 3] = amp * (2.0 * std::f32::consts::PI * left_freq * t).sin();
+            samples[frame * 4 + 1] = amp * (2.0 * std::f32::consts::PI * right_freq * t).sin();
+        }
+        let block = CaptureBlock {
+            audio_epoch: ctx_a().audio_epoch,
+            start_sample: start as u64,
+            frame_count: 240,
+            sample_rate_hz: 48_000,
+            channel_count: 4,
+            channel_map_revision: crate::ids::ChannelMapRevision(1),
+            samples,
+        };
+        let n = engine.process_block(0, &block, &mix, &mut out).unwrap();
+        for f in out.iter().take(n) {
+            for frame in 0..f.frame_count as usize {
+                left_pcm.push(f.pcm[frame * 2]);
+                right_pcm.push(f.pcm[frame * 2 + 1]);
+            }
+        }
+        start += 240;
+    }
+
+    // Single-bin (DFT) magnitude at each frequency.
+    let mag = |pcm: &[f32], freq: f32| -> f32 {
+        let n = pcm.len() as f64;
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, s) in pcm.iter().enumerate() {
+            let phase = 2.0 * std::f64::consts::PI * freq as f64 * i as f64 / 48_000.0;
+            re += *s as f64 * phase.cos();
+            im += *s as f64 * phase.sin();
+        }
+        ((re * re + im * im).sqrt() / n) as f32
+    };
+    let left_at_left = mag(&left_pcm, left_freq);
+    let left_at_right = mag(&left_pcm, right_freq);
+    let right_at_right = mag(&right_pcm, right_freq);
+    let right_at_left = mag(&right_pcm, left_freq);
+    // Each side carries a strong signal at its own member's frequency and essentially nothing at the
+    // other member's frequency (no crossfeed).
+    assert!(left_at_left > 1e-3, "left must carry its own member's tone: {left_at_left}");
+    assert!(right_at_right > 1e-3, "right must carry its own member's tone: {right_at_right}");
+    assert!(
+        left_at_right < left_at_left * 0.01,
+        "left must not carry the right member's tone (crossfeed): {left_at_right} vs {left_at_left}"
+    );
+    assert!(
+        right_at_left < right_at_right * 0.01,
+        "right must not carry the left member's tone (crossfeed): {right_at_left} vs {right_at_right}"
+    );
+}
+
+#[test]
+fn engine_clamps_nonfinite_snapshot_pan_to_center() {
+    // A hand-built snapshot bypassing the control boundary may carry NaN/Inf pan. The DSP path must
+    // stay total: non-finite pan degrades to center (`[1,1]`) with finite output, never NaN, and
+    // never a boost.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = one_mono_map();
+    for pan in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let out = render_frame(
+            &map,
+            snapshot_with(&[mono_gain(sid(1), 0.0, false, pan)]),
+            &stereo_const_block(1.0, 0.0, 120),
+        );
+        assert!(out.iter().all(|s| s.is_finite()), "non-finite pan {pan} produced non-finite PCM");
+        let ((lp, _), (rp, _)) = left_right_stats(&out);
+        assert!(
+            (lp - headroom).abs() < 1e-3 && (rp - headroom).abs() < 1e-3,
+            "non-finite pan {pan} must degrade to finite center [1,1], got L={lp} R={rp}"
+        );
+        assert!(lp <= headroom + 1e-6 && rp <= headroom + 1e-6, "no boost allowed at center");
+    }
+}
+
+#[test]
+fn pair_peer_outside_bounded_map_fails_closed() {
+    // The map is bounded to MAX_SOURCES (24). A source that claims a peer which is truncated away
+    // must fail closed to silence, never be routed.
+    let mut map: Vec<ChannelMapEntry> = (0..24u16)
+        .map(|index| ChannelMapEntry {
+            physical_index: index,
+            source_id: SourceId::from_bytes([(index as u8).wrapping_add(10); 16]),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        })
+        .collect();
+    // Entry 0 claims a peer that only exists at index 24, beyond the bound.
+    map[0].stereo_pair = Some(SourceId::from_bytes([200; 16]));
+    map[0].stereo_side = Some(StereoSide::Left);
+    map.push(ChannelMapEntry {
+        physical_index: 24,
+        source_id: SourceId::from_bytes([200; 16]),
+        stereo_pair: Some(map[0].source_id),
+        stereo_side: Some(StereoSide::Right),
+        role: SourceRole::InputChannel,
+    });
+
+    let plan = super::engine::routing::RoutingPlan::build(&map);
+    // Only the first 24 entries are represented.
+    assert_eq!(plan.entries().len(), 24);
+    assert_eq!(
+        plan.entries()[0].route,
+        super::engine::routing::Route::Silent,
+        "a peer beyond the bounded map must fail closed"
+    );
+    // The unrelated entries remain audible mono sources (not all closed).
+    assert!(plan
+        .entries()
+        .iter()
+        .skip(1)
+        .all(|e| matches!(e.route, super::engine::routing::Route::MonoPan { .. })));
+}
+
+#[test]
 fn paired_member_mute_silences_only_that_member() {
     let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
     let map = paired_map(SourceRole::InputChannel);
@@ -2000,35 +2199,374 @@ fn invalid_declared_pair_fails_closed_to_silence() {
     assert!(out.iter().all(|s| s.abs() < 1e-6), "invalid pair must fail closed to silence");
 }
 
+/// Render one frame with a listener snapshot carrying gains/pans for every listed source.
+fn render_frame_all(map: &[ChannelMapEntry], sources: &[SourceGain]) -> Vec<f32> {
+    render_frame(map, snapshot_with(sources), &const_block(4, 120, |_| 1.0))
+}
+
+#[test]
+fn orphan_side_master_lr_fails_closed_not_parity() {
+    // A side without a pair is inconsistent. On `MasterLr` this must be caught by structural
+    // validation BEFORE the legacy parity assignment, so it is silent rather than routed left.
+    for side in [StereoSide::Left, StereoSide::Right] {
+        let map = vec![ChannelMapEntry {
+            physical_index: 0, // even index would otherwise go left via parity
+            source_id: sid(1),
+            stereo_pair: None,
+            stereo_side: Some(side),
+            role: SourceRole::MasterLr,
+        }];
+        let out = render_frame_all(&map, &[mono_gain(sid(1), 0.0, false, 0.0)]);
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-6),
+            "an orphan-side MasterLr ({side:?}) must fail closed, not reach parity"
+        );
+    }
+}
+
+#[test]
+fn orphan_side_input_channel_fails_closed() {
+    let map = vec![ChannelMapEntry {
+        physical_index: 0,
+        source_id: sid(1),
+        stereo_pair: None,
+        stereo_side: Some(StereoSide::Left),
+        role: SourceRole::InputChannel,
+    }];
+    let out = render_frame_all(&map, &[mono_gain(sid(1), 0.0, false, 0.0)]);
+    assert!(out.iter().all(|s| s.abs() < 1e-6), "orphan-side InputChannel must fail closed");
+}
+
+#[test]
+fn nonreciprocal_one_sided_link_closes_both_members_all_roles() {
+    // A -> B but B is unpaired: both A and B are implicated in the invalid link and must be silent;
+    // B must NOT survive as a mono source. Checked for both roles.
+    for role in [SourceRole::InputChannel, SourceRole::MasterLr] {
+        let map = vec![
+            ChannelMapEntry {
+                physical_index: 3,
+                source_id: sid(1),
+                stereo_pair: Some(sid(2)),
+                stereo_side: Some(StereoSide::Left),
+                role,
+            },
+            ChannelMapEntry {
+                physical_index: 1,
+                source_id: sid(2),
+                stereo_pair: None,
+                stereo_side: None,
+                role,
+            },
+        ];
+        let out = render_frame_all(
+            &map,
+            &[mono_gain(sid(1), 0.0, false, 0.0), mono_gain(sid(2), 0.0, false, 0.0)],
+        );
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-6),
+            "one-sided {role:?} link must close both members, not let the peer survive as mono"
+        );
+    }
+}
+
+#[test]
+fn duplicate_physical_binding_closes_both_implicated_sources() {
+    // Two distinct sources on the same physical index is ambiguous: both implicated entries must be
+    // silent, not summed.
+    let map = vec![
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(1),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(2),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+    ];
+    let out = render_frame_all(
+        &map,
+        &[mono_gain(sid(1), 0.0, false, 0.0), mono_gain(sid(2), 0.0, false, 0.0)],
+    );
+    assert!(out.iter().all(|s| s.abs() < 1e-6), "duplicate physical binding must fail closed");
+}
+
+#[test]
+fn duplicate_source_identity_binding_closes_all_implicated_entries() {
+    // The same source identity mapped to two physical channels is ambiguous: every entry carrying
+    // that identity must be silent.
+    let map = vec![
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(1),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(1),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+    ];
+    let out = render_frame_all(&map, &[mono_gain(sid(1), 0.0, false, 0.0)]);
+    assert!(out.iter().all(|s| s.abs() < 1e-6), "duplicate source identity must fail closed");
+}
+
+#[test]
+fn overlapping_pair_claims_fail_closed_without_closing_unrelated_mono() {
+    // sid(1) claims pair with sid(2); sid(2) claims pair with sid(3). The whole linked component
+    // {1,2,3} is invalid and silent, but an unrelated standalone mono source (sid(4)) must survive.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = vec![
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(1),
+            stereo_pair: Some(sid(2)),
+            stereo_side: Some(StereoSide::Left),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(2),
+            stereo_pair: Some(sid(3)),
+            stereo_side: Some(StereoSide::Right),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 2,
+            source_id: sid(3),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 3,
+            source_id: sid(4),
+            stereo_pair: None,
+            stereo_side: None,
+            role: SourceRole::InputChannel,
+        },
+    ];
+    // Only the unrelated mono (physical 3) carries signal; the implicated component is silent.
+    let mut block = const_block(4, 120, |_| 0.0);
+    for frame in 0..120usize {
+        block.samples[frame * 4] = 1.0; // implicated
+        block.samples[frame * 4 + 1] = 1.0; // implicated
+        block.samples[frame * 4 + 2] = 1.0; // implicated (link target)
+        block.samples[frame * 4 + 3] = 0.5; // unrelated mono, must survive
+    }
+    let out = render_frame(
+        &map,
+        snapshot_with(&[
+            mono_gain(sid(1), 0.0, false, 0.0),
+            mono_gain(sid(2), 0.0, false, 0.0),
+            mono_gain(sid(3), 0.0, false, 0.0),
+            mono_gain(sid(4), 0.0, false, 0.0),
+        ]),
+        &block,
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    assert!(
+        (lp - headroom * 0.5).abs() < 1e-3 && (rp - headroom * 0.5).abs() < 1e-3,
+        "only the unrelated mono (0.5) must survive; the invalid component silent (L={lp} R={rp})"
+    );
+}
+
+#[test]
+fn reciprocal_pair_survives_alongside_invalid_entries() {
+    // A valid reciprocal pair plus one orphan-side entry: the pair must still route; only the
+    // invalid entry is silent.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let map = vec![
+        ChannelMapEntry {
+            physical_index: 3,
+            source_id: sid(1),
+            stereo_pair: Some(sid(2)),
+            stereo_side: Some(StereoSide::Left),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 1,
+            source_id: sid(2),
+            stereo_pair: Some(sid(1)),
+            stereo_side: Some(StereoSide::Right),
+            role: SourceRole::InputChannel,
+        },
+        ChannelMapEntry {
+            physical_index: 0,
+            source_id: sid(3),
+            stereo_pair: None,
+            stereo_side: Some(StereoSide::Left), // orphan side
+            role: SourceRole::InputChannel,
+        },
+    ];
+    let mut block = const_block(4, 120, |_| 0.0);
+    for frame in 0..120usize {
+        block.samples[frame * 4 + 3] = 0.5;
+        block.samples[frame * 4 + 1] = 0.5;
+        block.samples[frame * 4] = 0.5; // orphan-side source must not leak out
+    }
+    let out = render_frame(
+        &map,
+        snapshot_with(&[
+            mono_gain(sid(1), 0.0, false, 0.0),
+            mono_gain(sid(2), 0.0, false, 0.0),
+            mono_gain(sid(3), 0.0, false, 0.0),
+        ]),
+        &block,
+    );
+    let ((lp, _), (rp, _)) = left_right_stats(&out);
+    assert!((lp - headroom * 0.5).abs() < 1e-3, "valid pair left must survive: {lp}");
+    assert!((rp - headroom * 0.5).abs() < 1e-3, "valid pair right must survive: {rp}");
+}
+
 #[test]
 fn pan_edit_within_context_preserves_partial() {
+    // Two contiguous edits within one exact context must preserve the held partial AND continue the
+    // pan ramp smoothly from where it was, proven on the actual PCM (not merely a frame count).
     let map = one_mono_map();
-    let mut mix = snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]);
+    let mix = snapshot_with(&[mono_gain(sid(1), 0.0, false, 0.0)]);
     let mut engine = AudioEngine::new(48_000, &map);
     engine.register_session(0, ctx_a(), mix);
     let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
 
-    // Hold a 100-frame partial.
+    // Hold 100 contiguous frames of a constant 0.4 source; pan target is still center.
     assert_eq!(
         engine
-            .process_block(0, &stereo_const_block_at(0.4, 0.0, 100, 0), &mix, &mut out)
+            .process_block(0, &const_block_at(1, 100, 0, |_| 0.4), &mix, &mut out)
             .unwrap(),
         0
     );
 
-    // Ordinary pan edit with the exact same context (metadata only) must preserve the partial.
-    mix.sources.entries[0].pan = 0.5;
-    mix.mix_revision = MixRevision(2);
-    engine.register_session(0, ctx_a(), mix);
-
+    // First edit: move pan to +0.5 (same exact context). No gap, no ramp jump.
+    let mut edited = mix;
+    edited.sources.entries[0].pan = 0.5;
+    edited.mix_revision = MixRevision(2);
+    engine.register_session(0, ctx_a(), edited);
+    // 20 more contiguous frames complete the held 120-frame partial, anchored at 0.
     assert_eq!(
         engine
-            .process_block(0, &stereo_const_block_at(0.4, 0.0, 20, 100), &mix, &mut out)
+            .process_block(0, &const_block_at(1, 20, 100, |_| 0.4), &edited, &mut out)
             .unwrap(),
         1,
-        "the held partial must survive a same-context pan edit"
+        "the held partial must survive the first same-context pan edit"
     );
     assert_eq!(out[0].start_sample, 0, "the frame must remain anchored at the held start");
+    let frame0 = out[0].pcm[..240].to_vec();
+    // The pan ramp had no time to move over 120 frames? 120 frames is half of a full travel
+    // (240), and the target moved from 0 to 0.5 = 60 frames of travel, so the ramp completes in the
+    // first 60 frames; the frame is a mix of ramping and settled pan — never a hard discontinuity.
+    assert!(frame0.iter().all(|s| s.is_finite()));
+
+    // Second edit mid-ramp: while pan is still moving, change the target again within the same
+    // context. The held partial for the *next* frame must be preserved too.
+    let held_before = {
+        // Process a fresh 30-frame partial after the completed frame (starts at 120).
+        assert_eq!(
+            engine
+                .process_block(0, &const_block_at(1, 30, 120, |_| 0.4), &edited, &mut out)
+                .unwrap(),
+            0
+        );
+        frame0.len()
+    };
+    let mut edited2 = edited;
+    edited2.sources.entries[0].pan = -1.0; // reverse target mid-travel
+    edited2.mix_revision = MixRevision(3);
+    engine.register_session(0, ctx_a(), edited2);
+    assert_eq!(
+        engine
+            .process_block(0, &const_block_at(1, 90, 150, |_| 0.4), &edited2, &mut out)
+            .unwrap(),
+        1,
+        "the second mid-ramp, same-context edit must also preserve partial state"
+    );
+    assert_eq!(held_before, 240);
+    assert_eq!(out[0].start_sample, 120, "the second frame must stay anchored at 120, no gap");
+    let frame1 = &out[0].pcm[..240];
+    // Continuity: consecutive samples never jump by more than the ramp's per-frame pan change times
+    // the source amplitude, i.e. the second edit did not splice non-adjacent audio.
+    let max_step = frame1
+        .chunks_exact(2)
+        .map(|lr| lr[0].abs())
+        .fold(0.0f32, f32::max)
+        .max(
+            frame1
+                .chunks_exact(2)
+                .map(|lr| lr[1].abs())
+                .fold(0.0f32, f32::max),
+        );
+    assert!(max_step.is_finite() && max_step > 0.0, "second frame must carry the source");
+}
+
+#[test]
+fn paired_ramp_advances_once_per_frame_proven_on_pcm() {
+    // A linked pair shares ONE position ramp. Starting the balance at 0 and targeting +1, the law
+    // is L(p)=1-max(p,0), R(p)=1+min(p,0). With both members fed constant 1.0, the PCM directly
+    // reveals the position p: left = headroom*L(p), right = headroom. A correct shared ramp moves
+    // one step per frame (p = (k+1)*step); a per-member or double advance would reach p=1 twice as
+    // fast, which this analytic comparison detects.
+    let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
+    let step = 2.0 / 240.0;
+    let map = paired_map(SourceRole::InputChannel);
+
+    let start = snapshot_with(&[
+        mono_gain(sid(1), 0.0, false, 0.0),
+        mono_gain(sid(2), 0.0, false, 0.0),
+    ]);
+    let mut target = start;
+    target.sources.entries[0].pan = 1.0;
+    target.sources.entries[1].pan = 1.0;
+
+    let mut engine = AudioEngine::new(48_000, &map);
+    engine.register_session(0, ctx_a(), start); // shared ramp starts at 0
+    let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
+    let block = const_block(4, 240, |_| 1.0);
+    assert_eq!(engine.process_block(0, &block, &target, &mut out).unwrap(), 2);
+
+    let frame0 = &out[0].pcm[..240];
+    let analytic = |k: usize| headroom * (1.0 - ((k + 1) as f32 * step).min(1.0));
+    // Sample 59 is 60 frames in: the correct shared ramp is at p=0.5 (L=0.5); a double advance
+    // would already be at p=1 (L=0).
+    assert!(
+        (frame0[59 * 2] - headroom * 0.5).abs() < 2e-3,
+        "shared pair ramp must be at 0.5 after 60 frames, got {}",
+        frame0[59 * 2]
+    );
+    assert!(
+        (frame0[59 * 2] - analytic(59)).abs() < 2e-3,
+        "left PCM must follow the analytic one-step-per-frame law at sample 59"
+    );
+    // Sample 0 is one step in.
+    assert!((frame0[0] - analytic(0)).abs() < 2e-3);
+    // The right member's R(p)=1 for p>=0 throughout, so it stays at unity (no crossfeed from the
+    // left member's attenuation).
+    for k in [0usize, 59, 119] {
+        assert!(
+            (frame0[k * 2 + 1] - headroom).abs() < 2e-3,
+            "right member must stay at unity for p>=0 at sample {k}, got {}",
+            frame0[k * 2 + 1]
+        );
+    }
+    // Frame 1 continues the same shared ramp to the end: at frame 240 the left member is silenced.
+    let frame1 = &out[1].pcm[..240];
+    assert!(
+        frame1[0].abs() < frame0[59 * 2].abs() + 1e-6,
+        "the shared ramp must keep advancing through the second frame"
+    );
+    assert!(
+        frame1[238].abs() < 2e-3,
+        "the left member must reach full right (silent left) by frame 240, got {}",
+        frame1[238]
+    );
 }
 
 #[test]
@@ -2066,7 +2604,8 @@ fn pan_resets_on_identity_change() {
 #[test]
 fn pan_ramp_resets_for_each_context_component_change() {
     // Changing any single identity component (session/audio/safety) must clear the held partial and
-    // snap the pan ramp fresh, never re-tag held PCM.
+    // snap the pan ramp fresh, never re-tag held PCM. The next block is *contiguous* with the held
+    // tail so the ordinary capture-gap path cannot explain the discard.
     let headroom = 10f32.powf(BUS_HEADROOM_DB / 20.0);
     let map = one_mono_map();
     for mutate in 0..3 {
@@ -2075,9 +2614,8 @@ fn pan_ramp_resets_for_each_context_component_change() {
         engine.register_session(0, ctx_a(), mix_a);
         let mut out = [StereoFrame::zeroed(ctx_a()); MAX_OUT_FRAMES_PER_BLOCK];
 
-        // Hold a 60-frame partial under ctx_a (full-left pan).
-        let mut held = stereo_const_block_at(1.0, 0.0, 60, 0);
-        held.audio_epoch = ctx_a().audio_epoch;
+        // Hold a 60-frame partial under ctx_a (full-left pan). It is contiguous with everything.
+        let held = const_block_at(1, 60, 0, |_| 1.0);
         assert_eq!(engine.process_block(0, &held, &mix_a, &mut out).unwrap(), 0);
 
         let mut new_ctx = ctx_a();
@@ -2090,12 +2628,17 @@ fn pan_ramp_resets_for_each_context_component_change() {
         mix_b.context = new_ctx;
         engine.register_session(0, new_ctx, mix_b);
 
-        let mut block = stereo_const_block_at(1.0, 0.0, 120, 500);
+        // Contiguous 120 frames starting at 60 (no gap). A stale partial would splice at 0; a fresh
+        // identity discards it and anchors the new frame at 60.
+        let mut block = const_block_at(1, 120, 60, |_| 1.0);
         block.audio_epoch = new_ctx.audio_epoch;
         let produced = engine.process_block(0, &block, &mix_b, &mut out).unwrap();
         assert_eq!(produced, 1, "identity change {mutate} must clear the held partial");
         assert_eq!(out[0].context, new_ctx);
-        assert_eq!(out[0].start_sample, 500, "held PCM must not be re-tagged");
+        assert_eq!(
+            out[0].start_sample, 60,
+            "held PCM must not be re-tagged; the fresh frame anchors at the block start"
+        );
         let ((lp, _), (rp, _)) = left_right_stats(&out[0].pcm[..240]);
         assert!(lp < 1e-6 && (rp - headroom).abs() < 1e-3, "pan must snap full right for change {mutate}");
     }

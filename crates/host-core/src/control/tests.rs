@@ -40,10 +40,12 @@ impl Clock for TestClock {
 #[derive(Default)]
 struct RecordingDsp {
     disarms: Mutex<Vec<(SessionEpoch, SafetyGeneration)>>,
+    installs: Mutex<Vec<MixSnapshot>>,
 }
 
 impl DspControl for RecordingDsp {
-    fn install_snapshot(&self, _snapshot: MixSnapshot) -> Result<(), ControlError> {
+    fn install_snapshot(&self, snapshot: MixSnapshot) -> Result<(), ControlError> {
+        self.installs.lock().expect("dsp").push(snapshot);
         Ok(())
     }
 
@@ -545,6 +547,19 @@ fn pair_actor_with(left_avail: bool, right_avail: bool) -> ControlActor {
     )
 }
 
+/// A pair actor plus a handle to its recording DSP, so installs can be counted.
+fn pair_actor_and_dsp(left_avail: bool, right_avail: bool) -> (ControlActor, Arc<RecordingDsp>) {
+    let dsp = Arc::new(RecordingDsp::default());
+    let actor = ControlActor::new(
+        TestClock::new(),
+        dsp.clone(),
+        pair_catalog_with(left_avail, right_avail),
+        HostEpoch::from_bytes([0x11; 16]),
+        audio_epoch(),
+    );
+    (actor, dsp)
+}
+
 fn pair_gain(source_id: SourceId, gain_db: f32, pan: f32) -> SourceGain {
     SourceGain {
         source_id,
@@ -625,6 +640,32 @@ fn linked_pair_pan_equality_compares_canonicalized_values() {
 }
 
 #[test]
+fn linked_pair_pan_equality_is_exact_not_tolerant() {
+    // A differing pair pan smaller than f32::EPSILON must still be rejected: the accepted pair state
+    // must carry one exact canonical value, not a tolerance-window match.
+    let mut a = pair_actor_with(true, true);
+    let patch = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.0),
+        pair_gain(pair_right(), -3.0, f32::EPSILON),
+    ]);
+    assert_eq!(
+        a.apply_patch(sess(), patch),
+        Err(ControlError::Internal),
+        "differing canonical pans (0.0 vs EPSILON) must be rejected exactly"
+    );
+
+    // After out-of-range clamping the two pans are bit-identical (both 1.0) and must be accepted;
+    // gains and mutes stay independent.
+    let mut b = pair_actor_with(true, true);
+    let clamped = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 5.0),
+        pair_gain(pair_right(), -12.0, 2.5),
+    ]);
+    let ack = b.apply_patch(sess(), clamped).expect("clamped pans are exactly equal");
+    assert_eq!(ack.accepted_revision, MixRevision(1));
+}
+
+#[test]
 fn linked_pair_member_absent_is_rejected_half_pair() {
     let mut a = pair_actor_with(true, true);
     // Only the left member is present.
@@ -668,7 +709,7 @@ fn stale_catalog_revision_is_rejected() {
 
 #[test]
 fn rejected_pair_does_not_advance_accepted_revision_or_cache() {
-    let mut a = pair_actor_with(true, true);
+    let (mut a, dsp) = pair_actor_and_dsp(true, true);
     let patch = pair_patch(&[
         pair_gain(pair_left(), -3.0, 0.5),
         pair_gain(pair_right(), -6.0, -0.5),
@@ -681,4 +722,53 @@ fn rejected_pair_does_not_advance_accepted_revision_or_cache() {
     ]);
     let ack = a.apply_patch(sess(), ok).expect("base revision must remain 0 after a rejection");
     assert_eq!(ack.accepted_revision, MixRevision(1));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1, "only the accepted patch installs");
+}
+
+#[test]
+fn rejected_pair_preserves_seeded_accepted_snapshot_revision_and_ack_cache() {
+    // Seed real accepted state and an acknowledgement, then reject an unequal-pan pair, then verify
+    // the accepted snapshot, revision, DSP install count, and idempotent ack are all untouched.
+    let (mut a, dsp) = pair_actor_and_dsp(true, true);
+
+    let seed = pair_patch(&[
+        pair_gain(pair_left(), -3.0, -0.25),
+        pair_gain(pair_right(), -6.0, -0.25),
+    ]);
+    let seed_ack = a.apply_patch(sess(), seed).expect("seed accepted pair");
+    assert_eq!(seed_ack.accepted_revision, MixRevision(1));
+    a.remember_ack(sess(), "req-1", seed_ack);
+
+    let rejected = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.5),
+            pair_gain(pair_right(), -6.0, -0.5),
+        ])
+    };
+    // A rejection may still consume the pre-existing rate-limit bookkeeping token; it must not
+    // change accepted state. Use the same session so bookkeeping is observable across calls.
+    assert_eq!(a.apply_patch(sess(), rejected), Err(ControlError::Internal));
+
+    // Accepted snapshot and revision are unchanged.
+    let accepted = a.accepted_snapshot(sess()).expect("accepted snapshot present");
+    assert_eq!(accepted.mix_revision, MixRevision(1));
+    assert_eq!(accepted.sources.as_slice()[0].pan, -0.25);
+    assert_eq!(accepted.sources.as_slice()[1].pan, -0.25);
+    assert_eq!(accepted.sources.as_slice()[0].gain_db, -3.0);
+    assert_eq!(accepted.sources.as_slice()[1].gain_db, -6.0);
+    // The DSP was only asked to install the seed; the rejection never reached it.
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1, "rejection must not install to the DSP");
+    // The earlier acknowledgement is still cached verbatim, and a retry of the rejected edit using
+    // the same base revision is still a rejection (revision did not advance).
+    assert_eq!(a.cached_ack(sess(), "req-1"), Some(seed_ack));
+    let retry = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.5),
+            pair_gain(pair_right(), -6.0, -0.5),
+        ])
+    };
+    assert_eq!(a.apply_patch(sess(), retry), Err(ControlError::Internal));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1);
 }
