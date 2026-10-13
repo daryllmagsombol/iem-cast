@@ -365,6 +365,15 @@ impl HostSession {
         self.socket.local_addr()
     }
 
+    /// The actual full input-channel count the started capture stream is configured for.
+    ///
+    /// This forwards the real runtime's getter (the count the built stream negotiated), so a
+    /// composition can compare it against the verified binding after capture has actually started
+    /// instead of re-running a preflight probe. There is no preflight echo here.
+    pub fn configured_channels(&self) -> u16 {
+        self.runtime.configured_channels()
+    }
+
     /// Stop capture, stop the media pump, and join cleanly. Idempotent.
     pub fn stop(&mut self) {
         self.stopped.store(true, Ordering::Release);
@@ -445,6 +454,14 @@ impl Drop for HostServerHandle {
     }
 }
 
+/// A provider for the catalog snapshot pushed to a **freshly connected** session.
+///
+/// The composition installs a closure that reads a small committed-projection cache (never the
+/// native/store mutexes) so a defaults-only save changes what a new connection reads without
+/// broadcasting to existing musicians or advancing the running routing catalog revision. The static
+/// actor catalog remains unchanged.
+pub type InitialCatalogProvider = Arc<dyn Fn() -> CatalogSnapshot + Send + Sync>;
+
 /// The composition inputs for [`HostSession::start_server`], so callers do not pass a long
 /// positional argument list.
 pub struct ServerConfig {
@@ -458,6 +475,10 @@ pub struct ServerConfig {
     pub assets: Arc<dyn AssetProvider>,
     /// The versioned source catalog the actor validates patches against.
     pub catalog: CatalogSnapshot,
+    /// Optional per-connection initial-catalog provider. `None` preserves the previous behavior:
+    /// every fresh connection is sent the static `catalog`. When `Some`, a fresh connection is sent
+    /// the provider's current snapshot instead (the actor's validation catalog is not changed).
+    pub initial_catalog_provider: Option<InitialCatalogProvider>,
 }
 
 impl HostSession {
@@ -488,6 +509,7 @@ impl HostSession {
             origin,
             assets,
             catalog,
+            initial_catalog_provider,
         } = bundle;
         // `tls` paths are only needed to load `config`; `start_server` already validated them.
         let _ = tls;
@@ -532,6 +554,12 @@ impl HostSession {
             catalog,
         );
         plane.set_audio_events(audio_rx);
+        // A per-connection provider lets a fresh phone see the current committed template without
+        // changing the actor's static validation/routing catalog. `None` preserves the old static
+        // behavior.
+        if let Some(provider) = initial_catalog_provider {
+            plane.set_initial_catalog_provider(provider);
+        }
         // Keep the authoritative server reachable from the returned handle so the operator can
         // mint fresh pairing credentials against the SAME actor the router serves. Without this
         // the actor would be unreachable and credential minting could only be faked.
@@ -1103,6 +1131,32 @@ mod tests {
     }
 
     #[test]
+    fn host_session_forwards_the_actual_configured_channel_count() {
+        // The composition must compare the *actual started* capture layout, not a discovery max.
+        let backend = PushingBackend {
+            channels: 3,
+            frames: 128,
+            blocks: 0,
+        };
+        let session = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(3),
+        )
+        .expect("host session starts");
+
+        assert_eq!(
+            session.configured_channels(),
+            3,
+            "the accessor must forward the real runtime getter"
+        );
+
+        drop(session);
+    }
+
+    #[test]
     fn dsp_bridge_queues_a_mix_that_precedes_the_media_slot_then_applies_on_arm() {
         let backend = PushingBackend {
             channels: 1,
@@ -1444,6 +1498,7 @@ mod tests {
             origin: OriginPolicy::new(vec!["https://localhost".to_string()]),
             assets: Arc::new(OneAsset),
             catalog: catalog_from_channel_map(&default_channel_map(1), CatalogRevision(0)),
+            initial_catalog_provider: None,
         };
 
         let server = session

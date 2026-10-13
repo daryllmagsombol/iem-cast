@@ -975,3 +975,357 @@ fn apply_source_links_rejects_overlap_and_unknown_ids() {
     assert!(apply_source_links(&map, &defaults, &[(sid(0x11), sid(0x99))]).is_err());
     assert!(apply_source_links(&map, &defaults, &[(sid(0x11), sid(0x11))]).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// prepare_binding / commit_prepared_binding
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn prepare_binding_is_pure_and_retains_compatible_ids_map_labels_and_defaults() {
+    // A committed same-device binding: preparation writes nothing, advances no revision, mutates
+    // no memory, and returns a candidate carrying the exact committed identity.
+    let dir = temp_dir("prepare-compatible");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    let bound = store.bind("A", 2, 0).expect("bind A");
+    // Commit a source-bound label and a non-center default through the ordinary path.
+    let ids: Vec<SourceId> = bound.channel_map.iter().map(|e| e.source_id).collect();
+    let mut labeled = bound.clone();
+    labeled.labels = vec![(ids[0], "Kick".to_string())];
+    labeled.source_defaults = vec![
+        SourcePanDefault { source_id: ids[0], pan: -0.4 },
+        SourcePanDefault { source_id: ids[1], pan: 0.3 },
+    ];
+    store.commit(1, labeled).expect("commit labeled defaults");
+    let bytes_before = fs::read(&path).unwrap();
+    let committed_before = store.committed().clone();
+    let revision_before = store.revision();
+
+    let prepared = store.prepare_binding("A", 2).expect("prepare retains the binding");
+
+    assert_eq!(prepared.device_id.as_deref(), Some("A"));
+    assert_eq!(prepared.input_channels, Some(2));
+    assert_eq!(
+        prepared.channel_map, committed_before.channel_map,
+        "compatible preparation retains ids/map"
+    );
+    assert_eq!(
+        prepared.source_defaults, committed_before.source_defaults,
+        "compatible preparation retains defaults"
+    );
+    assert_eq!(prepared.labels, committed_before.labels, "labels retained");
+    assert_eq!(prepared.labels.len(), 1, "the source-bound label survives");
+    assert_eq!(
+        prepared.settings_revision, SettingsRevision(revision_before),
+        "prepared revision is the committed save base, not a draft"
+    );
+
+    // Pure: no file, memory, or revision change.
+    assert_eq!(fs::read(&path).unwrap(), bytes_before, "no write on prepare");
+    assert_eq!(store.committed(), &committed_before, "memory unchanged");
+    assert_eq!(store.revision(), revision_before, "revision unchanged");
+    assert!(only_expected_files(&dir, "config.json"), "no temp file left");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repeat_prepare_binding_returns_stable_ids() {
+    // Repeated compatible preparation must be deterministic: the native shell caches this pending
+    // candidate, so re-reading cannot churn UUIDs or committed state.
+    let dir = temp_dir("prepare-repeat");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    store.bind("A", 3, 0).expect("bind A");
+    let bytes_before = fs::read(&path).unwrap();
+
+    let first = store.prepare_binding("A", 3).expect("first prepare");
+    let second = store.prepare_binding("A", 3).expect("second prepare");
+
+    assert_eq!(
+        first.channel_map, second.channel_map,
+        "repeat preparation must not churn source ids"
+    );
+    assert_eq!(first.source_defaults, second.source_defaults);
+    assert_eq!(store.revision(), 1, "no revision change across reads");
+    assert_eq!(fs::read(&path).unwrap(), bytes_before, "no write across reads");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepare_binding_for_a_new_or_incompatible_binding_mints_fresh_ids_and_clears_labels() {
+    let dir = temp_dir("prepare-new");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    let existing = store.bind("A", 2, 0).expect("bind A");
+    let existing_ids: Vec<SourceId> = existing.channel_map.iter().map(|e| e.source_id).collect();
+    let bytes_before = fs::read(&path).unwrap();
+
+    // A different device: fresh mono ids, centered defaults, no source-bound labels.
+    let prepared = store.prepare_binding("B", 2).expect("prepare a new device");
+    let prepared_ids: Vec<SourceId> = prepared.channel_map.iter().map(|e| e.source_id).collect();
+    assert_eq!(prepared.device_id.as_deref(), Some("B"));
+    assert_ne!(prepared_ids, existing_ids, "a new binding mints fresh ids");
+    assert!(
+        prepared.channel_map.iter().all(|e| {
+            e.stereo_pair.is_none() && e.stereo_side.is_none() && e.role == SourceRole::InputChannel
+        }),
+        "fresh map is mono/unpaired"
+    );
+    assert!(
+        prepared.source_defaults.iter().all(|d| d.pan == 0.0),
+        "fresh defaults are centered"
+    );
+    assert!(prepared.labels.is_empty(), "source-bound labels are cleared");
+
+    // An incompatible layout on the SAME device also mints fresh identity.
+    let incompatible = store.prepare_binding("A", 4).expect("prepare a new layout");
+    let incompatible_ids: Vec<SourceId> =
+        incompatible.channel_map.iter().map(|e| e.source_id).collect();
+    assert_ne!(
+        incompatible_ids, existing_ids,
+        "a layout change under the same uid is a fresh binding"
+    );
+
+    assert_eq!(store.committed().device_id.as_deref(), Some("A"), "committed untouched");
+    assert_eq!(store.revision(), 1, "prepare never advances the revision");
+    assert_eq!(fs::read(&path).unwrap(), bytes_before, "prepare never writes");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepare_binding_legacy_compatible_retains_ids_labels_and_unresolved_links() {
+    // A migrated v1 (unknown layout) with an unresolved pair. Same-uid preparation retains ids,
+    // labels, and the unresolved link in the candidate so the operator can resolve it.
+    let dir = temp_dir("prepare-legacy");
+    let path = dir.join("config.json");
+    let mut map = vec![entry(0, 0x11), entry(1, 0x22)];
+    map[0].stereo_pair = Some(sid(0x22));
+    let v1 = Config {
+        version: 1,
+        device_id: Some("dev-A".to_string()),
+        selected_interface: None,
+        channel_map: map,
+        labels: vec![(sid(0x11), "Kick".to_string())],
+    };
+    fs::write(&path, serde_json::to_vec(&v1).unwrap()).expect("write v1");
+    let original_bytes = fs::read(&path).unwrap();
+
+    let store = ConfigStore::open(&path).expect("legacy load");
+    let ids_before: Vec<SourceId> =
+        store.committed().channel_map.iter().map(|e| e.source_id).collect();
+
+    let prepared = store
+        .prepare_binding("dev-A", 2)
+        .expect("same-device legacy preparation is allowed");
+    let ids_after: Vec<SourceId> = prepared.channel_map.iter().map(|e| e.source_id).collect();
+
+    assert_eq!(ids_before, ids_after, "legacy ids retained");
+    assert_eq!(prepared.labels.len(), 1, "legacy labels retained");
+    assert_eq!(
+        prepared.channel_map[0].stereo_pair,
+        Some(sid(0x22)),
+        "the unresolved link is preserved in the candidate"
+    );
+    assert!(
+        validate_config(&prepared).is_err(),
+        "the unresolved candidate is intentionally not yet canonical"
+    );
+    assert_eq!(fs::read(&path).unwrap(), original_bytes, "prepare never writes");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepared_unresolved_legacy_candidate_is_rejected_by_commit_until_resolved() {
+    // Preparation is allowed to surface an unresolved legacy candidate, but the explicit commit is
+    // fully validated: it must reject the unresolved candidate and only accept a resolved one.
+    let dir = temp_dir("commit-prepared-unresolved");
+    let path = dir.join("config.json");
+    let mut map = vec![entry(0, 0x11), entry(1, 0x22)];
+    map[0].stereo_pair = Some(sid(0x22));
+    let v1 = Config {
+        version: 1,
+        device_id: Some("dev-A".to_string()),
+        selected_interface: None,
+        channel_map: map,
+        labels: Vec::new(),
+    };
+    fs::write(&path, serde_json::to_vec(&v1).unwrap()).expect("write v1");
+    let original_bytes = fs::read(&path).unwrap();
+
+    let mut store = ConfigStore::open(&path).expect("legacy load");
+    let unresolved = store.prepare_binding("dev-A", 2).expect("prepare allowed");
+    assert!(
+        matches!(
+            store.commit_prepared_binding(0, unresolved),
+            Err(ConfigError::Corrupt)
+        ),
+        "an unresolved candidate cannot be installed"
+    );
+    assert_eq!(store.revision(), 0);
+    assert_eq!(fs::read(&path).unwrap(), original_bytes, "no write on rejection");
+
+    // After the operator resolves the sides, the same prepared identity commits.
+    let (resolved_map, resolved_defaults) = apply_source_links(
+        &store.committed().channel_map,
+        &store.committed().source_defaults,
+        &[(sid(0x11), sid(0x22))],
+    )
+    .expect("resolve the pair");
+    let mut resolved = store.prepare_binding("dev-A", 2).expect("prepare resolved");
+    resolved.channel_map = resolved_map;
+    resolved.source_defaults = resolved_defaults;
+    store
+        .commit_prepared_binding(0, resolved)
+        .expect("resolved prepared candidate installs");
+
+    let reopened = ConfigStore::open(&path).expect("reopen");
+    assert_eq!(reopened.revision(), 1);
+    assert_eq!(reopened.committed().channel_map[0].stereo_side, Some(StereoSide::Left));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepared_commit_installs_exact_supplied_ids_and_final_custom_pan_in_one_write() {
+    // Prepare a fresh binding, then install a fully-formed candidate that carries preview ids plus a
+    // final custom pan. The exact supplied ids/defaults must be what reopens, in a single write.
+    let dir = temp_dir("commit-prepared-exact");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+
+    let prepared = store.prepare_binding("A", 2).expect("prepare new binding");
+    let preview_ids: Vec<SourceId> = prepared.channel_map.iter().map(|e| e.source_id).collect();
+
+    let mut final_candidate = prepared.clone();
+    final_candidate.source_defaults = vec![
+        SourcePanDefault { source_id: preview_ids[0], pan: -0.25 },
+        SourcePanDefault { source_id: preview_ids[1], pan: -0.25 },
+    ];
+    let saved = store
+        .commit_prepared_binding(0, final_candidate)
+        .expect("prepared install");
+    assert_eq!(saved.settings_revision, SettingsRevision(1));
+    assert_eq!(store.revision(), 1, "exactly one revision advance");
+    assert!(
+        only_expected_files(&dir, "config.json"),
+        "exactly one atomic write, no temp file"
+    );
+
+    let reopened = ConfigStore::open(&path).expect("reopen");
+    let reopened_ids: Vec<SourceId> =
+        reopened.committed().channel_map.iter().map(|e| e.source_id).collect();
+    assert_eq!(reopened_ids, preview_ids, "preview ids are preserved on save/reopen");
+    let pan = reopened
+        .committed()
+        .source_defaults
+        .iter()
+        .find(|d| d.source_id == preview_ids[0])
+        .unwrap()
+        .pan;
+    assert_eq!(pan, -0.25, "the final custom payload pan persists");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepared_commit_replaces_an_existing_incompatible_binding_where_ordinary_commit_rejects() {
+    // Explicit prepared commit is not binding-restrictive: it can replace a different device where
+    // the ordinary commit returns DeviceMismatch. Consent/lifecycle are the native caller's job.
+    let dir = temp_dir("commit-prepared-replace");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    store.bind("A", 2, 0).expect("bind A");
+
+    let replacement = store.prepare_binding("B", 2).expect("prepare replacement");
+    let ordinary = replacement.clone();
+    assert!(
+        matches!(store.commit(1, ordinary), Err(ConfigError::DeviceMismatch { .. })),
+        "ordinary commit stays binding-restrictive"
+    );
+    assert_eq!(store.revision(), 1, "rejected ordinary commit wrote nothing");
+
+    let saved = store
+        .commit_prepared_binding(1, replacement)
+        .expect("explicit prepared replacement installs");
+    assert_eq!(saved.device_id.as_deref(), Some("B"));
+    assert_eq!(store.revision(), 2);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prepared_commit_rejects_stale_revision_exhaustion_and_io_without_side_effects() {
+    let dir = temp_dir("commit-prepared-failures");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    store.bind("A", 1, 0).expect("bind baseline");
+    let prepared = store.prepare_binding("A", 1).expect("prepare");
+    let bytes_before = fs::read(&path).unwrap();
+
+    // Stale expected revision.
+    assert!(matches!(
+        store.commit_prepared_binding(7, prepared.clone()),
+        Err(ConfigError::RevisionConflict { expected: 7, found: 1 })
+    ));
+    assert_eq!(store.revision(), 1);
+    assert_eq!(fs::read(&path).unwrap(), bytes_before);
+
+    // Exhausted counter rejects before any I/O.
+    store.revision = u64::MAX;
+    assert!(matches!(
+        store.commit_prepared_binding(u64::MAX, prepared.clone()),
+        Err(ConfigError::RevisionExhausted)
+    ));
+    store.revision = 1;
+
+    // Pre-install I/O failure leaves memory/revision/file untouched.
+    let conf = dir.join("conf");
+    fs::create_dir_all(&conf).unwrap();
+    let broken_path = conf.join("config.json");
+    let mut broken = ConfigStore::open(&broken_path).unwrap();
+    broken.bind("A", 1, 0).expect("bind broken baseline");
+    let broken_prepared = broken.prepare_binding("A", 1).expect("prepare");
+    let broken_revision = broken.revision();
+    fs::remove_dir_all(&conf).unwrap();
+    fs::write(&conf, b"not a directory").unwrap();
+    let error = broken
+        .commit_prepared_binding(broken_revision, broken_prepared)
+        .expect_err("unwritable path must fail");
+    assert!(matches!(error, ConfigError::Io(_)), "expected Io, got {error:?}");
+    assert_eq!(broken.revision(), broken_revision, "revision not advanced on pre-install failure");
+    fs::remove_file(&conf).ok();
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn prepared_commit_post_install_sync_failure_adopts_and_reports_uncertain() {
+    // The explicit commit reuses the same atomic writer and its DurabilityUncertain distinction.
+    let dir = temp_dir("commit-prepared-uncertain");
+    let path = dir.join("config.json");
+    let mut store = ConfigStore::open(&path).unwrap();
+    let prepared = store.prepare_binding("A", 1).expect("prepare");
+    inject(&mut store, WriteStage::SyncDir);
+
+    let error = store
+        .commit_prepared_binding(0, prepared)
+        .expect_err("post-install sync failure is uncertain");
+    match error {
+        ConfigError::DurabilityUncertain { revision, .. } => assert_eq!(revision, 1),
+        other => panic!("expected DurabilityUncertain, got {other:?}"),
+    }
+    assert_eq!(store.revision(), 1, "installed revision adopted");
+    assert_eq!(store.committed().settings_revision, SettingsRevision(1));
+    assert!(store.committed().device_id.as_deref() == Some("A"));
+
+    let on_disk = ConfigStore::open(&path).expect("reopen installed file");
+    assert_eq!(on_disk.revision(), 1);
+    assert_eq!(on_disk.binding(), Some("A"));
+
+    fs::remove_dir_all(&dir).ok();
+}

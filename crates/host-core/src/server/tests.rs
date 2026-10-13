@@ -672,6 +672,81 @@ fn connect_session_pushes_session_and_catalog_snapshots_in_order() {
     assert_eq!(messages[1]["payload"]["sources"].as_array().unwrap().len(), 2);
 }
 
+/// A distinct catalog B used to prove a fresh connection reads the provider, not the static A.
+fn catalog_b() -> CatalogSnapshot {
+    CatalogSnapshot {
+        catalog_revision: CatalogRevision(7),
+        sources: vec![SourceInfo {
+            source_id: SourceId::from_bytes([0x44; 16]),
+            physical_index: 0,
+            label: "B-Source".to_string(),
+            role: SourceRole::InputChannel,
+            authorized: true,
+            available: true,
+            stereo_pair: None,
+            stereo_side: None,
+            default_pan: 0.5,
+        }],
+    }
+}
+
+#[test]
+fn initial_catalog_provider_serves_fresh_connections_without_touching_routing_or_existing_mix() {
+    // A server whose static (actor) catalog is A, with an installed provider returning B.
+    let mut server = build_server_with_catalog();
+    let session = test_session_a();
+
+    // An existing accepted mix on the session A catalog is established first.
+    server
+        .control
+        .apply_patch(session, patch_source_gain(shared_source(), -3.0))
+        .expect("patch");
+    let accepted_before = server.control.accepted_snapshot(session);
+    let routing_revision_before = server.catalog().catalog_revision;
+
+    // Install the provider AFTER the mix exists: a defaults-only projection must not broadcast.
+    let provider: crate::host::InitialCatalogProvider = Arc::new(catalog_b);
+    server.set_initial_catalog_provider(provider);
+
+    let (mut rx, _tx) = server.connect_session(session);
+    let messages = drain_all(&mut rx);
+    assert_eq!(messages.len(), 2);
+
+    // The fresh connection's catalog is B (the provider), not the static actor catalog A.
+    assert_eq!(messages[1]["type"], "catalog.snapshot");
+    assert_eq!(messages[1]["payload"]["catalogRevision"], "7");
+    let sources = messages[1]["payload"]["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["label"], "B-Source");
+    assert_eq!(sources[0]["defaultPan"], 0.5);
+
+    // The session snapshot (and thus the actor routing catalog revision) is still A's.
+    assert_eq!(messages[0]["type"], "session.snapshot");
+    assert_eq!(messages[0]["payload"]["catalogRevision"], "1");
+
+    // No broadcast and no routing/mix mutation: the existing accepted mix and actor routing
+    // revision are unchanged by installing the provider and serving a fresh connection.
+    assert_eq!(server.control.accepted_snapshot(session), accepted_before);
+    assert_eq!(
+        server.catalog().catalog_revision,
+        routing_revision_before
+    );
+}
+
+#[test]
+fn absent_initial_catalog_provider_preserves_the_static_fixture_catalog() {
+    // With no provider installed (the fixture default), a fresh connection still reads the static
+    // catalog exactly as before. This guards the `None` fallback.
+    let mut server = build_server_with_catalog();
+    let session = test_session_a();
+    let (mut rx, _tx) = server.connect_session(session);
+    let messages = drain_all(&mut rx);
+
+    assert_eq!(messages[1]["type"], "catalog.snapshot");
+    assert_eq!(messages[1]["payload"]["catalogRevision"], "1");
+    assert_eq!(messages[1]["payload"]["sources"].as_array().unwrap().len(), 2);
+}
+
 #[test]
 fn publish_mix_applied_reaches_only_the_owning_session() {
     let (mut server, _clock) = build_server();

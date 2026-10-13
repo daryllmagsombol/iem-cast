@@ -244,6 +244,112 @@ impl ConfigStore {
         self.persist_candidate(candidate, next_revision, &bytes)
     }
 
+    /// Prepare (but do not install) a candidate binding for a verified capture device and layout.
+    ///
+    /// This is a **pure** read of the committed state: it writes nothing, mutates nothing, and
+    /// advances no revision. It is the native shell's read-only preview of what a binding to
+    /// `(device_id, verified_channels)` would look like.
+    ///
+    /// Continuity: when `device_id` matches the committed device **and** the committed map is
+    /// compatible with `verified_channels`, the candidate retains the committed source ids, map,
+    /// labels, and defaults verbatim — including unresolved legacy links, so the operator can still
+    /// resolve them before an explicit commit. A new or incompatible binding instead generates
+    /// **fresh** mono ids and centered defaults, and clears source-bound labels.
+    ///
+    /// The returned candidate's `settings_revision` is the **committed save base** (not a draft
+    /// revision), so a caller can present it honestly as an uninstalled preview. The candidate may
+    /// be invalid (e.g. unresolved legacy links); it is only validated when
+    /// [`commit_prepared_binding`](Self::commit_prepared_binding) installs it.
+    ///
+    /// Consent and lifecycle (stopped host, explicit replacement) are **not** core policy: the
+    /// native shell owns those. This function only decides identity continuity.
+    pub fn prepare_binding(
+        &self,
+        device_id: &str,
+        verified_channels: u16,
+    ) -> Result<ConfigV2, ConfigError> {
+        if verified_channels == 0 || verified_channels as usize > MAX_SOURCES {
+            return Err(ConfigError::Corrupt);
+        }
+
+        let same_uid = self.committed.device_id.as_deref() == Some(device_id);
+        let compatible = map_compatible(
+            &self.committed.channel_map,
+            self.committed.input_channels,
+            verified_channels,
+        );
+        let retain = same_uid && compatible;
+
+        let (channel_map, source_defaults, labels) = if retain {
+            (
+                self.committed.channel_map.clone(),
+                self.committed.source_defaults.clone(),
+                self.committed.labels.clone(),
+            )
+        } else {
+            let map = fresh_channel_map(verified_channels);
+            let defaults = centered_defaults(&map);
+            (map, defaults, Vec::new())
+        };
+
+        Ok(ConfigV2 {
+            version: CONFIG_VERSION,
+            device_id: Some(device_id.to_string()),
+            selected_interface: self.committed.selected_interface.clone(),
+            input_channels: Some(verified_channels),
+            settings_revision: SettingsRevision(self.revision),
+            channel_map,
+            labels,
+            source_defaults,
+        })
+    }
+
+    /// Explicitly install a fully-formed candidate prepared for a new/replacement/legacy binding.
+    ///
+    /// Unlike [`commit`](Self::commit), this is **not** binding-restrictive: it accepts a candidate
+    /// that changes the bound device or the verified layout, because the caller (the native shell)
+    /// has already obtained explicit replacement consent and stopped the host. It performs the
+    /// **full** canonical validation — so a candidate with unresolved links, an inconsistent count,
+    /// or invalid defaults is rejected — then advances the revision by exactly one and persists the
+    /// **exact supplied ids, map, labels, and defaults** through the same single atomic write the
+    /// ordinary commit uses. This is not a bind-then-save pair of writes.
+    ///
+    /// The trusted caller's responsibilities (not enforced here): explicit replacement consent,
+    /// lifecycle/stopped-host enforcement, and pairing this with the prepared candidate it obtained
+    /// from [`prepare_binding`](Self::prepare_binding).
+    ///
+    /// Failure semantics match the ordinary commit: a stale `expected_revision` is
+    /// [`RevisionConflict`](ConfigError::RevisionConflict); an exhausted counter is
+    /// [`RevisionExhausted`](ConfigError::RevisionExhausted); a pre-install I/O failure leaves
+    /// memory, file, and revision untouched; and an installed-but-not-durably-confirmed write
+    /// adopts the installed revision and returns
+    /// [`DurabilityUncertain`](ConfigError::DurabilityUncertain).
+    pub fn commit_prepared_binding(
+        &mut self,
+        expected_revision: u64,
+        mut candidate: ConfigV2,
+    ) -> Result<ConfigV2, ConfigError> {
+        if expected_revision != self.revision {
+            return Err(ConfigError::RevisionConflict {
+                expected: expected_revision,
+                found: self.revision,
+            });
+        }
+
+        // Checked revision advancement *before* any filesystem work.
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ConfigError::RevisionExhausted)?;
+
+        candidate.version = CONFIG_VERSION;
+        validate_config(&candidate)?;
+        candidate.settings_revision = SettingsRevision(next_revision);
+
+        let bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| ConfigError::Corrupt)?;
+        self.persist_candidate(candidate, next_revision, &bytes)
+    }
+
     /// Explicitly (re)bind to a verified capture device and layout.
     ///
     /// This is the stopped-host rebinding operation. A different device, or a layout change, mints
