@@ -69,7 +69,7 @@ const ack: MixAck = {
   canonicalSettings: {
     catalogRevision: '1' as MixAck['canonicalSettings']['catalogRevision'],
     mixRevision: '12' as MixAck['canonicalSettings']['mixRevision'],
-    sources: [{ sourceId: 'ch1', gainDb: -9, muted: false }],
+    sources: [{ sourceId: 'ch1', gainDb: -9, muted: false, pan: 0 }],
     masterDb: 0,
     masterMuted: false,
   },
@@ -78,7 +78,7 @@ const ack: MixAck = {
 const patch: MixPatch = {
   baseRevision: '1' as MixPatch['baseRevision'],
   catalogRevision: '1' as MixPatch['catalogRevision'],
-  sources: [{ sourceId: 'ch1', gainDb: -9, muted: false }],
+  sources: [{ sourceId: 'ch1', gainDb: -9, muted: false, pan: 0 }],
   masterDb: 0,
   masterMuted: false,
 };

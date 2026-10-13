@@ -20,6 +20,16 @@ export interface ReceiverViewProps {
   onMasterGainChange(db: number): void;
   onChannelGainChange(sourceId: string, db: number): void;
   onChannelMuteChange(sourceId: string, muted: boolean): void;
+  /**
+   * Mono pan: change ONLY this source's pan (normalized `[-1, 1]`). Gains, mutes, master, and arm
+   * are not touched. Consumed by the grouped-strip UI later (designer Task 6).
+   */
+  onChannelPanChange(sourceId: string, pan: number): void;
+  /**
+   * Stereo balance: change BOTH pair members' pan atomically in one edit (normalized `[-1, 1]`),
+   * preserving each member's independent gain and mute. Consumed by the designer Task 6.
+   */
+  onPairBalanceChange(leftSourceId: string, rightSourceId: string, pan: number): void;
   onStop(): void;
   onStart?(): void;
   onPrepare?(): void;

@@ -7,9 +7,9 @@ import { createReceiverController } from '../../transport/ReceiverController';
 import { MusicianRoot } from '../MusicianRoot';
 
 afterEach(cleanup);
-const mix: MixSnapshot = { catalogRevision: '1' as CounterString, mixRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -12, muted: true }], masterDb: -18, masterMuted: true };
+const mix: MixSnapshot = { catalogRevision: '1' as CounterString, mixRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -12, muted: true, pan: 0 }], masterDb: -18, masterMuted: true };
 function fixture(phase: ReceiverSnapshot['phase'] = 'unpaired') {
-  let snapshot: ReceiverSnapshot = { phase, catalog: { catalogRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', physicalIndex: 0, label: 'Lead vocal', available: true, authorized: true, stereoPair: null, role: 'inputChannel' }] }, requested_mix: mix, accepted_mix: mix, applied_mix: null, master_local_muted: true, error: null, diagnostics: { network_rtt_ms: 'Unavailable', buffer_delay_ms: 'Waiting for sample', buffer_target_delay_ms: 'Unavailable', buffer_minimum_delay_ms: 'Unavailable', packets_lost_delta: 'Unavailable', concealment_percent: 'Unavailable', jitter_buffer_preference: { state: 'Not requested', requested_ms: null }, end_to_end: 'Not measured', last_updated: null } };
+  let snapshot: ReceiverSnapshot = { phase, catalog: { catalogRevision: '1' as CounterString, sources: [{ sourceId: 'vocal', physicalIndex: 0, label: 'Lead vocal', available: true, authorized: true, stereoPair: null, stereoSide: null, defaultPan: 0, role: 'inputChannel' }] }, requested_mix: mix, accepted_mix: mix, applied_mix: null, master_local_muted: true, error: null, diagnostics: { network_rtt_ms: 'Unavailable', buffer_delay_ms: 'Waiting for sample', buffer_target_delay_ms: 'Unavailable', buffer_minimum_delay_ms: 'Unavailable', packets_lost_delta: 'Unavailable', concealment_percent: 'Unavailable', jitter_buffer_preference: { state: 'Not requested', requested_ms: null }, end_to_end: 'Not measured', last_updated: null } };
   let notify: (s: ReceiverSnapshot) => void = () => {};
   const controller: ReceiverController = { getSnapshot: () => snapshot, subscribe: h => { notify = h; return () => {}; }, connect: vi.fn(async () => { snapshot = { ...snapshot, phase: 'ready-muted' }; notify(snapshot); }), arm: vi.fn(async () => {}), requestMix: vi.fn(async patch => ({ acceptedRevision: '2' as CounterString, catalogRevision: patch.catalogRevision, canonicalSettings: { ...mix, ...patch, mixRevision: '2' as CounterString } })), personalMasterMute: vi.fn(), stop: vi.fn(), disconnect: vi.fn() };
   return { controller, update: (s: Partial<ReceiverSnapshot>) => { snapshot = { ...snapshot, ...s }; notify(snapshot); } };
@@ -42,7 +42,7 @@ test('accepted settings are never presented as Applied; mute waits for matching 
   fireEvent.click(screen.getByRole('button', { name: 'Unmute Lead vocal' }));
   await screen.findByText(/Accepted · Waiting for host application/);
   expect(screen.getByText(/Applied mute: Muted/)).toBeInTheDocument();
-  act(() => update({ applied_mix: { ...mix, mixRevision: '2' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -12, muted: false }] } }));
+  act(() => update({ applied_mix: { ...mix, mixRevision: '2' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -12, muted: false, pan: 0 }] } }));
   expect(screen.getByText(/Applied mute: Not muted/)).toBeInTheDocument();
   expect(screen.queryByText(/Accepted · Waiting for host application/)).not.toBeInTheDocument();
 });
@@ -64,6 +64,8 @@ test('a listener with no mix yet still gets a fader per catalog source', () => {
           authorized: true,
           stereoPair: null,
           role: 'inputChannel',
+          stereoSide: null,
+          defaultPan: 0,
         },
       ],
     },
@@ -145,7 +147,7 @@ test('rejection restores latest accepted settings rather than older DSP settings
   const { controller, update } = fixture('armed');
   render(<MusicianRoot controller={controller} />);
   act(() => update({ applied_mix: mix, accepted_mix: { ...mix, mixRevision: '2' as CounterString,
-    sources: [{ sourceId: 'vocal', gainDb: -20, muted: true }] } }));
+    sources: [{ sourceId: 'vocal', gainDb: -20, muted: true, pan: 0 }] } }));
   controller.requestMix = vi.fn().mockRejectedValue(new Error('Mix was not accepted'));
   fireEvent.change(screen.getByRole('slider', { name: 'Lead vocal' }), { target: { value: '-30' } });
   expect(await screen.findByRole('alert')).toHaveTextContent('Mix was not accepted');
@@ -163,7 +165,7 @@ test('starting during a pending edit does not suppress its accepted feedback', a
   fireEvent.click(screen.getByRole('button', { name: 'Start listening' }));
   await act(async () => resolve({ acceptedRevision: '2' as CounterString,
     catalogRevision: mix.catalogRevision, canonicalSettings: { ...mix,
-      mixRevision: '2' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -24, muted: true }] } }));
+      mixRevision: '2' as CounterString, sources: [{ sourceId: 'vocal', gainDb: -24, muted: true, pan: 0 }] } }));
   expect(screen.getByText('Accepted · Waiting for host application')).toBeInTheDocument();
   expect(screen.getByRole('slider', { name: 'Lead vocal' })).toHaveValue('-24');
 });

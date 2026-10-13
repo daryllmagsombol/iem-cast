@@ -5,6 +5,7 @@ import { Button } from '../ui/Button';
 import { SimulatedPreview } from '../preview/SimulatedPreview';
 import { JoinView } from './JoinView';
 import { ReceiverView } from './ReceiverView';
+import { initialMix } from './initial-mix';
 
 export interface MusicianRootProps {
   controller?: ReceiverController;
@@ -75,18 +76,10 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
   const base = snapshot.requested_mix ?? snapshot.accepted_mix ?? snapshot.applied_mix;
   const applied = snapshot.applied_mix;
   // A listener starts with no host mix. Rather than block every edit, synthesize a neutral local
-  // mix from the catalog (all sources muted at a safe attenuation, master attenuated); the first
-  // patch then carries the listener's real intent. Muted-by-default keeps nothing unexpectedly
-  // audible before an explicit unmute.
-  const neutralMix: MixSnapshot = base ?? {
-    catalogRevision: snapshot.catalog.catalogRevision,
-    mixRevision: '0' as CounterString,
-    sources: snapshot.catalog.sources
-      .filter(source => source.available && source.authorized)
-      .map(source => ({ sourceId: source.sourceId, gainDb: -60, muted: true })),
-    masterDb: -60,
-    masterMuted: true,
-  };
+  // mix from the catalog with the SAME pure builder both phone paths use (all usable sources muted
+  // at a safe attenuation with their default pan, master attenuated). Muted-by-default keeps
+  // nothing unexpectedly audible before an explicit unmute; an accepted mix always wins.
+  const neutralMix: MixSnapshot = base ?? initialMix(snapshot.catalog);
   const match =
     !!intent?.acceptedRevision &&
     applied?.mixRevision === intent.acceptedRevision &&
@@ -95,7 +88,8 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
     applied.masterMuted === intent.patch.masterMuted &&
     intent.patch.sources.every(s =>
       applied.sources.some(a =>
-        a.sourceId === s.sourceId && a.gainDb === s.gainDb && a.muted === s.muted,
+        a.sourceId === s.sourceId && a.gainDb === s.gainDb && a.muted === s.muted &&
+        a.pan === s.pan,
       ),
     );
   const pending = !!intent && !match;
@@ -257,6 +251,36 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
           sources: display?.sources.map(s =>
             s.sourceId === id ? { ...s, muted } : s,
           ) ?? [],
+        });
+      }}
+      // Mono pan: update ONLY this source's pan; gains, mutes, master, and arm are untouched.
+      onChannelPanChange={(id, pan) => {
+        edit({
+          sources: display?.sources.map(s =>
+            s.sourceId === id ? { ...s, pan } : s,
+          ) ?? [],
+        });
+      }}
+      // Stereo balance: update BOTH pair members' pan atomically in one patch, preserving each
+      // member's independent gain and mute. An invalid pair intent (same id, a non-reciprocal
+      // peer, an unavailable/unauthorized member, or a member missing from the current display)
+      // is rejected before any edit, so a linked pair is never silently degraded into a half edit.
+      onPairBalanceChange={(leftId, rightId, pan) => {
+        if (leftId === rightId) return;
+        const catalogById = new Map(snapshot.catalog.sources.map(s => [s.sourceId, s]));
+        const left = catalogById.get(leftId);
+        const right = catalogById.get(rightId);
+        const reciprocal = left?.stereoPair === rightId && right?.stereoPair === leftId;
+        const usable = (s: typeof left) => !!s && s.available && s.authorized;
+        const members = display?.sources ?? [];
+        const inDisplay = (id: string) => members.some(s => s.sourceId === id);
+        if (!reciprocal || !usable(left) || !usable(right) || !inDisplay(leftId) || !inDisplay(rightId)) {
+          return;
+        }
+        edit({
+          sources: members.map(s =>
+            s.sourceId === leftId || s.sourceId === rightId ? { ...s, pan } : s,
+          ),
         });
       }}
       onStop={stop}

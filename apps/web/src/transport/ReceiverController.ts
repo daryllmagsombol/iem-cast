@@ -41,6 +41,7 @@ import {
   UNKNOWN_JITTER_BUFFER_PREFERENCE,
   type IntervalMetric,
 } from './diagnostics';
+import { initialMix, normalizeCatalog, normalizeMixSnapshot, normalizeSourceGain } from '../musician/initial-mix';
 
 /** Freshness window for diagnostics: stale readings become `Unavailable`. */
 const DIAGNOSTICS_STALE_MS = 3000;
@@ -149,10 +150,11 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
           for (const waiter of batch.waiters) waiter.reject(new Error('Mix request superseded by host settings'));
           return;
         }
+        const accepted = normalizeMixSnapshot(ack.canonicalSettings as never);
         snapshot = {
           ...snapshot,
-          accepted_mix: ack.canonicalSettings,
-          requested_mix: queuedMix ? snapshot.requested_mix : ack.canonicalSettings,
+          accepted_mix: accepted,
+          requested_mix: queuedMix ? snapshot.requested_mix : accepted,
           error: snapshot.error === mixError ? null : snapshot.error,
         };
         mixError = null;
@@ -199,7 +201,9 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
     switch (eventType(event)) {
       case 'catalog.snapshot': {
         const payload = event.payload as ReceiverSnapshot['catalog'];
-        snapshot = { ...snapshot, catalog: payload };
+        // Normalize at the incoming boundary so `defaultPan`/`stereoSide`/`stereoPair` are always
+        // present (legacy payloads omit them) before the UI or the seed builder reads them.
+        snapshot = { ...snapshot, catalog: normalizeCatalog(payload) };
         emit();
         break;
       }
@@ -224,15 +228,19 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
         if (typeof payload.context?.safetyGeneration === 'string') {
           currentGeneration = payload.context.safetyGeneration;
         }
+        // Normalize legacy/partial incoming mixes once, so `pan` is always a finite canonical
+        // number everywhere downstream (including the accepted-resume comparison).
+        const incoming = (mix: MixSnapshot | null | undefined): MixSnapshot | null =>
+          mix == null ? null : normalizeMixSnapshot(mix as never);
         snapshot = {
           ...snapshot,
           // Host authority is not local playback permission. Only a live confirmed attempt can
           // put this lifecycle into armed, including when a snapshot arrives after a timeout.
           phase: payload.phase === 'armed' && (currentArmNonce === null || pendingArm !== null)
             ? snapshot.phase : payload.phase,
-          requested_mix: payload.requestedMix === undefined ? snapshot.requested_mix : payload.requestedMix,
-          accepted_mix: payload.acceptedMix === undefined ? snapshot.accepted_mix : payload.acceptedMix,
-          applied_mix: payload.appliedMix === undefined ? snapshot.applied_mix : payload.appliedMix,
+          requested_mix: payload.requestedMix === undefined ? snapshot.requested_mix : incoming(payload.requestedMix),
+          accepted_mix: payload.acceptedMix === undefined ? snapshot.accepted_mix : incoming(payload.acceptedMix),
+          applied_mix: payload.appliedMix === undefined ? snapshot.applied_mix : incoming(payload.appliedMix),
         };
         emit();
         break;
@@ -245,7 +253,8 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
         if (snapshot.accepted_mix && BigInt(payload.acceptedRevision) < BigInt(snapshot.accepted_mix.mixRevision)) break;
         snapshot = {
           ...snapshot,
-          accepted_mix: payload.canonicalSettings,
+          // Canonicalize the accepted snapshot's pan on the incoming boundary.
+          accepted_mix: normalizeMixSnapshot(payload.canonicalSettings as never),
         };
         emit();
         break;
@@ -253,7 +262,7 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       case 'mix.applied': {
         // DSP-confirmed. Recorded for display; still never opens the gate.
         const payload = event.payload as { settings: MixSnapshot };
-        snapshot = { ...snapshot, applied_mix: payload.settings };
+        snapshot = { ...snapshot, applied_mix: normalizeMixSnapshot(payload.settings as never) };
         emit();
         break;
       }
@@ -423,25 +432,34 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
     },
 
     requestMix(patch: MixPatch) {
+      // Normalize the outgoing patch on the boundary: a legacy caller that omits `pan` is filled
+      // with center, while an explicit `null`/non-finite pan rejects the request before any write.
+      // This keeps `pan` always present and canonical on the wire.
+      let outgoing: MixPatch;
+      try {
+        outgoing = { ...patch, sources: patch.sources.map(normalizeSourceGain) };
+      } catch (error) {
+        return Promise.reject(error);
+      }
       // Optimistic local echo of intent; kept distinct from accepted and applied.
       snapshot = {
         ...snapshot,
         requested_mix: {
-          catalogRevision: patch.catalogRevision,
-          mixRevision: patch.baseRevision,
-          sources: patch.sources,
-          masterDb: patch.masterDb,
-          masterMuted: patch.masterMuted,
+          catalogRevision: outgoing.catalogRevision,
+          mixRevision: outgoing.baseRevision,
+          sources: outgoing.sources,
+          masterDb: outgoing.masterDb,
+          masterMuted: outgoing.masterMuted,
         },
       };
       snapshot = { ...snapshot, error: snapshot.error === mixError ? null : snapshot.error };
       mixError = null;
       const result = new Promise<MixAck>((resolve, reject) => {
         if (queuedMix) {
-          queuedMix.patch = patch;
+          queuedMix.patch = outgoing;
           queuedMix.waiters.push({ resolve, reject });
         } else {
-          queuedMix = { patch, signal: lifecycle.signal, requestId: crypto.randomUUID(), waiters: [{ resolve, reject }] };
+          queuedMix = { patch: outgoing, signal: lifecycle.signal, requestId: crypto.randomUUID(), waiters: [{ resolve, reject }] };
         }
       });
       emit();
@@ -506,14 +524,15 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
           checkAttempt();
           let accepted = snapshot.accepted_mix;
           if (accepted === null) {
+            // The SAME pure builder both phone paths use, so the arm bootstrap can never drift from
+            // the rendered template (defaults from the catalog, pan included).
+            const template = initialMix(snapshot.catalog);
             const neutral: MixPatch = {
               baseRevision: '0' as CounterString,
-              catalogRevision: snapshot.catalog.catalogRevision,
-              sources: snapshot.catalog.sources
-                .filter(source => source.available && source.authorized)
-                .map(source => ({ sourceId: source.sourceId, gainDb: -60, muted: true })),
-              masterDb: -60,
-              masterMuted: true,
+              catalogRevision: template.catalogRevision,
+              sources: template.sources,
+              masterDb: template.masterDb,
+              masterMuted: template.masterMuted,
             };
             const ack = await controller.requestMix(neutral);
             checkAttempt();
