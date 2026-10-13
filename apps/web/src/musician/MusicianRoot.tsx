@@ -214,6 +214,9 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
         appliedDb: a?.gainDb,
         appliedMuted: a?.muted,
         muted: mixed?.muted ?? true,
+        // Unpaired MasterLr has a fixed parity split and no pan control; the raw value is
+        // harmless there because ReceiverView only renders a pan slot for pannable sources.
+        pan: mixed?.pan ?? source.defaultPan,
         pending,
         accepted: pending && !!intent?.acceptedRevision,
       };
