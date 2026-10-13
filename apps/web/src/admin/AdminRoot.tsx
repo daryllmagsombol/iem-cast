@@ -313,7 +313,7 @@ export function AdminRoot({ bridge }: AdminRootProps) {
             )}
           </section>
           <section id="setup-4" className="iem-panel">
-            <SourcesView bridge={bridge} device={device} />
+            <SourcesView bridge={bridge} device={device} hostRunning={hostRunning} />
           </section>
           <section id="setup-5" className="iem-panel">
             <PairingView bridge={bridge} hostRunning={hostRunning} />
