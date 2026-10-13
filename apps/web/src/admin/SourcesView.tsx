@@ -20,7 +20,10 @@ export interface SourcesViewProps {
   hostRunning?: boolean;
 }
 
-type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed' | 'uncertain';
+type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed' | 'uncertain' | 'conflict';
+
+/** A save the user must explicitly consent to, because it replaces an incompatible binding. */
+type PendingConsent = { kind: 'defaults' } | { kind: 'links'; pairs: SourceLinkPair[] };
 
 interface DefaultEntry {
   key: string;
@@ -123,6 +126,25 @@ function isOlderRevision(candidate: string, current: string): boolean {
   }
 }
 
+/** The host's stable machine error code, when the rejection carried one. */
+function errorCode(error: unknown): string | null {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+  }
+  return null;
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+/** A commit that installed the change advanced the revision; only a reload recovers. */
+const RELOAD_CODES = new Set([
+  'SOURCE_SETTINGS_DURABILITY_UNCERTAIN',
+  'SOURCE_SETTINGS_REVISION_CONFLICT',
+]);
+
 function currentPairs(entries: DefaultEntry[]): SourceLinkPair[] {
   return entries
     .filter(entry => entry.kind === 'pair')
@@ -144,17 +166,21 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
   const [loadingSettings, setLoadingSettings] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, number>>({});
   const [status, setStatus] = useState<Record<string, SaveStatus>>({});
-  const [consentPending, setConsentPending] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<Record<string, string>>({});
+  const [consentPending, setConsentPending] = useState<PendingConsent | null>(null);
   const [scan, setScan] = useState(0);
   const [leftChoice, setLeftChoice] = useState('');
   const [rightChoice, setRightChoice] = useState('');
   const [linkStatus, setLinkStatus] = useState<SaveStatus>('idle');
   const [linkMessage, setLinkMessage] = useState<string | null>(null);
+  const [linkReloadNeeded, setLinkReloadNeeded] = useState(false);
 
   const generationRef = useRef(0);
   const inFlightRef = useRef(false);
   const queuedRef = useRef(false);
   const replaceConfirmedRef = useRef(false);
+  /** The exact intended link pair set for a pending/returned link save, replayed by Retry. */
+  const linkIntentRef = useRef<SourceLinkPair[] | null>(null);
 
   const bridgeRef = useRef(bridge);
   const settingsRef = useRef(settings);
@@ -200,6 +226,7 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       draftsRef.current = {};
       setDrafts({});
       setStatus({});
+      setStatusMessage({});
       return undefined;
     }
     generationRef.current += 1;
@@ -207,15 +234,18 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
     inFlightRef.current = false;
     queuedRef.current = false;
     replaceConfirmedRef.current = false;
+    linkIntentRef.current = null;
     settingsRef.current = null;
     draftsRef.current = {};
     setSettings(null);
     setDrafts({});
     setStatus({});
+    setStatusMessage({});
     setLoadError(null);
-    setConsentPending(false);
+    setConsentPending(null);
     setLinkStatus('idle');
     setLinkMessage(null);
+    setLinkReloadNeeded(false);
     setLoadingSettings(true);
 
     const request = bridge.readSourceSettings(deviceId);
@@ -252,9 +282,16 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
     const pending = dirtyKeys(entriesRef.current, draftsRef.current, current);
     if (pending.length === 0) return;
     if (current.bindingStatus === 'replacement' && !replaceConfirmedRef.current) {
-      setConsentPending(true);
+      setConsentPending({ kind: 'defaults' });
       return;
     }
+    await saveDefaultsNow(pending);
+  }
+
+  async function saveDefaultsNow(pending: string[]) {
+    const activeBridge = bridgeRef.current;
+    const current = settingsRef.current;
+    if (!activeBridge || !current || pending.length === 0) return;
 
     const generation = generationRef.current;
     const targetDeviceId = current.deviceId;
@@ -264,6 +301,11 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
     setStatus(previous => {
       const next = { ...previous };
       for (const key of pending) next[key] = 'saving';
+      return next;
+    });
+    setStatusMessage(previous => {
+      const next = { ...previous };
+      for (const key of pending) delete next[key];
       return next;
     });
 
@@ -278,13 +320,9 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       if (generation !== generationRef.current || settingsRef.current?.deviceId !== targetDeviceId) {
         return;
       }
-      // A response carrying an older committed revision is stale; keep the newer draft and fail.
+      // A response carrying an older committed revision is stale; keep the newer draft and reload.
       if (isOlderRevision(result.settingsRevision, baseRevision)) {
-        setStatus(previous => {
-          const next = { ...previous };
-          for (const key of pending) next[key] = 'failed';
-          return next;
-        });
+        markDefaults(pending, 'conflict', 'The saved defaults changed underneath this request. Reload before retrying.');
         return;
       }
       settingsRef.current = result;
@@ -300,15 +338,31 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
         }
         return next;
       });
+      if (durable) {
+        setStatusMessage(previous => {
+          const next = { ...previous };
+          for (const key of pending) {
+            next[key] = 'Installed, but restart durability was not confirmed. Reload before retrying.';
+          }
+          return next;
+        });
+      }
       replaceConfirmedRef.current = false;
-      setConsentPending(false);
-    } catch {
+      setConsentPending(null);
+    } catch (error) {
       if (generation !== generationRef.current) return;
-      setStatus(previous => {
-        const next = { ...previous };
-        for (const key of pending) next[key] = 'failed';
-        return next;
-      });
+      const code = errorCode(error);
+      const fallback = errorMessage(error, 'Could not save the defaults.');
+      if (code === 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN') {
+        markDefaults(pending, 'uncertain', 'Installed, but restart durability was not confirmed. Reload before retrying.');
+      } else if (RELOAD_CODES.has(code ?? '')) {
+        markDefaults(pending, 'conflict', fallback);
+      } else {
+        // A plain failure keeps the draft and the host message so Retry is actionable.
+        markDefaults(pending, 'failed', fallback);
+      }
+      // A failed confirm must not leave consent standing for a later, unconfirmed edit.
+      replaceConfirmedRef.current = false;
     } finally {
       inFlightRef.current = false;
       if (queuedRef.current && generation === generationRef.current) {
@@ -320,54 +374,113 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
     }
   }
 
+  function markDefaults(keys: string[], state: SaveStatus, message: string) {
+    setStatus(previous => {
+      const next = { ...previous };
+      for (const key of keys) next[key] = state;
+      return next;
+    });
+    setStatusMessage(previous => {
+      const next = { ...previous };
+      for (const key of keys) next[key] = message;
+      return next;
+    });
+  }
+
   function handleChange(key: string, value: number) {
     draftsRef.current = { ...draftsRef.current, [key]: value };
     setDrafts(draftsRef.current);
     setStatus(previous => {
       const current = previous[key];
-      if (current === 'failed' || current === 'saved' || current === 'uncertain') {
+      if (current === 'failed' || current === 'saved' || current === 'uncertain' || current === 'conflict') {
         return { ...previous, [key]: 'idle' };
       }
       return previous;
     });
-    void flush();
-  }
-
-  function confirmReplacement() {
-    replaceConfirmedRef.current = true;
-    setConsentPending(false);
-    void flush();
-  }
-
-  function cancelReplacement() {
-    // Drop the unsaved draft and return every editable entry to its committed value.
+    setStatusMessage(previous => {
+      if (!(key in previous)) return previous;
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+    // A draft reverted back to the committed value no longer needs a replacement confirmation.
     const current = settingsRef.current;
-    if (current) {
-      const restored: Record<string, number> = {};
-      for (const entry of entriesRef.current) restored[entry.key] = committedFor(entry, current);
-      draftsRef.current = restored;
-      setDrafts(restored);
+    if (
+      current !== null &&
+      dirtyKeys(entriesRef.current, draftsRef.current, current).length === 0
+    ) {
+      setConsentPending(previous => (previous?.kind === 'defaults' ? null : previous));
     }
-    replaceConfirmedRef.current = false;
-    setConsentPending(false);
-    setStatus({});
+    void flush();
   }
 
-  async function runLinkSave(mutate: (pairs: SourceLinkPair[]) => SourceLinkPair[]) {
+  /** Re-read the committed settings from the host, discarding drafts/status. */
+  function reload() {
+    setConsentPending(null);
+    replaceConfirmedRef.current = false;
+    linkIntentRef.current = null;
+    setScan(n => n + 1);
+  }
+
+  function confirmConsent() {
+    const pending = consentPending;
+    replaceConfirmedRef.current = true;
+    setConsentPending(null);
+    if (pending?.kind === 'links') {
+      void runLinkSave(pending.pairs, true);
+      return;
+    }
+    void flush();
+  }
+
+  function cancelConsent() {
+    const pending = consentPending;
+    replaceConfirmedRef.current = false;
+    if (pending?.kind === 'links') {
+      linkIntentRef.current = null;
+    } else {
+      // Drop the unsaved default draft and return every editable entry to its committed value.
+      const current = settingsRef.current;
+      if (current) {
+        const restored: Record<string, number> = {};
+        for (const entry of entriesRef.current) restored[entry.key] = committedFor(entry, current);
+        draftsRef.current = restored;
+        setDrafts(restored);
+      }
+      setStatus({});
+      setStatusMessage({});
+    }
+    setConsentPending(null);
+  }
+
+  async function runLinkSave(pairs: SourceLinkPair[], confirmed: boolean) {
     const activeBridge = bridgeRef.current;
     const current = settingsRef.current;
     if (!activeBridge || !current || hostRunning) return;
-    const pairs = mutate(currentPairs(entriesRef.current));
+    if (current.bindingStatus === 'replacement' && !confirmed) {
+      // Reuse the same explicit consent step for link saves; the intended mutation is preserved.
+      linkIntentRef.current = pairs;
+      setConsentPending({ kind: 'links', pairs });
+      return;
+    }
     const generation = generationRef.current;
     const targetDeviceId = current.deviceId;
     const baseRevision = current.settingsRevision;
     setLinkStatus('saving');
     setLinkMessage(null);
+    setLinkReloadNeeded(false);
     try {
-      const result = await activeBridge.saveSourceLinks(targetDeviceId, baseRevision, pairs, false);
+      const result = await activeBridge.saveSourceLinks(
+        targetDeviceId,
+        baseRevision,
+        pairs,
+        confirmed,
+      );
       if (generation !== generationRef.current || settingsRef.current?.deviceId !== targetDeviceId) return;
       if (isOlderRevision(result.settingsRevision, baseRevision)) {
-        setLinkStatus('failed');
+        linkIntentRef.current = pairs;
+        setLinkStatus('conflict');
+        setLinkReloadNeeded(true);
         setLinkMessage('The saved links changed underneath this request. Reload before retrying.');
         return;
       }
@@ -379,17 +492,41 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       setDrafts(seeded);
       setLeftChoice('');
       setRightChoice('');
-      setLinkStatus(result.durabilityUncertain ? 'uncertain' : 'saved');
-      setLinkMessage(
-        result.durabilityUncertain
-          ? 'Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.'
-          : null,
-      );
-    } catch (e) {
+      linkIntentRef.current = null;
+      replaceConfirmedRef.current = false;
+      if (result.durabilityUncertain) {
+        setLinkStatus('uncertain');
+        setLinkReloadNeeded(true);
+        setLinkMessage('Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.');
+      } else {
+        setLinkStatus('saved');
+        setLinkMessage(null);
+      }
+    } catch (error) {
       if (generation !== generationRef.current) return;
-      setLinkStatus('failed');
-      setLinkMessage(e instanceof Error ? e.message : 'Could not save the stereo links.');
+      // Keep the exact intended mutation so Retry replays it rather than the committed set.
+      linkIntentRef.current = pairs;
+      replaceConfirmedRef.current = false;
+      const code = errorCode(error);
+      if (code === 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN') {
+        setLinkStatus('uncertain');
+        setLinkReloadNeeded(true);
+        setLinkMessage('Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.');
+      } else if (RELOAD_CODES.has(code ?? '')) {
+        setLinkStatus('conflict');
+        setLinkReloadNeeded(true);
+        setLinkMessage(errorMessage(error, 'The saved links changed underneath this request. Reload before retrying.'));
+      } else {
+        setLinkStatus('failed');
+        setLinkMessage(errorMessage(error, 'Could not save the stereo links.'));
+      }
     }
+  }
+
+  function handleLinkRetry() {
+    const intended = linkIntentRef.current;
+    if (!intended) return;
+    void runLinkSave(intended, replaceConfirmedRef.current);
   }
 
   function findLinkablePair(): { leftSourceId: string; rightSourceId: string } | null {
@@ -415,10 +552,10 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       setLinkMessage('One of the chosen sources is already linked. Unlink it first.');
       return;
     }
-    void runLinkSave(pairs => [
-      ...pairs,
-      { leftSourceId: leftChoice, rightSourceId: rightChoice },
-    ]);
+    void runLinkSave(
+      [...currentPairs(entriesRef.current), { leftSourceId: leftChoice, rightSourceId: rightChoice }],
+      replaceConfirmedRef.current,
+    );
   }
 
   function handleUnlink() {
@@ -427,10 +564,11 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       setLinkMessage('Choose a linked source to unlink.');
       return;
     }
-    void runLinkSave(pairs =>
-      pairs.filter(
+    void runLinkSave(
+      currentPairs(entriesRef.current).filter(
         pair => !(pair.leftSourceId === match.leftSourceId && pair.rightSourceId === match.rightSourceId),
       ),
+      replaceConfirmedRef.current,
     );
   }
 
@@ -440,12 +578,13 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
       setLinkMessage('Choose a linked pair to reverse.');
       return;
     }
-    void runLinkSave(pairs =>
-      pairs.map(pair =>
+    void runLinkSave(
+      currentPairs(entriesRef.current).map(pair =>
         pair.leftSourceId === match.leftSourceId && pair.rightSourceId === match.rightSourceId
           ? { leftSourceId: match.rightSourceId, rightSourceId: match.leftSourceId }
           : pair,
       ),
+      replaceConfirmedRef.current,
     );
   }
 
@@ -522,12 +661,13 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
                 <div role="alert" className="iem-stack rounded-panel border border-boundary bg-surface-raised p-4">
                   <p className="text-label text-warning">Replace the saved profile?</p>
                   <p className="text-text-secondary">
-                    The saved defaults belong to a different device or layout. Replacing them
-                    requires your explicit confirmation and a stopped host.
+                    {consentPending.kind === 'links'
+                      ? 'The saved defaults belong to a different device or layout. Replacing them to save stereo links requires your explicit confirmation and a stopped host.'
+                      : 'The saved defaults belong to a different device or layout. Replacing them requires your explicit confirmation and a stopped host.'}
                   </p>
                   <div className="iem-row">
-                    <Button variant="primary" onClick={confirmReplacement}>Confirm save</Button>
-                    <Button onClick={cancelReplacement}>Cancel</Button>
+                    <Button variant="primary" onClick={confirmConsent}>Confirm save</Button>
+                    <Button onClick={cancelConsent}>Cancel</Button>
                   </div>
                 </div>
               )}
@@ -561,7 +701,12 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
                           onReset={() => handleChange(entry.key, 0)}
                         />
                       )}
-                      <SaveState state={status[entry.key] ?? 'idle'} onRetry={() => void flush()} />
+                      <SaveState
+                        state={status[entry.key] ?? 'idle'}
+                        message={statusMessage[entry.key]}
+                        onRetry={() => void flush()}
+                        onReload={reload}
+                      />
                     </li>
                   );
                 })}
@@ -612,7 +757,12 @@ export function SourcesView({ bridge, device, hostRunning = false }: SourcesView
                   <Button disabled={!linkEnabled} onClick={handleReverse}>Reverse</Button>
                 </div>
                 {linkMessage && <p role="status" className="text-caption text-text-secondary">{linkMessage}</p>}
-                <SaveState state={linkStatus} onRetry={() => void runLinkSave(pairs => pairs)} />
+                <SaveState
+                  state={linkStatus}
+                  message={undefined}
+                  onRetry={handleLinkRetry}
+                  onReload={linkReloadNeeded ? reload : undefined}
+                />
               </div>
             </>
           )}
@@ -660,7 +810,17 @@ function ProfileStatus({ settings }: { settings: SourceSettings }) {
   }
 }
 
-function SaveState({ state, onRetry }: { state: SaveStatus; onRetry(): void }) {
+function SaveState({
+  state,
+  message,
+  onRetry,
+  onReload,
+}: {
+  state: SaveStatus;
+  message?: string;
+  onRetry(): void;
+  onReload?: () => void;
+}) {
   if (state === 'saving') {
     return <span role="status" className="text-caption text-text-secondary">Saving…</span>;
   }
@@ -669,15 +829,27 @@ function SaveState({ state, onRetry }: { state: SaveStatus; onRetry(): void }) {
   }
   if (state === 'uncertain') {
     return (
-      <span role="status" className="text-caption text-warning">
-        Installed, but restart durability was not confirmed.
+      <span className="flex flex-wrap items-center gap-2 text-caption text-warning">
+        <span role="status">{message ?? 'Installed, but restart durability was not confirmed.'}</span>
+        <Button size="compact" onClick={onReload ?? onRetry}>Reload</Button>
+      </span>
+    );
+  }
+  if (state === 'conflict') {
+    return (
+      <span className="flex flex-wrap items-center gap-2 text-caption text-warning">
+        <span role="status">
+          {message ?? 'The saved settings changed underneath this request. Reload before retrying.'}
+        </span>
+        <Button size="compact" onClick={onReload ?? onRetry}>Reload</Button>
       </span>
     );
   }
   if (state === 'failed') {
     return (
       <span className="flex flex-wrap items-center gap-2 text-caption text-danger">
-        failed
+        <span role="status">failed</span>
+        {message ? <span className="text-text-secondary">{message}</span> : null}
         <Button size="compact" onClick={onRetry}>Retry</Button>
       </span>
     );

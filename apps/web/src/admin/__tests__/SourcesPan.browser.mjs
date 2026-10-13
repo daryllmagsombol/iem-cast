@@ -26,8 +26,13 @@ try {
 
     const mono = page.getByRole('slider', { name: /browser-test vocal source name default pan/ });
     await expect(mono).toHaveValue('50');
+    // Scope the Saved assertion to the mono source's own entry so the profile line
+    // ("Saved profile is active…") can never satisfy it.
+    const monoEntry = page
+      .getByRole('listitem')
+      .filter({ has: page.getByRole('slider', { name: /browser-test vocal source name default pan/ }) });
     await mono.fill('-50');
-    await expect(page.getByText('Saved').first()).toBeVisible();
+    await expect(monoEntry.getByText('Saved', { exact: true })).toBeVisible();
     assert.equal(await page.evaluate(() => window.sourcesFixture.calls.includes('save-defaults')), true);
 
     // One grouped balance entry for the reciprocal pair; no per-member pan controls.

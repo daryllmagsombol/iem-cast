@@ -245,11 +245,115 @@ test('a rejected save shows failed with Retry; a stale older-revision response k
   await waitFor(() => expect(bridge.saveSourceDefaults).toHaveBeenCalledTimes(2));
   expect(slider).toHaveValue('50');
 
-  // The stale response carries an older committed revision; it must not overwrite the newer draft.
+  // The stale response carries an older committed revision; it must not overwrite the newer draft
+  // and it is recovery-by-reload, not a retry against the stale base.
   second.resolve(makeSettings('dev-a', '4', [sourceA, sourceB]));
-  await waitFor(() => expect(screen.getByText(/failed/)).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument());
+  expect(screen.getByText(/changed underneath this request/i)).toBeInTheDocument();
   expect(screen.queryByText('Saved')).not.toBeInTheDocument();
   expect(slider).toHaveValue('50');
+});
+
+test('a durability-uncertain save shows the uncertain state with Reload and re-reads on reload', async () => {
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': makeSettings('dev-a', '7', [sourceA, sourceB]) });
+  bridge.readSourceSettings = vi.fn(bridge.readSourceSettings);
+  (bridge.saveSourceDefaults as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+    Object.assign(new Error('settings were installed but restart durability is unconfirmed; reload before retrying'), {
+      code: 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN',
+    }),
+  );
+
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+  const slider = await screen.findByRole('slider', { name: /Channel 1 default pan/ });
+  fireEvent.change(slider, { target: { value: '-50' } });
+
+  // An uncertain commit must not read as a plain failure with a retry that can never succeed.
+  expect(await screen.findByText(/restart durability was not confirmed/i)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+
+  // Reload must genuinely re-read settings, not resubmit with the stale base revision.
+  const readsBefore = (bridge.readSourceSettings as ReturnType<typeof vi.fn>).mock.calls.length;
+  fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+  await waitFor(() =>
+    expect((bridge.readSourceSettings as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(readsBefore),
+  );
+  expect(bridge.saveSourceDefaults).toHaveBeenCalledTimes(1);
+});
+
+test('a revision-conflict save surfaces the host message and offers Reload, not Retry', async () => {
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': makeSettings('dev-a', '7', [sourceA, sourceB]) });
+  (bridge.saveSourceDefaults as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+    Object.assign(new Error('base revision 7 does not match the committed revision 8'), {
+      code: 'SOURCE_SETTINGS_REVISION_CONFLICT',
+    }),
+  );
+
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+  const slider = await screen.findByRole('slider', { name: /Channel 1 default pan/ });
+  fireEvent.change(slider, { target: { value: '-50' } });
+
+  expect(await screen.findByText(/does not match the committed revision/i)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+});
+
+test('a failed link save Retry replays the intended pair set and never reports Saved', async () => {
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': makeSettings('dev-a', '1', [sourceA, sourceB]) });
+  (bridge.saveSourceLinks as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('link write failed'));
+
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+  fireEvent.change(await screen.findByLabelText('Left source'), { target: { value: 'src-a' } });
+  fireEvent.change(screen.getByLabelText('Right source'), { target: { value: 'src-b' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+
+  expect(await screen.findByText('failed')).toBeInTheDocument();
+  expect(screen.queryByText('Saved')).not.toBeInTheDocument();
+
+  // Retry must replay the SAME intended mutation, not the currently committed (empty) pair set.
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+  await waitFor(() => expect(bridge.saveSourceLinks).toHaveBeenCalledTimes(2));
+  const calls = (bridge.saveSourceLinks as ReturnType<typeof vi.fn>).mock.calls;
+  expect(calls[1]).toEqual(calls[0]);
+  expect(calls[0]).toEqual(['dev-a', '1', [{ leftSourceId: 'src-a', rightSourceId: 'src-b' }], false]);
+  // Only after a genuine round trip does the grouped pair appear.
+  expect(await screen.findByRole('slider', { name: /Channel 1 and Channel 2 default balance/ })).toBeInTheDocument();
+});
+
+test('a replacement binding routes Link through confirmation and saves with replaceBinding true', async () => {
+  const replacement = makeSettings('dev-a', '1', [sourceA, sourceB], { bindingStatus: 'replacement' });
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': replacement });
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+
+  fireEvent.change(await screen.findByLabelText('Left source'), { target: { value: 'src-a' } });
+  fireEvent.change(screen.getByLabelText('Right source'), { target: { value: 'src-b' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+
+  expect(await screen.findByText('Replace the saved profile?')).toBeInTheDocument();
+  expect(bridge.saveSourceLinks).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm save' }));
+  await waitFor(() =>
+    expect(bridge.saveSourceLinks).toHaveBeenCalledWith('dev-a', '1', [{ leftSourceId: 'src-a', rightSourceId: 'src-b' }], true),
+  );
+});
+
+test('a failed replacement confirm resets consent so the next edit re-confirms', async () => {
+  const replacement = makeSettings('dev-a', '1', [sourceA, sourceB], { bindingStatus: 'replacement' });
+  const bridge = bridgeWith({ 'dev-a': [sourceA, sourceB] }, { 'dev-a': replacement });
+  (bridge.saveSourceDefaults as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('write failed'));
+
+  render(<SourcesView bridge={bridge} device={deviceA} />);
+  const slider = await screen.findByRole('slider', { name: /Channel 1 default pan/ });
+  fireEvent.change(slider, { target: { value: '-50' } });
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Confirm save' }));
+  expect(await screen.findByText('failed')).toBeInTheDocument();
+
+  // A later edit must ask again rather than silently reusing the previous consent.
+  fireEvent.change(slider, { target: { value: '50' } });
+  expect(await screen.findByText('Replace the saved profile?')).toBeInTheDocument();
+  expect(bridge.saveSourceDefaults).toHaveBeenCalledTimes(1);
 });
 
 test('switching device mid-flight discards the previous device save response', async () => {
