@@ -231,15 +231,45 @@ sourceDefaults: { sourceId, pan }[]
 
 ## 8. Operator APIs
 
+### Setup preview and binding consent
+
+The native shell owns one pending binding separately from the committed single profile. Reads
+prepare/reuse an in-memory candidate without writes, committed-state mutation, or revision changes.
+Preview UUIDs remain stable across read, explicit save, and start. Save installs the prepared
+binding plus its final links/defaults in one transaction, never bind-then-save as separate writes.
+
+Core adds pure `prepare_binding(device_id, verified_channels)` and explicit
+`commit_prepared_binding(expected_revision, candidate)`; ordinary commit remains binding-restrictive.
+Compatible legacy candidates retain IDs, map, labels and unresolved links until explicit resolution.
+
+Each source-settings view includes `bindingStatus: 'saved' | 'new' | 'replacement' | 'legacy'`.
+It also reports `durabilityUncertain: boolean` for an installed saved view whose restart durability
+was not confirmed, so a read/reload cannot accidentally relabel that outcome ordinary success.
+Its settings revision always denotes the committed save base, not a saved draft. Both save payloads
+accept optional `replaceBinding`, default false; replacing an incompatible saved profile requires
+explicit consent and a stopped host. Previewing another device cannot alter the active host.
+
+Start may materialize a missing profile or finalize compatible resolved legacy settings while
+preserving prepared IDs. It never silently replaces an incompatible existing profile or resolves
+legacy pair sides. The UI disables Start for unsaved control edits. Compare actual started capture
+channels with the verified binding; tear down on mismatch without silent rebinding.
+
 ### 8.1 Commands
 
 - `read_source_settings({ deviceId }) -> { deviceId, inputChannels, settingsRevision, catalog }`.
+  The returned view also includes `bindingStatus` as defined above.
 - `save_source_defaults({ deviceId, baseSettingsRevision, sourceDefaults })` — takes a **complete**
   vector and validates pair equality, `settingsRevision`, and device binding. It must not install a
   mix or change routing.
 - `save_source_links({ deviceId, baseSettingsRevision, pairs: [{ leftSourceId, rightSourceId }] })`
   — replaces the complete pair set atomically. It requires a **stopped host** and resets affected
   defaults to center, advancing the catalog/routing binding.
+
+Both save operations include optional `replaceBinding: false`; replacement saves require true.
+Current verified-binding default saves remain allowed during capture and affect only future mixes.
+A connection-time catalog provider reads a small committed-projection cache, not native/store
+mutexes. Update that cache after installed commits, including durability-uncertain outcomes, without
+broadcasting or advancing the running routing catalog revision.
 
 ### 8.2 Authorization and wiring
 
