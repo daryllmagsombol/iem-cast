@@ -20,3 +20,10 @@ rust-embed = { version = "8.12", features = ["debug-embed"] }
 uuid = { version = "1.27.0", features = ["v4"] }
 if-addrs = "0.14.0"
 host-core = { path = "../../../crates/host-core" }
+
+[dev-dependencies]
+# Enable the EXISTING tauri dependency's `test` feature for the real-ACL MockRuntime harness.
+# Rust `cfg(test)` does NOT propagate to dependency crates, so the app's own test cfg cannot expose
+# `tauri::test`; the dependency itself must be compiled with this feature. It is dev-only, so the
+# production dependency feature set stays empty and no third-party package is added.
+tauri = { version = "2.12", features = ["test"] }

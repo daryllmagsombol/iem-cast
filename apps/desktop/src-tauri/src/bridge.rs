@@ -67,22 +67,83 @@ pub struct PairingCredential {
 }
 
 /// A source the operator may make available to musicians.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// Carries the truthful configured metadata (`role`, `stereoPair`, `stereoSide`, `defaultPan`) from
+/// the committed/prepared projection, so a valid configured map is never reported as hardcoded
+/// mono. `available`/`available_to_musicians` retain the read-only physical/cast flags.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceInfo {
     pub source_id: String,
     pub physical_index: u16,
     pub label: String,
+    /// Configured role: `inputChannel` or `masterLr`.
+    pub role: String,
     pub available: bool,
     pub available_to_musicians: bool,
+    /// Configured reciprocal stereo peer source id, when this source is linked.
+    pub stereo_pair: Option<String>,
+    /// Configured side (`left`/`right`) when this source is linked.
+    pub stereo_side: Option<String>,
+    /// Configured default pan/balance in `[-1.0, 1.0]`.
+    pub default_pan: f32,
 }
 
 /// A catalog snapshot returned to the operator UI.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogSnapshot {
     pub catalog_revision: String,
     pub sources: Vec<SourceInfo>,
+}
+
+/// Which binding state a [`SourceSettings`] view describes.
+///
+/// The wire strings are exactly `saved`/`new`/`replacement`/`legacy`; the UI distinguishes an
+/// unsaved preview from an installed profile using this, never by comparing revisions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BindingStatus {
+    /// A committed profile that matches the selected device and verified layout.
+    Saved,
+    /// No committed profile yet; the prepared candidate would be a fresh binding.
+    New,
+    /// A committed profile for a different device/layout; installing it needs explicit consent.
+    Replacement,
+    /// A migrated legacy profile with no verified layout (unresolved until explicitly resolved).
+    Legacy,
+}
+
+/// One per-source default pan/balance entry in a save payload.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePanDefaultDto {
+    pub source_id: String,
+    pub pan: f32,
+}
+
+/// One explicit left/right stereo link in a save payload.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceLinkPair {
+    pub left_source_id: String,
+    pub right_source_id: String,
+}
+
+/// The source-settings view for the selected device.
+///
+/// `settings_revision` always denotes the **committed save base** (not a saved draft), so the
+/// caller compares it against the revision it last saw. `durability_uncertain` is `true` only for
+/// an installed view whose restart durability was not confirmed.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSettings {
+    pub device_id: String,
+    pub input_channels: u16,
+    pub settings_revision: String,
+    pub binding_status: BindingStatus,
+    pub durability_uncertain: bool,
+    pub catalog: CatalogSnapshot,
 }
 
 /// Sensible default host-setup values discovered by the desktop backend.
@@ -109,4 +170,46 @@ pub struct HostDefaults {
 pub struct IpcError {
     pub code: String,
     pub message: String,
+}
+
+/// Project a real `host-core` catalog snapshot into the IPC DTO.
+///
+/// This preserves the truthful configured role/pair/side/default metadata; nothing is inferred or
+/// hardcoded. `authorized` maps to `available_to_musicians` and `available` mirrors physical
+/// presence (a configured, committed source is present).
+pub fn catalog_from_core(core: &host_core::contract::CatalogSnapshot) -> CatalogSnapshot {
+    CatalogSnapshot {
+        catalog_revision: core.catalog_revision.to_string(),
+        sources: core
+            .sources
+            .iter()
+            .map(|source| SourceInfo {
+                source_id: source.source_id.to_string(),
+                physical_index: source.physical_index,
+                label: source.label.clone(),
+                role: role_str(source.role),
+                available: source.available,
+                available_to_musicians: source.authorized,
+                stereo_pair: source.stereo_pair.map(|peer| peer.to_string()),
+                stereo_side: source.stereo_side.map(side_str),
+                default_pan: source.default_pan,
+            })
+            .collect(),
+    }
+}
+
+/// The wire string for a configured source role.
+fn role_str(role: host_core::contract::SourceRole) -> String {
+    match role {
+        host_core::contract::SourceRole::InputChannel => "inputChannel".to_string(),
+        host_core::contract::SourceRole::MasterLr => "masterLr".to_string(),
+    }
+}
+
+/// The wire string for a configured stereo side.
+fn side_str(side: host_core::contract::StereoSide) -> String {
+    match side {
+        host_core::contract::StereoSide::Left => "left".to_string(),
+        host_core::contract::StereoSide::Right => "right".to_string(),
+    }
 }

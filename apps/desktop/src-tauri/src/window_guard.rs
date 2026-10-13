@@ -26,6 +26,17 @@ pub fn authorize_window(label: &str) -> Result<(), WindowDenied> {
     }
 }
 
+/// Authorize a caller by its **actual injected window**.
+///
+/// The label is read from the real invoking webview, never from a frontend-supplied argument, so a
+/// spoofed `windowLabel` string cannot impersonate the operator window. This is defence in depth on
+/// top of the capability ACL, which already scopes access to the operator window.
+pub fn authorize_call<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+) -> Result<(), WindowDenied> {
+    authorize_window(window.label())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

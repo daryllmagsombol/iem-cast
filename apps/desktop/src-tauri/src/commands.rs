@@ -5,7 +5,7 @@
 //! catalog. The operator source catalog is read-only and derived from the selected device's real
 //! channel count, using the same mapping the running host publishes to phones.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use host_core::contract::{
     CaptureRequest as CoreCaptureRequest, InterfaceInfo as CoreInterfaceInfo,
@@ -20,9 +20,11 @@ use tauri::State;
 use crate::asset_embed::EmbeddedMusicianAssets;
 use crate::bridge::{
     CatalogSnapshot, DeviceInfo, HostDefaults, InterfaceInfo, IpcError, OutputDeviceInfo,
-    PairingCredential, SourceInfo, StartHostRequest, StartHostResult,
+    PairingCredential, SourceLinkPair, SourcePanDefaultDto, SourceSettings, StartHostRequest,
+    StartHostResult,
 };
-use crate::window_guard::authorize_window;
+use crate::source_settings::{SourceSettingsState, SAMPLE_RATE_HZ};
+use crate::window_guard::{authorize_call, authorize_window};
 
 /// The default HTTPS/WSS control port when the operator does not override it.
 pub const DEFAULT_CONTROL_PORT: u16 = 8443;
@@ -235,6 +237,7 @@ pub fn start_host(
     window_label: String,
     request: StartHostRequest,
     state: State<'_, HostState>,
+    settings: State<'_, SourceSettingsState>,
 ) -> Result<StartHostResult, IpcError> {
     check_caller(&window_label)?;
     let tls = TlsIdentity::new(
@@ -263,18 +266,20 @@ pub fn start_host(
         ));
     }
 
-    // Resolve the physical channel count from the actual device capabilities (enumeration only,
-    // never an audio stream).
-    let channels = host_core::capture::enumerate_input_devices()
-        .into_iter()
-        .find(|d| d.device_id == request.device_id)
-        .map(|d| d.input_channels.max(1))
-        .unwrap_or(2);
+    // Resolve the binding profile for the selected device and capture the projection cache to
+    // install as the fresh-connection catalog provider. No discovery maximum and no unknown-device
+    // fallback: an unverifiable device fails loudly.
+    let (profile, projection) = {
+        let mut manager = settings.lock()?;
+        let profile = manager.resolve_start_profile(&request.device_id)?;
+        (profile, manager.projection())
+    };
+    let channels = profile.input_channels.unwrap_or(0);
 
     let core_request = CoreStartHostRequest {
         capture: CoreCaptureRequest {
             device_id: request.device_id.clone(),
-            sample_rate_hz: 48_000,
+            sample_rate_hz: SAMPLE_RATE_HZ,
             buffer_frames: 128,
         },
         interface: CoreInterfaceInfo {
@@ -295,10 +300,10 @@ pub fn start_host(
         port: 0,
     };
 
-    let channel_map = default_channel_map(channels);
+    // The retained saved/prepared map: never a freshly-invented default map.
+    let channel_map = profile.channel_map.clone();
 
-    // Start against the real capture backend. This is the only hardware-opening path; it is never
-    // exercised by tests.
+    // Start against the real capture backend. This is the only hardware-opening path.
     let session = HostSession::start_real(
         tls.clone(),
         selected,
@@ -306,6 +311,15 @@ pub fn start_host(
         channel_map.clone(),
     )
     .map_err(|error| ipc_err("HOST_START_FAILED", error.to_string()))?;
+
+    // Compare the ACTUAL started capture layout against the verified binding before advertising
+    // server success. A mismatch is torn down; the binding is never silently rebound.
+    let actual_channels = session.configured_channels();
+    if let Err(error) = crate::source_settings::verify_started_channels(channels, actual_channels) {
+        let mut session = session;
+        session.stop();
+        return Err(error);
+    }
 
     let audio_epoch = session.audio_epoch();
 
@@ -315,12 +329,21 @@ pub fn start_host(
     let bind = std::net::SocketAddr::new(interface_ip, port);
     let origin = OriginPolicy::new([control_origin(interface_ip, port)]);
     let catalog = catalog_from_channel_map(&channel_map, CatalogRevision(0));
+    // The provider captures ONLY the committed-projection cache; it never touches the lifecycle or
+    // settings mutex, so a fresh connection cannot deadlock or block on the settings lock.
+    let provider: host_core::host::InitialCatalogProvider = Arc::new(move || {
+        projection
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| catalog_from_channel_map(&[], CatalogRevision(0)))
+    });
     let config = ServerConfig {
         tls,
         bind,
         origin,
         assets: EmbeddedMusicianAssets::new().into_provider(),
         catalog,
+        initial_catalog_provider: Some(provider),
     };
     let server = session
         .start_server(config)
@@ -398,25 +421,12 @@ fn resolve_channels(device_id: Option<&str>) -> Option<u16> {
 /// Build an honest, read-only catalog for a resolved channel count.
 ///
 /// The rows come from the same `default_channel_map` + `catalog_from_channel_map` the running host
-/// uses, so two channels stay two rows and twenty-two stay twenty-two. This never falls back to a
-/// fabricated 22-channel list.
+/// uses, so two channels stay two rows and twenty-two stay twenty-two. Every configured metadata
+/// field (role/pair/side/default pan) is carried truthfully from that map; nothing is hardcoded.
+/// This never falls back to a fabricated 22-channel list.
 fn catalog_for_channels(channels: u16) -> CatalogSnapshot {
     let catalog = catalog_from_channel_map(&default_channel_map(channels), CatalogRevision(0));
-    CatalogSnapshot {
-        catalog_revision: catalog.catalog_revision.to_string(),
-        sources: catalog
-            .sources
-            .into_iter()
-            .map(|source| SourceInfo {
-                source_id: source.source_id.to_string(),
-                physical_index: source.physical_index,
-                label: source.label,
-                // Read-only build: physical presence and cast flag both mirror the device catalog.
-                available: source.available,
-                available_to_musicians: source.authorized,
-            })
-            .collect(),
-    }
+    crate::bridge::catalog_from_core(&catalog)
 }
 
 /// Build the read-only catalog for a device id, or an explicit empty catalog when it is unknown.
@@ -433,15 +443,34 @@ fn catalog_for_device(device_id: Option<&str>) -> CatalogSnapshot {
 
 /// Read-only operator catalog of the SELECTED device's real input channels. Operator-window only.
 ///
-/// `device_id` identifies the selected capture device. When it is absent or unknown the catalog is
-/// explicitly empty; it is never the old hardcoded 22-channel draft.
+/// `device_id` identifies the selected capture device. When a committed/prepared binding for the
+/// same device is available it is projected truthfully (real role/pair/side/default metadata);
+/// otherwise the discovered channel count yields a mono preview. When the device is absent or
+/// unknown the catalog is explicitly empty; it is never the old hardcoded 22-channel draft.
 #[tauri::command]
 pub fn source_catalog(
     window_label: String,
     device_id: Option<String>,
+    settings: State<'_, SourceSettingsState>,
 ) -> Result<CatalogSnapshot, IpcError> {
-    check_caller(&window_label)?;
-    Ok(catalog_for_device(device_id.as_deref()))
+    source_catalog_impl(&window_label, &settings, device_id.as_deref())
+}
+
+/// Testable core of [`source_catalog`].
+fn source_catalog_impl(
+    window_label: &str,
+    settings: &SourceSettingsState,
+    device_id: Option<&str>,
+) -> Result<CatalogSnapshot, IpcError> {
+    check_caller(window_label)?;
+    // When a committed/prepared binding for the same device is available, project it truthfully.
+    let projected = device_id
+        .and_then(|id| settings.lock().ok()?.read_view(id).ok())
+        .map(|view| view.catalog);
+    match projected {
+        Some(catalog) if !catalog.sources.is_empty() => Ok(catalog),
+        _ => Ok(catalog_for_device(device_id)),
+    }
 }
 
 /// Editing the source set is not supported in this build. Operator-window only.
@@ -569,6 +598,132 @@ fn stop_monitor_impl(window_label: &str, state: &HostState) -> Result<(), IpcErr
         host.monitor = None;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Source settings: read / save defaults / save links
+// ---------------------------------------------------------------------------------------------
+
+/// Read the source-settings view for the selected device. Operator-window only. Never writes.
+#[tauri::command]
+pub fn read_source_settings<R: tauri::Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, SourceSettingsState>,
+    device_id: String,
+) -> Result<SourceSettings, IpcError> {
+    authorize_call(&window).map_err(|_| ipc_err("WINDOW_FORBIDDEN", "caller is not the operator window"))?;
+    read_source_settings_impl(window.label(), &state, &device_id)
+}
+
+/// Testable core of [`read_source_settings`].
+fn read_source_settings_impl(
+    window_label: &str,
+    state: &SourceSettingsState,
+    device_id: &str,
+) -> Result<SourceSettings, IpcError> {
+    check_caller(window_label)?;
+    let mut manager = state.lock()?;
+    manager.read_view(device_id)
+}
+
+/// Save a complete default-pan vector for the selected device. Operator-window only.
+///
+/// A compatible saved binding may be updated while the host runs; a new/legacy/replacement binding
+/// requires a stopped host, and a replacement additionally requires explicit `replaceBinding`.
+#[tauri::command]
+pub fn save_source_defaults<R: tauri::Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, SourceSettingsState>,
+    host: State<'_, HostState>,
+    device_id: String,
+    base_settings_revision: String,
+    source_defaults: Vec<SourcePanDefaultDto>,
+    replace_binding: Option<bool>,
+) -> Result<SourceSettings, IpcError> {
+    authorize_call(&window).map_err(|_| ipc_err("WINDOW_FORBIDDEN", "caller is not the operator window"))?;
+    save_source_defaults_impl(
+        window.label(),
+        &state,
+        &host,
+        &device_id,
+        &base_settings_revision,
+        &source_defaults,
+        replace_binding.unwrap_or(false),
+    )
+}
+
+/// Testable core of [`save_source_defaults`].
+fn save_source_defaults_impl(
+    window_label: &str,
+    state: &SourceSettingsState,
+    host: &HostState,
+    device_id: &str,
+    base_settings_revision: &str,
+    source_defaults: &[SourcePanDefaultDto],
+    replace_binding: bool,
+) -> Result<SourceSettings, IpcError> {
+    check_caller(window_label)?;
+    let running = host_is_running(host)?;
+    let mut manager = state.lock()?;
+    manager.save_defaults(
+        running,
+        device_id,
+        base_settings_revision,
+        source_defaults,
+        replace_binding,
+    )
+}
+
+/// Save a complete explicit link set for the selected device. Operator-window only.
+///
+/// Requires a stopped host and resets affected defaults to center.
+#[tauri::command]
+pub fn save_source_links<R: tauri::Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, SourceSettingsState>,
+    host: State<'_, HostState>,
+    device_id: String,
+    base_settings_revision: String,
+    pairs: Vec<SourceLinkPair>,
+    replace_binding: Option<bool>,
+) -> Result<SourceSettings, IpcError> {
+    authorize_call(&window).map_err(|_| ipc_err("WINDOW_FORBIDDEN", "caller is not the operator window"))?;
+    save_source_links_impl(
+        window.label(),
+        &state,
+        &host,
+        &device_id,
+        &base_settings_revision,
+        &pairs,
+        replace_binding.unwrap_or(false),
+    )
+}
+
+/// Testable core of [`save_source_links`].
+fn save_source_links_impl(
+    window_label: &str,
+    state: &SourceSettingsState,
+    host: &HostState,
+    device_id: &str,
+    base_settings_revision: &str,
+    pairs: &[SourceLinkPair],
+    replace_binding: bool,
+) -> Result<SourceSettings, IpcError> {
+    check_caller(window_label)?;
+    let running = host_is_running(host)?;
+    let mut manager = state.lock()?;
+    manager.save_links(
+        running,
+        device_id,
+        base_settings_revision,
+        pairs,
+        replace_binding,
+    )
+}
+
+/// Whether a host is currently running, without holding the slot past the check.
+fn host_is_running(host: &HostState) -> Result<bool, IpcError> {
+    Ok(host.lock()?.is_some())
 }
 
 #[cfg(test)]
@@ -803,8 +958,17 @@ mod tests {
 
     #[test]
     fn source_catalog_rejects_a_non_operator_window() {
-        let error = source_catalog("musician".to_string(), None).expect_err("must reject");
+        let state = test_settings_state();
+        let error = source_catalog_impl("musician", &state, None).expect_err("must reject");
         assert_eq!(error.code, "WINDOW_FORBIDDEN");
+    }
+
+    /// An empty, temporary source-settings state for tests that must never touch real user data.
+    fn test_settings_state() -> crate::source_settings::SourceSettingsState {
+        crate::source_settings::SourceSettingsState::open(
+            unique_temp_dir("settings-fixture").join("source-settings.json"),
+            std::sync::Arc::new(crate::source_settings::SystemCaptureIdentity),
+        )
     }
 
     #[test]
@@ -838,5 +1002,35 @@ mod tests {
                 .code,
             "WINDOW_FORBIDDEN"
         );
+    }
+
+    #[test]
+    fn read_source_settings_rejects_a_foreign_window() {
+        let settings = test_settings_state();
+        let host = HostState::default();
+        let error = read_source_settings_impl("other", &settings, "dev")
+            .expect_err("must reject");
+        assert_eq!(error.code, "WINDOW_FORBIDDEN");
+        // The host state is irrelevant to the guard, which runs first.
+        let _ = host;
+    }
+
+    #[test]
+    fn save_source_links_rejects_a_foreign_window() {
+        let settings = test_settings_state();
+        let host = HostState::default();
+        let error = save_source_links_impl("musician", &settings, &host, "dev", "0", &[], false)
+            .expect_err("must reject");
+        assert_eq!(error.code, "WINDOW_FORBIDDEN");
+    }
+
+    #[test]
+    fn save_source_defaults_rejects_a_foreign_window() {
+        let settings = test_settings_state();
+        let host = HostState::default();
+        let error =
+            save_source_defaults_impl("other", &settings, &host, "dev", "0", &[], false)
+                .expect_err("must reject");
+        assert_eq!(error.code, "WINDOW_FORBIDDEN");
     }
 }
