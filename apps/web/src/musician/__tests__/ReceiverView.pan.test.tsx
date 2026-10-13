@@ -172,3 +172,79 @@ test('pair_group_preserves_independent_gain_edits_without_touching_balance', () 
   expect(onChannelGainChange).toHaveBeenCalledWith('L', -24);
   expect(onPairBalanceChange).not.toHaveBeenCalled();
 });
+
+test('valid_reciprocal_both_masterlr_pair_renders_the_group_and_one_balance_wired_to_pair_callback', () => {
+  const onPairBalanceChange = vi.fn();
+  const onChannelPanChange = vi.fn();
+  const catalog = [
+    source({ sourceId: 'mL', label: 'Master L', role: 'masterLr', stereoPair: 'mR', stereoSide: 'left' }),
+    source({ sourceId: 'mR', label: 'Master R', role: 'masterLr', stereoPair: 'mL', stereoSide: 'right' }),
+  ];
+  renderView({
+    catalog,
+    channels: [channel('mL', 'Master L', { pan: 0.3 }), channel('mR', 'Master R', { pan: 0.3 })],
+    onPairBalanceChange,
+    onChannelPanChange,
+  });
+
+  // A paired MasterLr uses the balance law: a grouped pair with one shared balance, never mono pan.
+  expect(screen.getByText('Linked stereo pair')).toBeInTheDocument();
+  expect(screen.getByRole('slider', { name: 'Master L / Master R balance' })).toHaveValue('30');
+  expect(screen.queryByRole('slider', { name: 'Master L pan' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('slider', { name: 'Master R pan' })).not.toBeInTheDocument();
+
+  fireEvent.change(screen.getByRole('slider', { name: 'Master L / Master R balance' }), { target: { value: '50' } });
+  expect(onPairBalanceChange).toHaveBeenCalledWith('mL', 'mR', 0.5);
+  expect(onChannelPanChange).not.toHaveBeenCalled();
+});
+
+test('reciprocal_pair_with_mismatched_roles_is_a_disabled_invalid_pair', () => {
+  const onPairBalanceChange = vi.fn();
+  const catalog = [
+    source({ sourceId: 'L', label: 'Keys L', role: 'inputChannel', stereoPair: 'R', stereoSide: 'left' }),
+    source({ sourceId: 'R', label: 'Keys R', role: 'masterLr', stereoPair: 'L', stereoSide: 'right' }),
+  ];
+  renderView({
+    catalog,
+    channels: [channel('L', 'Keys L'), channel('R', 'Keys R')],
+    onPairBalanceChange,
+  });
+  const balance = screen.getByRole('slider', { name: 'Keys L / Keys R balance' });
+  expect(balance).toBeDisabled();
+  fireEvent.change(balance, { target: { value: '70' } });
+  expect(onPairBalanceChange).not.toHaveBeenCalled();
+  expect(screen.getByText('Stereo balance unavailable.')).toBeInTheDocument();
+});
+
+test('a_present_pair_member_is_never_rendered_twice', () => {
+  const catalog = [
+    source({ sourceId: 'L', label: 'Keys L', stereoPair: 'R', stereoSide: 'left' }),
+    source({ sourceId: 'R', label: 'Keys R', stereoPair: 'L', stereoSide: 'right' }),
+  ];
+  renderView({ catalog, channels: [channel('L', 'Keys L'), channel('R', 'Keys R')] });
+  // One group with exactly one label heading per member, not a duplicated mono strip as well.
+  expect(screen.getAllByText('Linked stereo pair')).toHaveLength(1);
+  expect(screen.getAllByRole('slider', { name: 'Keys L' })).toHaveLength(1);
+  expect(screen.getAllByRole('slider', { name: 'Keys R' })).toHaveLength(1);
+});
+
+test('legacy_masterlr_with_a_dangling_pair_renders_the_disabled_invalid_pair_group', () => {
+  const onPairBalanceChange = vi.fn();
+  // MasterLr points at a peer that does not reciprocate — incomplete, so it must fail closed and
+  // show the disabled group (accepted behavior change), never a mono pan.
+  const catalog = [
+    source({ sourceId: 'mL', label: 'Master L', role: 'masterLr', stereoPair: 'mR', stereoSide: 'left' }),
+    source({ sourceId: 'mR', label: 'Master R', role: 'masterLr', stereoPair: null, stereoSide: null }),
+  ];
+  renderView({
+    catalog,
+    channels: [channel('mL', 'Master L'), channel('mR', 'Master R')],
+    onPairBalanceChange,
+  });
+  expect(screen.getByText('Stereo balance unavailable.')).toBeInTheDocument();
+  const balance = screen.getByRole('slider', { name: 'Master L / Master R balance' });
+  expect(balance).toBeDisabled();
+  expect(screen.queryByRole('slider', { name: 'Master L pan' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('slider', { name: 'Master R pan' })).not.toBeInTheDocument();
+});
+

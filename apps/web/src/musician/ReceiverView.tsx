@@ -94,20 +94,36 @@ export function ReceiverView(props: ReceiverViewProps) {
       const peer = peerId ? sourceById.get(peerId) : undefined;
       const peerChannel = peerId ? channels.find(c => c.sourceId === peerId) : undefined;
       const reciprocal = !!peerId && peer?.stereoPair === channel.sourceId;
+      // A peer already consumed by an earlier unit must never render a second time.
+      const peerAlreadySeen = !!peer && seen.has(peer.sourceId);
       const validPair =
         reciprocal &&
+        !peerAlreadySeen &&
         !!source &&
         !!peer &&
         !!peerChannel &&
+        source.role === peer.role &&
         source.stereoSide !== null &&
         peer.stereoSide !== null &&
         source.stereoSide !== peer.stereoSide;
-      // `stereoPair` is set but the pair is not complete/valid: keep it a disabled group so it can
-      // never silently degrade into two independent mono pan controls.
-      if (peerId && source && source.role !== 'masterLr') {
+      // Any source that declares a `stereoPair` (including a MasterLr) is handled as a group: a valid
+      // reciprocal pair renders two member strips plus ONE shared balance; anything incomplete,
+      // non-reciprocal, role-mismatched, unavailable, or already-consumed fails closed to a disabled
+      // group. It never degrades into independent mono pan controls. Only an UNPAIRED source
+      // (peerId null) — e.g. legacy MasterLr — takes the mono branch and gets no pan.
+      if (peerId && source) {
         if (!validPair) {
-          if (peerChannel) seen.add(peerChannel.sourceId);
-          return { kind: 'invalid-pair' as const, source, peer: peer ?? null, channel, peerChannel: peerChannel ?? null };
+          // Skip a peer that a prior unit already rendered so it cannot be duplicated.
+          const reusablePeer = peerChannel && peer && !seen.has(peer.sourceId) ? peer : null;
+          const reusablePeerChannel = reusablePeer ? peerChannel! : null;
+          if (reusablePeerChannel) seen.add(reusablePeerChannel.sourceId);
+          return {
+            kind: 'invalid-pair' as const,
+            source,
+            peer: reusablePeer,
+            channel,
+            peerChannel: reusablePeerChannel,
+          };
         }
         seen.add(peer!.sourceId);
         const left = source.stereoSide === 'left' ? source : peer!;

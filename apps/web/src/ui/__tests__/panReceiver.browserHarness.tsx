@@ -53,9 +53,12 @@ export function mountPanReceiver() {
     source({ sourceId: 'vocal', label: LONG, role: 'masterLr', defaultPan: 0 }),
     source({ sourceId: 'keysL', label: 'Keys L', stereoPair: 'keysR', stereoSide: 'left', defaultPan: 0.4 }),
     source({ sourceId: 'keysR', label: 'Keys R', stereoPair: 'keysL', stereoSide: 'right', defaultPan: 0.4 }),
+    // VALID reciprocal both-masterLr pair: must render as a grouped pair with one balance.
+    source({ sourceId: 'masterL', label: 'Master L', role: 'masterLr', stereoPair: 'masterR', stereoSide: 'left', defaultPan: 0.1 }),
+    source({ sourceId: 'masterR', label: 'Master R', role: 'masterLr', stereoPair: 'masterL', stereoSide: 'right', defaultPan: 0.1 }),
     ...invalidCatalog,
   ];
-  const channels = [channel('vocal', LONG), channel('keysL', 'Keys L', 0.4), channel('keysR', 'Keys R', 0.4), channel('orphanL', `${LONG} L`), channel('orphanR', `${LONG} R`)];
+  const channels = [channel('vocal', LONG), channel('keysL', 'Keys L', 0.4), channel('keysR', 'Keys R', 0.4), channel('masterL', 'Master L', 0.1), channel('masterR', 'Master R', 0.1), channel('orphanL', `${LONG} L`), channel('orphanR', `${LONG} R`)];
 
   function render(phase: 'armed' | 'ready-muted') {
     root.render(

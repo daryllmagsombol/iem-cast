@@ -257,11 +257,42 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
         });
       }}
       // Mono pan: update ONLY this source's pan; gains, mutes, master, and arm are untouched.
+      // A member of a linked pair must never emit a half-pair edit the actor would reject, so a
+      // per-source pan intent for a paired source is routed to BOTH reciprocal members atomically
+      // (equivalent to the pair balance path). An unpaired source keeps the mono behavior.
       onChannelPanChange={(id, pan) => {
+        const catalogById = new Map(snapshot.catalog.sources.map(s => [s.sourceId, s]));
+        const source = catalogById.get(id);
+        const peerId = source?.stereoPair ?? null;
+        const peer = peerId ? catalogById.get(peerId) : undefined;
+        const members = display?.sources ?? [];
+        const inDisplay = (memberId: string) => members.some(s => s.sourceId === memberId);
+        if (
+          peerId &&
+          peer &&
+          peer.stereoPair === id &&
+          source?.role === peer.role &&
+          source.available &&
+          source.authorized &&
+          peer.available &&
+          peer.authorized &&
+          inDisplay(id) &&
+          inDisplay(peerId)
+        ) {
+          edit({
+            sources: members.map(s =>
+              s.sourceId === id || s.sourceId === peerId ? { ...s, pan } : s,
+            ),
+          });
+          return;
+        }
+        // Paired but not validly routable: refuse to emit a half-pair edit rather than let the
+        // actor reject it. An unpaired source (peerId null) still takes the mono edit below.
+        if (peerId) return;
         edit({
-          sources: display?.sources.map(s =>
+          sources: members.map(s =>
             s.sourceId === id ? { ...s, pan } : s,
-          ) ?? [],
+          ),
         });
       }}
       // Stereo balance: update BOTH pair members' pan atomically in one patch, preserving each

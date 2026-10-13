@@ -25,17 +25,29 @@ try {
     const events = () => page.evaluate(() => window.panReceiver.events);
 
     // Mono non-master source would be pannable; the fixture's mono source is masterLr (no pan).
-    // Valid pair: exactly one balance, two member gain sliders + mutes.
-    await expect(page.getByText('Linked stereo pair')).toHaveCount(2);
+    // Valid pairs: Keys pair AND the both-masterLr pair each render one shared balance; plus the
+    // disabled invalid-pair group => three "Linked stereo pair" headings.
+    await expect(page.getByText('Linked stereo pair')).toHaveCount(3);
     const balance = page.getByRole('slider', { name: 'Keys L / Keys R balance', exact: true });
     await expect(balance).toHaveValue('40');
     await expect(page.getByRole('slider', { name: 'Keys L', exact: true })).toHaveCount(1);
     await expect(page.getByRole('slider', { name: 'Keys R', exact: true })).toHaveCount(1);
     await expect(page.getByText('Left · Keys L')).toBeVisible();
     await expect(page.getByText('Right · Keys R')).toBeVisible();
-    await expect(page.getByTestId('pair-balance-helper')).toHaveText(
+    const keysGroup = page.getByRole('region', { name: 'Keys L and Keys R stereo pair' });
+    await expect(keysGroup.getByTestId('pair-balance-helper')).toHaveText(
       'Center keeps left and right unchanged. Moving toward one side turns down the other side.',
     );
+
+    // A VALID reciprocal both-masterLr pair uses the balance law: grouped pair, one shared balance,
+    // and no per-member mono pan.
+    const masterBalance = page.getByRole('slider', { name: 'Master L / Master R balance', exact: true });
+    await expect(masterBalance).toBeEnabled();
+    await expect(masterBalance).toHaveValue('10');
+    await expect(page.getByRole('slider', { name: 'Master L pan', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('slider', { name: 'Master R pan', exact: true })).toHaveCount(0);
+    await masterBalance.fill('50');
+    await expect.poll(events).toContainEqual({ kind: 'balance', args: ['masterL', 'masterR', 0.5] });
 
     // Invalid (non-reciprocal) pair: its balance is disabled and it exposes no per-member pan.
     const invalidBalance = page.getByRole('slider', { name: `${'A deliberately long browser-test vocal source name'} L / ${'A deliberately long browser-test vocal source name'} R balance`, exact: true });

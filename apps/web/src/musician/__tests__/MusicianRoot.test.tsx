@@ -100,25 +100,29 @@ test('first edit seeds the shared template defaults (nonzero pan) and adjusts on
   expect(props.channels.map(c => c.requestedDb)).toEqual([-60, -60]);
   expect(props.channels.every(c => c.muted)).toBe(true);
 
-  // Simulate a first mono pan edit through the forwarded callback, then a gain edit.
+  // Simulate a first mono pan edit through the forwarded callback for a paired source. A linked
+  // pair member routes to BOTH members atomically (no half-pair intent), so the right member moves
+  // with the left; gain/mute stay at the seeded template.
   props.onChannelPanChange('left', -0.25);
   await screen.findByTestId('receiver-view');
   await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0));
   const patch = calls.at(-1)!;
-  // The explicit pan edit lands on the left member only; the right keeps the seeded default.
   expect(patch.sources).toEqual([
     { sourceId: 'left', gainDb: -60, muted: true, pan: -0.25 },
-    { sourceId: 'right', gainDb: -60, muted: true, pan: 0.35 },
+    { sourceId: 'right', gainDb: -60, muted: true, pan: -0.25 },
   ]);
 });
 
-test('onChannelPanChange updates only that source pan, leaving gain/mute/master/arm untouched', async () => {
+test('onChannelPanChange on an unpaired source updates only that source, leaving gain/mute/master/arm untouched', async () => {
   const calls: MixPatch[] = [];
+  const soloCatalog = [
+    { sourceId: 'solo', physicalIndex: 0, label: 'Solo', role: 'inputChannel' as const, authorized: true, available: true, stereoPair: null, stereoSide: null, defaultPan: 0 },
+  ];
   const controller = mockController(snapshot({
+    catalog: { catalogRevision: '1' as never, sources: soloCatalog },
     accepted_mix: { catalogRevision: '1' as never, mixRevision: '1' as never, masterDb: -18, masterMuted: false,
       sources: [
-        { sourceId: 'left', gainDb: -12, muted: false, pan: 0 },
-        { sourceId: 'right', gainDb: -6, muted: true, pan: 0 },
+        { sourceId: 'solo', gainDb: -12, muted: false, pan: 0 },
       ] },
   }));
   controller.requestMix = (patch => {
@@ -128,14 +132,13 @@ test('onChannelPanChange updates only that source pan, leaving gain/mute/master/
   }) as ReceiverController['requestMix'];
 
   render(<MusicianRoot controller={controller} />);
-  viewProps.current!.onChannelPanChange('left', 0.5);
+  viewProps.current!.onChannelPanChange('solo', 0.5);
   await vi.waitFor(() => expect(calls.length).toBe(1));
   const patch = calls[0];
   expect(patch.masterDb).toBe(-18);
   expect(patch.masterMuted).toBe(false);
   expect(patch.sources).toEqual([
-    { sourceId: 'left', gainDb: -12, muted: false, pan: 0.5 },
-    { sourceId: 'right', gainDb: -6, muted: true, pan: 0 },
+    { sourceId: 'solo', gainDb: -12, muted: false, pan: 0.5 },
   ]);
 });
 
@@ -210,3 +213,29 @@ test('an invalid pair intent emits no half edit', async () => {
   await new Promise(r => setTimeout(r, 0));
   expect(calls).toHaveLength(0);
 });
+
+test('a mono pan intent on a linked pair member is routed to both members, never a half-pair edit', async () => {
+  const calls: MixPatch[] = [];
+  const controller = mockController(snapshot({
+    accepted_mix: { catalogRevision: '1' as never, mixRevision: '1' as never, masterDb: -18, masterMuted: true,
+      sources: [
+        { sourceId: 'left', gainDb: -12, muted: false, pan: 0 },
+        { sourceId: 'right', gainDb: -6, muted: true, pan: 0 },
+      ] },
+  }));
+  controller.requestMix = (patch => {
+    calls.push(patch);
+    return Promise.resolve({ acceptedRevision: '2' as never, catalogRevision: patch.catalogRevision,
+      canonicalSettings: { ...patch, mixRevision: '2' as never } });
+  }) as ReceiverController['requestMix'];
+
+  render(<MusicianRoot controller={controller} />);
+  // 'left' is a member of the reciprocal left/right pair; a per-source pan must not emit a half edit.
+  viewProps.current!.onChannelPanChange('left', -0.25);
+  await vi.waitFor(() => expect(calls.length).toBe(1));
+  expect(calls[0].sources).toEqual([
+    { sourceId: 'left', gainDb: -12, muted: false, pan: -0.25 },
+    { sourceId: 'right', gainDb: -6, muted: true, pan: -0.25 },
+  ]);
+});
+
