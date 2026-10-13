@@ -109,6 +109,30 @@ describe('initialMix', () => {
     ]);
   });
 
+  test('a non-reciprocal one-sided marker excludes the claiming source and its peer', () => {
+    const base = (overrides: Partial<SourceInfo>, sourceId: string): SourceInfo => ({
+      sourceId,
+      physicalIndex: 0,
+      label: sourceId,
+      role: 'inputChannel',
+      authorized: true,
+      available: true,
+      stereoPair: null,
+      stereoSide: null,
+      defaultPan: 0,
+      ...overrides,
+    });
+    // A claims B, but B claims nobody. Neither may seed as an independent mono source.
+    const oneSided: CatalogSnapshot = {
+      catalogRevision: '7' as CounterString,
+      sources: [
+        base({ stereoPair: 'b', stereoSide: 'left' }, 'a'),
+        base({ stereoPair: null, stereoSide: null }, 'b'),
+      ],
+    };
+    expect(initialMix(oneSided).sources).toEqual([]);
+  });
+
   test('an unpaired masterLr keeps a fixed safe center setting', () => {
     const catalog: CatalogSnapshot = {
       catalogRevision: '7' as CounterString,

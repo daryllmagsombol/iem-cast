@@ -784,6 +784,31 @@ describe('receiver controller pan normalization and seeding', () => {
     controller.disconnect();
   });
 
+  test('a resolved legacy ack without pan carries a normalized numeric pan to the caller', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    // A legacy/partial ack omits `pan`. The snapshot is normalized, so the value handed back to
+    // `MusicianRoot` via `requestMix(...).then(...)` must be normalized too — otherwise its intent
+    // keeps `pan: undefined` while the applied echo normalizes to 0 and `Applied` never matches.
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(async patch => ({
+      acceptedRevision: counter('12'),
+      catalogRevision: patch.catalogRevision,
+      canonicalSettings: {
+        catalogRevision: patch.catalogRevision,
+        mixRevision: counter('12'),
+        sources: [{ sourceId: 'ch1', gainDb: -9, muted: false } as never],
+        masterDb: 0,
+        masterMuted: false,
+      },
+    }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const ack = await controller.requestMix(panPatch(0.4));
+    expect(ack.canonicalSettings.sources[0].pan).toBe(0);
+    // The resolved value must agree with the recorded accepted snapshot (single source of truth).
+    expect(ack.canonicalSettings).toEqual(controller.getSnapshot().accepted_mix);
+    controller.disconnect();
+  });
+
   test('a same-session resume keeps its accepted pan even when the catalog default changes', async () => {
     const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
     const controller = createReceiverController(ports);

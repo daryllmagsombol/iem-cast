@@ -159,7 +159,10 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
         };
         mixError = null;
         emit();
-        for (const waiter of batch.waiters) waiter.resolve(ack);
+        // Resolve waiters with the SAME normalized canonical value recorded as `accepted_mix`, so a
+        // legacy/partial ack that omits `pan` cannot hand the caller a raw `pan: undefined` (which
+        // would never match the normalized applied echo).
+        for (const waiter of batch.waiters) waiter.resolve({ ...ack, canonicalSettings: accepted });
       } catch (error) {
         if (batch.canceled || batch.signal.aborted) return;
         mixError = error instanceof Error ? error.message : 'The host could not accept this mix.';

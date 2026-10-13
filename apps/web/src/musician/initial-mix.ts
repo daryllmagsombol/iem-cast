@@ -120,9 +120,25 @@ export function initialMix(catalog: CatalogSnapshot): MixSnapshot {
   const usable = (source: SourceInfo | undefined): source is SourceInfo =>
     !!source && source.available && source.authorized;
 
+  // A link is valid only when it is **reciprocal**: each member names the other. Collect every id
+  // touched by a one-sided declaration (a source that names a peer that does not name it back) so
+  // such a claim can never seed a lone mono source or an independent half of a pair.
+  const nonReciprocal = new Set<string>();
+  for (const source of catalog.sources) {
+    const peerId = source.stereoPair;
+    if (!peerId) continue;
+    const peer = byId.get(peerId);
+    if (!peer || peer.stereoPair !== source.sourceId) {
+      nonReciprocal.add(source.sourceId);
+      if (peer) nonReciprocal.add(peer.sourceId);
+    }
+  }
+
   const sources: SourceGain[] = catalog.sources
     .filter(source => {
       if (!usable(source)) return false;
+      // Any source involved in a non-reciprocal declaration is excluded as a unit.
+      if (nonReciprocal.has(source.sourceId)) return false;
       // A linked member is valid only when its reciprocal peer is also present and usable.
       if (source.stereoPair) return usable(byId.get(source.stereoPair));
       return true;
