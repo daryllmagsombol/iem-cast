@@ -1031,8 +1031,9 @@ fn prepare_binding_is_pure_and_retains_compatible_ids_map_labels_and_defaults() 
 
 #[test]
 fn repeat_prepare_binding_returns_stable_ids() {
-    // Repeated compatible preparation must be deterministic: the native shell caches this pending
-    // candidate, so re-reading cannot churn UUIDs or committed state.
+    // A compatible preparation is a pure projection of committed identity, so repeating it yields
+    // the same ids/defaults without touching committed state. (Stable ids for a *new* pending
+    // binding are the native shell's cache responsibility, not this core helper's.)
     let dir = temp_dir("prepare-repeat");
     let path = dir.join("config.json");
     let mut store = ConfigStore::open(&path).unwrap();
@@ -1060,6 +1061,16 @@ fn prepare_binding_for_a_new_or_incompatible_binding_mints_fresh_ids_and_clears_
     let mut store = ConfigStore::open(&path).unwrap();
     let existing = store.bind("A", 2, 0).expect("bind A");
     let existing_ids: Vec<SourceId> = existing.channel_map.iter().map(|e| e.source_id).collect();
+
+    // Commit a real source-bound label plus a non-center default so clearing is observable.
+    let mut labeled = existing.clone();
+    labeled.labels = vec![(existing_ids[0], "Kick".to_string())];
+    labeled.source_defaults = vec![
+        SourcePanDefault { source_id: existing_ids[0], pan: -0.4 },
+        SourcePanDefault { source_id: existing_ids[1], pan: 0.3 },
+    ];
+    store.commit(1, labeled).expect("commit labeled binding");
+    assert_eq!(store.committed().labels.len(), 1, "a real label is committed");
     let bytes_before = fs::read(&path).unwrap();
 
     // A different device: fresh mono ids, centered defaults, no source-bound labels.
@@ -1077,9 +1088,12 @@ fn prepare_binding_for_a_new_or_incompatible_binding_mints_fresh_ids_and_clears_
         prepared.source_defaults.iter().all(|d| d.pan == 0.0),
         "fresh defaults are centered"
     );
-    assert!(prepared.labels.is_empty(), "source-bound labels are cleared");
+    assert!(
+        prepared.labels.is_empty(),
+        "the committed source-bound label is cleared on a new binding"
+    );
 
-    // An incompatible layout on the SAME device also mints fresh identity.
+    // An incompatible layout on the SAME device also mints fresh identity and clears labels.
     let incompatible = store.prepare_binding("A", 4).expect("prepare a new layout");
     let incompatible_ids: Vec<SourceId> =
         incompatible.channel_map.iter().map(|e| e.source_id).collect();
@@ -1087,9 +1101,13 @@ fn prepare_binding_for_a_new_or_incompatible_binding_mints_fresh_ids_and_clears_
         incompatible_ids, existing_ids,
         "a layout change under the same uid is a fresh binding"
     );
+    assert!(
+        incompatible.labels.is_empty(),
+        "the committed label is cleared on an incompatible layout too"
+    );
 
     assert_eq!(store.committed().device_id.as_deref(), Some("A"), "committed untouched");
-    assert_eq!(store.revision(), 1, "prepare never advances the revision");
+    assert_eq!(store.revision(), 2, "prepare never advances the revision");
     assert_eq!(fs::read(&path).unwrap(), bytes_before, "prepare never writes");
 
     fs::remove_dir_all(&dir).ok();
@@ -1192,7 +1210,12 @@ fn prepared_unresolved_legacy_candidate_is_rejected_by_commit_until_resolved() {
 #[test]
 fn prepared_commit_installs_exact_supplied_ids_and_final_custom_pan_in_one_write() {
     // Prepare a fresh binding, then install a fully-formed candidate that carries preview ids plus a
-    // final custom pan. The exact supplied ids/defaults must be what reopens, in a single write.
+    // final custom pan. The exact supplied ids/defaults must be what reopens.
+    //
+    // "One write" is established by source inspection: `commit_prepared_binding` delegates to the
+    // same `persist_candidate`/`write_atomic` path as the ordinary commit, so there is exactly one
+    // atomic replacement and no second map generation. This test does not count writes; it observes
+    // a single revision advance and no leftover temp file, which is consistent with that shared path.
     let dir = temp_dir("commit-prepared-exact");
     let path = dir.join("config.json");
     let mut store = ConfigStore::open(&path).unwrap();
@@ -1212,7 +1235,7 @@ fn prepared_commit_installs_exact_supplied_ids_and_final_custom_pan_in_one_write
     assert_eq!(store.revision(), 1, "exactly one revision advance");
     assert!(
         only_expected_files(&dir, "config.json"),
-        "exactly one atomic write, no temp file"
+        "no leftover temp file from the atomic write"
     );
 
     let reopened = ConfigStore::open(&path).expect("reopen");

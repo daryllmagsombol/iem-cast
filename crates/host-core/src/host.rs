@@ -1132,25 +1132,34 @@ mod tests {
 
     #[test]
     fn host_session_forwards_the_actual_configured_channel_count() {
-        // The composition must compare the *actual started* capture layout, not a discovery max.
+        // The composition must compare the *actual started* capture layout, not a discovery max or
+        // the drafted map. Build the fake stream with 3 channels but a 2-entry channel map, so a
+        // `channel_map.len()` implementation would return 2 and fail here.
         let backend = PushingBackend {
             channels: 3,
             frames: 128,
             blocks: 0,
         };
+        let draft_map = default_channel_map(2);
+        assert_eq!(
+            draft_map.len(),
+            2,
+            "the draft map deliberately differs from the actual configured count"
+        );
+
         let session = HostSession::start(
             &backend,
             valid_tls(),
             loopback(),
             start_request(),
-            default_channel_map(3),
+            draft_map,
         )
         .expect("host session starts");
 
         assert_eq!(
             session.configured_channels(),
             3,
-            "the accessor must forward the real runtime getter"
+            "the accessor must forward the real runtime getter, not the map length"
         );
 
         drop(session);
