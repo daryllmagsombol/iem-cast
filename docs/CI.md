@@ -272,8 +272,19 @@ root). Vitest's lcov reporter defaults to paths like `SF:src/...`, which then re
 to nothing and report **0%** coverage. `apps/web/vitest.config.ts` therefore sets the
 lcov reporter's `projectRoot` to the monorepo root
 (`fileURLToPath(new URL('../..', import.meta.url))`), so entries are repo-relative
-(`SF:apps/web/src/...`). Removing that override silently reverts to 0%. The Rust
-report is generated from the repo root, so its paths are already repo-relative.
+(`SF:apps/web/src/...`). Removing that override silently reverts to 0%.
+
+`cargo llvm-cov` instead emits **absolute** `SF:` paths (e.g.
+`/Users/runner/work/iem-cast/iem-cast/crates/host-core/src/...`). Because the coverage
+job runs on **macOS** while the scan job runs on **Linux**, those paths can never
+resolve against `sonar.projectBaseDir`; SonarQube then imports nothing for Rust and
+every Rust file is left with no coverage data at all (not 0% — absent). The workflow
+therefore rewrites the records to repo-relative immediately after generating them, and
+fails the job if any absolute `SF:` path survives:
+
+```
+perl -i -pe "s|^SF:\Q${GITHUB_WORKSPACE}\E/|SF:|" rust-coverage/lcov.info
+```
 
 ### `sonar-project.properties`
 
@@ -299,7 +310,7 @@ Performed in the authoring environment (macOS, Node 24.20.0, Cargo/rustc 1.90.0)
 | Command | Result |
 |---|---|
 | `npm ci --dry-run --ignore-scripts` | Passed (lockfile consistent) |
-| `npm test` | Passed (23 files, 159 tests) |
+| `npm test` | Passed (28 files, 307 tests) |
 | `npm run test:coverage --workspace apps/web` | Passed; emitted `apps/web/coverage/lcov.info` with repo-relative `SF:apps/web/src/...` paths |
 | `npm run build:web` | Passed (typecheck + admin/musician builds) |
 | `node apps/web/src/musician/__tests__/mix.browser.mjs` (from `apps/web`) | Passed |
