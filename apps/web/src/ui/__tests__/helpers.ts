@@ -31,12 +31,23 @@ export function diagSnapshot(
   input: {
     rtt?: DiagnosticsSnapshot['network_rtt_ms'];
     buffer?: DiagnosticsSnapshot['buffer_delay_ms'];
+    target?: DiagnosticsSnapshot['buffer_target_delay_ms'];
+    minimum?: DiagnosticsSnapshot['buffer_minimum_delay_ms'];
+    lost?: DiagnosticsSnapshot['packets_lost_delta'];
+    concealment?: DiagnosticsSnapshot['concealment_percent'];
+    preference?: DiagnosticsSnapshot['jitter_buffer_preference'];
     lastUpdated?: number | null;
   } = {},
 ): DiagnosticsSnapshot {
   return {
     network_rtt_ms: input.rtt ?? 'Unavailable',
     buffer_delay_ms: input.buffer ?? 'Waiting for sample',
+    // Additive compatibility fields; unchanged behavior for existing callers.
+    buffer_target_delay_ms: input.target ?? 'Unavailable',
+    buffer_minimum_delay_ms: input.minimum ?? 'Unavailable',
+    packets_lost_delta: input.lost ?? 'Unavailable',
+    concealment_percent: input.concealment ?? 'Unavailable',
+    jitter_buffer_preference: input.preference ?? { state: 'Not requested', requested_ms: null },
     end_to_end: 'Not measured',
     last_updated: input.lastUpdated ?? 1_700_000_000_000,
   };

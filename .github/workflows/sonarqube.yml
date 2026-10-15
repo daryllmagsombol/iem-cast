@@ -1,0 +1,93 @@
+name: SonarQube
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Analysis only needs to read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: sonarqube-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarqube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # fetch-depth 0 is required so SonarQube can read full SCM history/blame
+      # for new-code detection.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Fork PRs do not receive repository secrets, and an unconfigured repo has
+      # none either. Detect that up front and skip with a clear annotation
+      # instead of failing on missing credentials. See docs/CI.md for setup.
+      - name: Check SonarQube credentials
+        id: sonar_creds
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then
+            echo "run_scan=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_scan=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SONAR_TOKEN and/or SONAR_HOST_URL are not set (fork PR or unconfigured repository); skipping the SonarQube scan. See docs/CI.md."
+          fi
+
+      # `sonar.projectKey`/`sonar.projectName` are the scanner's project identity,
+      # not attacker input, but they still must be safe before use. Resolve the
+      # repository variable (falling back to the repository name) and validate
+      # the characters here, then pass the validated values to the scan action.
+      - name: Resolve and validate SonarQube project key/name
+        id: sonar_meta
+        env:
+          RAW_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || github.event.repository.name }}
+          RAW_PROJECT_NAME: ${{ vars.SONAR_PROJECT_NAME || github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          # Sonar project keys allow letters, digits, '.', '_', ':', '-'.
+          if [ -z "$RAW_PROJECT_KEY" ] || ! printf '%s' "$RAW_PROJECT_KEY" | grep -Eq '^[A-Za-z0-9_.:-]+$'; then
+            echo "::error::Invalid SonarQube project key (empty or disallowed characters)."
+            exit 1
+          fi
+          # Display names also allow spaces and common punctuation.
+          if [ -z "$RAW_PROJECT_NAME" ] || ! printf '%s' "$RAW_PROJECT_NAME" | grep -Eq '^[A-Za-z0-9_.:()&+/ -]+$'; then
+            echo "::error::Invalid SonarQube project name (empty or disallowed characters)."
+            exit 1
+          fi
+          echo "key=$RAW_PROJECT_KEY" >> "$GITHUB_OUTPUT"
+          echo "name=$RAW_PROJECT_NAME" >> "$GITHUB_OUTPUT"
+
+      # No coverage report is generated: the repository's current scripts and
+      # lockfiles include no coverage tooling (the web suite has no vitest
+      # coverage provider and no Rust coverage tool is pinned), so the scan
+      # analyses sources only. Do not add a fictional lcov path here; see
+      # docs/CI.md for how to wire coverage later.
+      #
+      # Pull-request parameters (sonar.pullrequest.*) and branch detection are
+      # left to the scanner's supported auto-detection. Do NOT pass
+      # `-Dsonar.branch.name` on a pull_request event: it conflicts with the
+      # auto-detected PR parameters. No branch name (which can be attacker-influenced
+      # on PRs) is interpolated into the scan arguments.
+      - name: SonarQube Scan
+        if: steps.sonar_creds.outputs.run_scan == 'true'
+        uses: SonarSource/sonarqube-scan-action@c7ee0f9df90b7aa20e8dcf9695dcfe2e7da5b4f2 # v7
+        with:
+          args: >
+            -Dsonar.projectKey=${{ steps.sonar_meta.outputs.key }}
+            -Dsonar.projectName=${{ steps.sonar_meta.outputs.name }}
+            -Dsonar.qualitygate.wait=true
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

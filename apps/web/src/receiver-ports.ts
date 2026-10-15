@@ -24,20 +24,88 @@ import type {
 
 /** Authenticated musician WSS signaling. */
 export interface MusicianSignaling {
-  connect(): Promise<void>;
-  requestMix(patch: MixPatch): Promise<MixAck>;
-  arm(arm: ListenArm): Promise<void>;
+  connect(signal?: AbortSignal): Promise<void>;
+  requestMix(patch: MixPatch, signal?: AbortSignal, requestId?: string): Promise<MixAck>;
+  /** Optional correlation id lets the controller identify an arm's host error. */
+  arm(arm: ListenArm, requestId?: string, signal?: AbortSignal): Promise<void>;
   disarm(): Promise<void>;
   onEvent(handler: (ev: ServerEvent) => void): () => void;
 }
 
+/**
+ * Outcome of the browser's latest jitter-buffer target preference.
+ *
+ * `jitterBufferTarget` is a **preference**, not a cap: `'Accepted'` only means the browser
+ * accepted the assignment for later consideration — it never means the actual buffer is that
+ * value or that latency is reduced. `'Unsupported'` is reserved for a receiver that was actually
+ * observed without either property; a port with no status accessor, no receiver, or a
+ * feature-detect that could not be evaluated reports `'Unavailable'` rather than inventing an
+ * `'Unsupported'` claim.
+ */
+export type JitterBufferPreferenceState =
+  | 'Not requested'
+  | 'Accepted'
+  | 'Unsupported'
+  | 'Rejected'
+  | 'Unavailable';
+
+export interface JitterBufferPreference {
+  state: JitterBufferPreferenceState;
+  /** The millisecond value last requested, or `null` before any request. */
+  requested_ms: number | null;
+}
+
+/**
+ * The receiver property a buffer-target request was carried on.
+ *
+ * `jitterBufferTarget` (milliseconds) is preferred; `playoutDelayHint` (seconds) is the fallback
+ * for browsers that lack the former (older Chrome/Safari). Both are preferences, not caps.
+ */
+export type JitterBufferTargetProperty = 'jitterBufferTarget' | 'playoutDelayHint';
+
+/**
+ * Raw feature-detect/assignment outcome reported by the concrete media port.
+ *
+ * `undefined` (from the optional accessor) means the port did not expose the capability at all —
+ * an older or fake port — and is surfaced as `'Unavailable'`, never an invented `'Unsupported'`.
+ * `supported: false` is only set when a receiver was actually observed and lacked **both** the
+ * `jitterBufferTarget` and `playoutDelayHint` properties, so it maps to a real `'Unsupported'`; no
+ * receiver, or an unevaluatable feature-detect, leaves the status `undefined`.
+ */
+export interface JitterBufferPreferenceStatus {
+  /** Whether the receiver exposed `jitterBufferTarget` or the `playoutDelayHint` fallback. */
+  supported: boolean;
+  /** The millisecond value last requested, or `null` before any request. */
+  requestedMs: number | null;
+  /** Whether the assignment did not throw. Never proof of the actual browser buffer. */
+  accepted: boolean;
+  /**
+   * The property that carried the request, or `null` when neither was observed. Optional so older
+   * callers that only knew `jitterBufferTarget` remain valid; the browser port always sets it.
+   */
+  property?: JitterBufferTargetProperty | null;
+}
+
 /** Browser WebRTC receive-only audio plus media element control. */
 export interface AudioMediaPort {
-  createRecvOnlyAudio(): Promise<void>;
+  createRecvOnlyAudio(signal?: AbortSignal): Promise<void>;
   setJitterBufferTargetMs(ms: number): Promise<boolean>;
+  /**
+   * Optional bounded re-assert of the last requested buffer target, for callers that want the
+   * preference to take effect once the audio sink is actually playing. Concrete browser ports
+   * re-apply only when a request was made, a supported property is present, and the sink is
+   * playing; older/fake ports may omit it, in which case the call is simply skipped.
+   */
+  reassertJitterBufferTarget?(): boolean;
   play(): Promise<void>;
   stop(): void;
   mute(muted: boolean): void;
+  /**
+   * Optional preference accessor. Concrete browser ports report the real feature-detect and
+   * assignment outcome; older/fake ports may omit it entirely, in which case the controller
+   * reports the preference as `'Unavailable'` rather than inventing an `'Unsupported'` claim.
+   */
+  jitterBufferStatus?(): JitterBufferPreference;
 }
 
 /** Trusted user-gesture source, required before opening the sticky local gate. */
@@ -56,6 +124,17 @@ export interface InboundStats {
   emitted: number;
   delay: number;
   sampledAtMs: number;
+  /**
+   * Optional raw browser fields, carried only when finite and present. Absent stays absent
+   * (`undefined`) rather than `0`; each is normalized to seconds/`jitterBufferEmittedCount`
+   * deltas by the diagnostics helpers, independently of the required fields.
+   */
+  targetDelay?: number;
+  minimumDelay?: number;
+  packetsLost?: number;
+  packetsReceived?: number;
+  concealedSamples?: number;
+  totalSamplesReceived?: number;
 }
 
 /** WebRTC media statistics; reads cached normalized samples refreshed via `refresh()`. */
@@ -89,6 +168,16 @@ export interface ReceiverPorts {
 export interface DiagnosticsSnapshot {
   network_rtt_ms: number | 'Unavailable';
   buffer_delay_ms: number | 'Unavailable' | 'Waiting for sample';
+  /** Latest-interval average browser target jitter-buffer hold, in ms. */
+  buffer_target_delay_ms: number | 'Unavailable' | 'Waiting for sample';
+  /** Latest-interval minimum achievable jitter-buffer delay, in ms. */
+  buffer_minimum_delay_ms: number | 'Unavailable' | 'Waiting for sample';
+  /** Latest-interval lost-packet count; a genuine unchanged count is `0`. */
+  packets_lost_delta: number | 'Unavailable' | 'Waiting for sample';
+  /** Latest-interval concealment percentage; a genuine interval with none is `0`. */
+  concealment_percent: number | 'Unavailable' | 'Waiting for sample';
+  /** Whether the port reported the jitter-buffer target preference and its outcome. */
+  jitter_buffer_preference: JitterBufferPreference;
   end_to_end: 'Not measured';
   last_updated: number | null;
 }
@@ -101,6 +190,8 @@ export interface ReceiverSnapshot {
   accepted_mix: MixSnapshot | null;
   applied_mix: MixSnapshot | null;
   master_local_muted: boolean;
+  /** Explicit output-unmute intent awaiting host acceptance; local output is still muted. */
+  master_unmute_pending?: boolean;
   diagnostics: DiagnosticsSnapshot;
   error: string | null;
 }
@@ -116,7 +207,7 @@ export interface ReceiverController {
   connect(): Promise<void>;
   /** Resolves on accepted (canonical ack), never on DSP-applied. */
   requestMix(patch: MixPatch): Promise<MixAck>;
-  /** Invokes `media.play()` from the gesture before awaiting host confirmation. */
+  /** Invokes `media.play()` in the gesture; resolves only on matching host confirmation. */
   arm(): Promise<void>;
   personalMasterMute(muted: boolean): void;
   stop(): void;

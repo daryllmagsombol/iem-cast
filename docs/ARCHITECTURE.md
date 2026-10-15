@@ -202,9 +202,12 @@ in [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md) §4.
 Mono sources are centered with explicitly fixed coefficients (draft unity into each side before
 fixed bus attenuation); stereo-linked pairs preserve L/R with **no pan in MVP**. Summation is
 float with **no per-input clipping**. With 22 correlated unity sources the worst case is
-≈ **26.85 dB**; a fixed **−27 dB bus headroom** is a **PROBE-ONLY** starting point that may
-materially reduce loudness and must be verified by calibration before production. There is **no
-adaptive fader normalization**.
+≈ **26.85 dB**; the POC now uses a fixed **−6 dB bus headroom** (measured; previously a
+`−27 dB` probe-only placeholder that made a lone source far too quiet), matching the limiter
+ceiling for a single full-scale source. There is **no adaptive fader normalization**, no
+source-count scaling, and no AGC. This is a fixed POC policy, not a calibrated hearing-safety
+guarantee; correlated sums above the ceiling are bounded by the limiter, and real-hardware
+calibration is still required.
 
 Chain order:
 

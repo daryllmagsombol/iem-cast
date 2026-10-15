@@ -322,7 +322,20 @@ fn apply_command(
             }
         }
         RuntimeCommand::UpdateMix { slot, mix } => {
-            snapshots[slot] = Some(mix);
+            // An update only applies to the session already live in this slot. It never implicitly
+            // replaces a different session; that would require an explicit `SetMix`.
+            let same_session = pipeline.session_at(slot) == Some(mix.context.session_epoch);
+            if same_session {
+                // Route through the same identity-aware upsert as `SetMix` so an exact-context edit
+                // preserves the engine partial/ramps/limiter and the slot's encoder; only install
+                // the snapshot when the upsert is accepted.
+                if pipeline
+                    .register(slot, mix.context.session_epoch, mix)
+                    .is_ok()
+                {
+                    snapshots[slot] = Some(mix);
+                }
+            }
         }
         RuntimeCommand::Clear { slot } => {
             pipeline.unregister(slot);
@@ -572,5 +585,180 @@ mod tests {
         );
         assert!(matches!(result, Err(CaptureFault::UnsupportedRate)));
     }
-}
 
+    // ---------------------------------------------------------------------------------------------
+    // Command-routing tests (synchronous `apply_command` seams; no worker, no sleeps)
+    // ---------------------------------------------------------------------------------------------
+
+    fn rt_snapshot(session: SessionEpoch, gain_db: f32) -> MixSnapshot {
+        MixSnapshot {
+            context: crate::contract::SessionContext {
+                session_epoch: session,
+                audio_epoch: AudioEpoch::from_bytes([0x55; 16]),
+                safety_generation: SafetyGeneration(1),
+            },
+            catalog_revision: CatalogRevision(1),
+            mix_revision: MixRevision(1),
+            sources: SourceGainMatrix::from_slice(&[SourceGain {
+                source_id: source(),
+                gain_db,
+                muted: false,
+            }]),
+            master_db: 0.0,
+            master_muted: false,
+        }
+    }
+
+    fn rt_ramp_block(start_sample: u64, frames: u32) -> CaptureBlock {
+        let mut samples = crate::contract::silent_audio_slot();
+        for frame in 0..frames as usize {
+            samples[frame] = (start_sample as usize + frame) as f32 * 0.001;
+        }
+        CaptureBlock {
+            audio_epoch: AudioEpoch::from_bytes([0x55; 16]),
+            start_sample,
+            frame_count: frames,
+            sample_rate_hz: 48_000,
+            channel_count: 1,
+            channel_map_revision: ChannelMapRevision(1),
+            samples,
+        }
+    }
+
+    fn rt_run_block(
+        pipeline: &mut Pipeline,
+        snapshots: &[Option<MixSnapshot>; MAX_SESSIONS],
+        block: &CaptureBlock,
+    ) -> crate::pipeline::ListenerOutput {
+        let mut out: [crate::pipeline::ListenerOutput; MAX_SESSIONS] =
+            std::array::from_fn(crate::pipeline::ListenerOutput::empty);
+        pipeline.process(block, snapshots, &mut out, None).unwrap();
+        std::mem::replace(&mut out[0], crate::pipeline::ListenerOutput::empty(0))
+    }
+
+    #[test]
+    fn set_mix_reinstall_after_held_partial_keeps_frame_at_zero() {
+        // Real `SetMix` command routing: register, hold 100 frames, re-issue the identical SetMix,
+        // then 128 contiguous frames. The identity-aware upsert must preserve the held partial so
+        // the first frame still starts at 0 (not 100).
+        let mut pipeline = Pipeline::new(48_000, &channel_map());
+        let mut snapshots: [Option<MixSnapshot>; MAX_SESSIONS] = [None, None, None, None];
+        let session = SessionEpoch::from_bytes([0x22; 16]);
+        let snapshot = rt_snapshot(session, -6.0);
+
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::SetMix {
+                slot: 0,
+                session,
+                mix: snapshot,
+            },
+        );
+        let held = rt_run_block(&mut pipeline, &snapshots, &rt_ramp_block(0, 100));
+        assert_eq!(held.count, 0);
+
+        // Identical reinstall (what install_snapshot does on an ordinary patch).
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::SetMix {
+                slot: 0,
+                session,
+                mix: snapshot,
+            },
+        );
+        let produced = rt_run_block(&mut pipeline, &snapshots, &rt_ramp_block(100, 128));
+        assert_eq!(produced.count, 1);
+        assert_eq!(
+            produced.frames[0].start_sample, 0,
+            "SetMix reinstall must preserve the held partial"
+        );
+    }
+
+    #[test]
+    fn update_mix_same_session_upserts_and_installs_snapshot() {
+        // `UpdateMix` for the live session routes through the same upsert and installs the snapshot.
+        let mut pipeline = Pipeline::new(48_000, &channel_map());
+        let mut snapshots: [Option<MixSnapshot>; MAX_SESSIONS] = [None, None, None, None];
+        let session = SessionEpoch::from_bytes([0x22; 16]);
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::SetMix {
+                slot: 0,
+                session,
+                mix: rt_snapshot(session, -6.0),
+            },
+        );
+
+        let held = rt_run_block(&mut pipeline, &snapshots, &rt_ramp_block(0, 60));
+        assert_eq!(held.count, 0);
+
+        // Ordinary gain edit, same session + exact context.
+        let edited = rt_snapshot(session, -3.0);
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::UpdateMix {
+                slot: 0,
+                mix: edited,
+            },
+        );
+        assert_eq!(
+            snapshots[0].map(|s| s.sources.entries[0].gain_db),
+            Some(-3.0)
+        );
+
+        let produced = rt_run_block(&mut pipeline, &snapshots, &rt_ramp_block(60, 60));
+        assert_eq!(produced.count, 1);
+        assert_eq!(
+            produced.frames[0].start_sample, 0,
+            "partial preserved across update"
+        );
+    }
+
+    #[test]
+    fn update_mix_for_a_different_session_is_ignored() {
+        // `UpdateMix` must never implicitly replace a different session bound to the slot.
+        let mut pipeline = Pipeline::new(48_000, &channel_map());
+        let mut snapshots: [Option<MixSnapshot>; MAX_SESSIONS] = [None, None, None, None];
+        let session = SessionEpoch::from_bytes([0x22; 16]);
+        let other = SessionEpoch::from_bytes([0x33; 16]);
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::SetMix {
+                slot: 0,
+                session,
+                mix: rt_snapshot(session, -6.0),
+            },
+        );
+
+        apply_command(
+            &mut pipeline,
+            &mut snapshots,
+            &mut None,
+            RuntimeCommand::UpdateMix {
+                slot: 0,
+                mix: rt_snapshot(other, -3.0),
+            },
+        );
+
+        assert_eq!(
+            pipeline.session_at(0),
+            Some(session),
+            "a different session must not replace the live slot"
+        );
+        assert_eq!(
+            snapshots[0].map(|s| s.context.session_epoch),
+            Some(session),
+            "snapshot must remain the live session"
+        );
+    }
+}

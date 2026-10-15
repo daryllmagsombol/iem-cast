@@ -14,6 +14,7 @@ export interface ReceiverViewProps {
   masterRequestedDb: number;
   masterAppliedDb?: number;
   masterMuted: boolean;
+  masterUnmutePending?: boolean;
   masterPending?: boolean;
   onMasterMuteChange(muted: boolean): void;
   onMasterGainChange(db: number): void;
@@ -98,7 +99,7 @@ export function ReceiverView(props: ReceiverViewProps) {
       <p className="text-caption text-text-secondary">Keep this page visible and the screen on. Wired earphones only.</p>
       {error && (
         <p role="alert" className="iem-hint text-danger">
-          {error} · Listening state must be checked before restarting.
+          {error}
         </p>
       )}
       {props.wakeLockWarning && (
@@ -165,10 +166,10 @@ export function ReceiverView(props: ReceiverViewProps) {
           </div>
           <div className="iem-dock-actions">
             <Button
-              onClick={() => onMasterMuteChange(!masterMuted)}
+              onClick={() => onMasterMuteChange(props.masterUnmutePending || !masterMuted)}
               disabled={masterMuted && !armed}
             >
-              {masterMuted ? 'Unmute personal output' : 'Mute personal output'}
+              {props.masterUnmutePending ? 'Cancel output unmute' : masterMuted ? 'Unmute personal output' : 'Mute personal output'}
             </Button>
             <Button variant="destructive" onClick={onStop}>Stop listening</Button>
           </div>

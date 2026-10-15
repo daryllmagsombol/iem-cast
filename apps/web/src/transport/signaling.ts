@@ -86,7 +86,7 @@ export interface BrowserMusicianSignaling extends MusicianSignaling {
   /** The most recent audio epoch seen from the host, if any. */
   currentAudioEpoch(): string | null;
   /** Sends the local SDP offer (`rtc.offer`). */
-  sendRtcOffer(sdp: string): Promise<void>;
+  sendRtcOffer(sdp: string, signal?: AbortSignal): Promise<void>;
   /** Trickles a local ICE candidate (`rtc.candidate`); `null` signals end-of-candidates. */
   sendRtcCandidate(candidate: RTCIceCandidate | null): void;
 }
@@ -133,6 +133,7 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
   let safetyGeneration = '0';
   let probeRequestId: string | null = null;
   let hostEpochWaiters: (() => void)[] = [];
+  let authoritativeSession = false;
 
   function emit(event: ServerEvent): void {
     for (const handler of handlers) handler(event);
@@ -173,6 +174,11 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
       return;
     }
 
+    // Once a full session snapshot establishes identity, delayed replies from the previous
+    // session must not change the epochs used by subsequent outbound frames.
+    if (authoritativeSession && event.type !== 'session.snapshot' && event.requestId !== probeRequestId &&
+      (event.hostEpoch !== hostEpoch || (event.sessionEpoch !== null && event.sessionEpoch !== sessionEpoch))) return;
+    if (event.type === 'session.snapshot') authoritativeSession = true;
     if (typeof event.hostEpoch === 'string') hostEpoch = event.hostEpoch;
     if (typeof event.sessionEpoch === 'string') sessionEpoch = event.sessionEpoch;
 
@@ -251,19 +257,31 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
     socket.send(JSON.stringify(envelope));
   }
 
-  function openSocket(): Promise<void> {
+  function openSocket(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     return new Promise<void>((resolve, reject) => {
       const scheme = loc.protocol === 'http:' ? 'ws:' : 'wss:';
       const next = new WebSocketCtor(`${scheme}//${loc.host}/api/v1/ws`);
       socket = next;
       let settled = false;
+      const cancel = () => {
+        settled = true;
+        signal?.removeEventListener('abort', cancel);
+        if (socket === next) { socket = null; ready = false; }
+        reject(new Error('Signaling connection canceled'));
+        next.close();
+      };
+      signal?.addEventListener('abort', cancel, { once: true });
 
       next.onopen = () => {
+        if (signal?.aborted || socket !== next) return;
         settled = true;
+        signal?.removeEventListener('abort', cancel);
         ready = true;
         resolve();
       };
       next.onerror = () => {
+        signal?.removeEventListener('abort', cancel);
         if (!settled) {
           settled = true;
           ready = false;
@@ -271,6 +289,8 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
         }
       };
       next.onclose = () => {
+        signal?.removeEventListener('abort', cancel);
+        if (socket !== next) return;
         if (!settled) {
           settled = true;
           reject(new Error('Signaling socket closed before it was ready'));
@@ -280,18 +300,20 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
         failPending(new Error('Signaling connection closed'));
       };
       next.onmessage = event => {
-        if (typeof event.data === 'string') handleFrame(event.data);
+        if (socket === next && typeof event.data === 'string') handleFrame(event.data);
       };
     });
   }
 
-  async function pair(token: string): Promise<void> {
+  async function pair(token: string, signal?: AbortSignal): Promise<void> {
     const response = await fetchImpl('/api/v1/pair', {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token }),
+      signal,
     });
+    signal?.throwIfAborted();
     if (!response.ok) {
       throw new Error(`Pairing was rejected (status ${response.status})`);
     }
@@ -302,6 +324,7 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
     } catch {
       body = {};
     }
+    signal?.throwIfAborted();
     if (typeof body.sessionEpoch === 'string') sessionEpoch = body.sessionEpoch as SessionEpoch;
     if (typeof body.hostEpoch === 'string') hostEpoch = body.hostEpoch as HostEpoch;
   }
@@ -314,7 +337,8 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
    * type) is enough to adopt it. The probe is best-effort: a timeout resolves without an epoch and
    * the caller fails naturally rather than hanging.
    */
-  async function probeHostEpoch(probeTimeoutMs: number): Promise<void> {
+  async function probeHostEpoch(probeTimeoutMs: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (hostEpoch !== '' || !socket || !ready) return;
     const requestId = randomRequestId();
     probeRequestId = requestId;
@@ -325,11 +349,14 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
         settled = true;
         probeRequestId = null;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', finish);
         resolve();
       };
       const timer = setTimeout(finish, probeTimeoutMs);
+      signal?.addEventListener('abort', finish, { once: true });
       hostEpochWaiters.push(finish);
       try {
+        signal?.throwIfAborted();
         writeFrame('heartbeat', requestId, {});
       } catch {
         finish();
@@ -337,19 +364,28 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
     });
   }
 
-  async function connect(): Promise<void> {
+  async function connect(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (ready && socket) return;
-    if (connectPromise) return connectPromise;
+    if (connectPromise) {
+      await connectPromise;
+      signal?.throwIfAborted();
+      return;
+    }
     connectPromise = (async () => {
       try {
         const token = readToken();
         if (token !== null) {
-          await pair(token);
+          await pair(token, signal);
+          signal?.throwIfAborted();
           clearToken();
         }
-        await openSocket();
+        signal?.throwIfAborted();
+        await openSocket(signal);
+        signal?.throwIfAborted();
         // Adopt the host epoch if `/pair` did not provide one, so control frames are accepted.
-        await probeHostEpoch(epochProbeTimeoutMs);
+        await probeHostEpoch(epochProbeTimeoutMs, signal);
+        signal?.throwIfAborted();
       } finally {
         connectPromise = null;
       }
@@ -360,9 +396,10 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
   return {
     connect,
 
-    async requestMix(patch: MixPatch): Promise<MixAck> {
-      await connect();
-      const requestId = randomRequestId();
+    async requestMix(patch: MixPatch, signal?: AbortSignal, correlationId?: string): Promise<MixAck> {
+      await connect(signal);
+      signal?.throwIfAborted();
+      const requestId = correlationId ?? randomRequestId();
       return new Promise<MixAck>((resolve, reject) => {
         if (pending.size >= MAX_PENDING_REQUESTS) {
           const oldest = pending.keys().next().value;
@@ -377,22 +414,37 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
         }
         const timer = setTimeout(() => {
           pending.delete(requestId);
+          signal?.removeEventListener('abort', cancel);
           reject(new Error('Mix request timed out'));
         }, requestTimeoutMs);
-        pending.set(requestId, { resolve, reject, timer });
+        const cancel = () => {
+          clearTimeout(timer);
+          pending.delete(requestId);
+          signal?.removeEventListener('abort', cancel);
+          reject(new Error('Mix request canceled'));
+        };
+        signal?.addEventListener('abort', cancel, { once: true });
+        pending.set(requestId, {
+          resolve: ack => { signal?.removeEventListener('abort', cancel); resolve(ack); },
+          reject: error => { signal?.removeEventListener('abort', cancel); reject(error); },
+          timer,
+        });
         try {
+          signal?.throwIfAborted();
           writeFrame('mix.patch', requestId, patch);
         } catch (error) {
           clearTimeout(timer);
           pending.delete(requestId);
+          signal?.removeEventListener('abort', cancel);
           reject(error);
         }
       });
     },
 
-    async arm(arm: ListenArm): Promise<void> {
-      await connect();
-      writeFrame('listen.arm', randomRequestId(), arm);
+    async arm(arm: ListenArm, requestId?: string, signal?: AbortSignal): Promise<void> {
+      await connect(signal);
+      signal?.throwIfAborted();
+      writeFrame('listen.arm', requestId ?? randomRequestId(), arm);
     },
 
     async disarm(): Promise<void> {
@@ -419,8 +471,9 @@ export function createMusicianSignaling(deps: SignalingDeps = {}): BrowserMusici
       return audioEpoch;
     },
 
-    async sendRtcOffer(sdp: string): Promise<void> {
-      await connect();
+    async sendRtcOffer(sdp: string, signal?: AbortSignal): Promise<void> {
+      await connect(signal);
+      signal?.throwIfAborted();
       writeFrame('rtc.offer', randomRequestId(), { sdp });
     },
 

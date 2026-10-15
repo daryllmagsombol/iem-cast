@@ -30,3 +30,6 @@ local-certs/
 
 # Local agent/session state
 .opencode/
+
+# Isolated feature workspaces
+.worktrees/

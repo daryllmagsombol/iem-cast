@@ -29,6 +29,11 @@ test('unpaired_root_shows_join_gate_and_never_arms_implicitly', () => {
         diagnostics: {
           network_rtt_ms: 'Unavailable',
           buffer_delay_ms: 'Unavailable',
+          buffer_target_delay_ms: 'Unavailable',
+          buffer_minimum_delay_ms: 'Unavailable',
+          packets_lost_delta: 'Unavailable',
+          concealment_percent: 'Unavailable',
+          jitter_buffer_preference: { state: 'Not requested', requested_ms: null },
           end_to_end: 'Not measured',
           last_updated: null,
         },

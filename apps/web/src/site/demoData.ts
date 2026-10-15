@@ -81,13 +81,28 @@ export const DEMO_STATUS_LABELS: Record<DemoStatusCode, string> = {
 
 /** Fictional fixture used to demonstrate the diagnostics display states. */
 export function sampleDiagnostics(status: DemoStatusCode, now: number): DiagnosticsSnapshot {
+  // Additive compatibility fields only; existing displayed rows are unchanged.
+  const optional = {
+    buffer_target_delay_ms: 'Unavailable' as const,
+    buffer_minimum_delay_ms: 'Unavailable' as const,
+    packets_lost_delta: 'Unavailable' as const,
+    concealment_percent: 'Unavailable' as const,
+    jitter_buffer_preference: { state: 'Not requested' as const, requested_ms: null },
+  };
   switch (status) {
     case 'normal':
-      return { network_rtt_ms: 38, buffer_delay_ms: 2, end_to_end: 'Not measured', last_updated: now };
+      return {
+        network_rtt_ms: 38,
+        buffer_delay_ms: 2,
+        ...optional,
+        end_to_end: 'Not measured',
+        last_updated: now,
+      };
     case 'waiting':
       return {
         network_rtt_ms: 'Unavailable',
         buffer_delay_ms: 'Waiting for sample',
+        ...optional,
         end_to_end: 'Not measured',
         last_updated: null,
       };
@@ -95,6 +110,7 @@ export function sampleDiagnostics(status: DemoStatusCode, now: number): Diagnost
       return {
         network_rtt_ms: 'Unavailable',
         buffer_delay_ms: 'Unavailable',
+        ...optional,
         end_to_end: 'Not measured',
         last_updated: null,
       };
@@ -103,6 +119,7 @@ export function sampleDiagnostics(status: DemoStatusCode, now: number): Diagnost
       return {
         network_rtt_ms: 'Unavailable',
         buffer_delay_ms: 'Unavailable',
+        ...optional,
         end_to_end: 'Not measured',
         last_updated: now - 30_000,
       };
@@ -110,6 +127,7 @@ export function sampleDiagnostics(status: DemoStatusCode, now: number): Diagnost
       return {
         network_rtt_ms: 'Unavailable',
         buffer_delay_ms: 'Unavailable',
+        ...optional,
         end_to_end: 'Not measured',
         last_updated: null,
       };

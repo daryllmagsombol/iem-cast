@@ -41,6 +41,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const serial = useRef(0);
+  const actionSerial = useRef(0);
   const latest = useRef(snapshot);
   latest.current = snapshot;
 
@@ -62,6 +63,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       );
       if ((unavailable && prior.phase !== next.phase) || sourceLost) {
         serial.current++;
+        actionSerial.current++;
         setIntent(null);
         setRollback(null);
         setBusy(false);
@@ -105,7 +107,6 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
   async function request(patch: MixPatch) {
     if (!editable) return;
     const id = ++serial.current;
-    const previous = latest.current.applied_mix ?? latest.current.accepted_mix;
     setIntent({ patch, serial: id });
     setRollback(null);
     setError(null);
@@ -121,7 +122,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       if (id === serial.current) {
         setError(errorMessage(e));
         setIntent(null);
-        setRollback(previous);
+        setRollback(latest.current.accepted_mix ?? latest.current.applied_mix);
       }
     }
   }
@@ -139,7 +140,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
     });
   }
   function start() {
-    const id = ++serial.current;
+    const id = ++actionSerial.current;
     setError(null);
     setBusy(true);
     // Invoke arm inside this click, BEFORE any await. Never chain connect().then(arm()).
@@ -147,10 +148,10 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       void controller
         .arm()
         .catch(e => {
-          if (id === serial.current) setError(errorMessage(e));
+          if (id === actionSerial.current) setError(errorMessage(e));
         })
         .finally(() => {
-          if (id === serial.current) setBusy(false);
+          if (id === actionSerial.current) setBusy(false);
         });
     } catch (e) {
       setError(errorMessage(e));
@@ -158,20 +159,21 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
     }
   }
   function prepare() {
-    const id = ++serial.current;
+    const id = ++actionSerial.current;
     setError(null);
     setBusy(true);
     void controller
       .connect()
       .catch(e => {
-        if (id === serial.current) setError(errorMessage(e));
+        if (id === actionSerial.current) setError(errorMessage(e));
       })
       .finally(() => {
-        if (id === serial.current) setBusy(false);
+        if (id === actionSerial.current) setBusy(false);
       });
   }
   function stop() {
     serial.current++;
+    actionSerial.current++;
     setIntent(null);
     setRollback(null);
     setBusy(false);
@@ -231,8 +233,13 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
       masterRequestedDb={display?.masterDb ?? -60}
       masterAppliedDb={applied?.masterDb}
       masterMuted={snapshot.master_local_muted}
+      masterUnmutePending={snapshot.master_unmute_pending}
       masterPending={pending}
       onMasterMuteChange={m => {
+        serial.current++;
+        setIntent(null);
+        setRollback(null);
+        setError(null);
         controller.personalMasterMute(m);
         setSnapshot(controller.getSnapshot());
       }}
