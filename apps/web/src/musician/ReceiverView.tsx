@@ -42,6 +42,22 @@ export interface ReceiverViewProps {
   wakeLockWarning: string | null;
 }
 
+/**
+ * The subset of receiver props the grouped channel-strip views need: per-source meters and the
+ * channel/pair edit callbacks. Passing only this keeps the pass-through explicit.
+ */
+interface ChannelActions {
+  readonly meters: Record<string, number | undefined>;
+  readonly onChannelGainChange: (sourceId: string, db: number) => void;
+  readonly onChannelMuteChange: (sourceId: string, muted: boolean) => void;
+  readonly onChannelPanChange: (sourceId: string, pan: number) => void;
+  readonly onPairBalanceChange: (
+    leftSourceId: string,
+    rightSourceId: string,
+    pan: number,
+  ) => void;
+}
+
 /** A usable source is present, available, and authorized. */
 function isUsableSource(source: SourceInfo | undefined): source is SourceInfo {
   return !!source && source.available && source.authorized;
@@ -182,7 +198,7 @@ function PairGroupView({
   armed,
 }: {
   readonly group: Extract<ChannelGroup, { kind: 'pair' }>;
-  readonly viewProps: ReceiverViewProps;
+  readonly viewProps: ChannelActions;
   readonly armed: boolean;
 }) {
   const { left, right, leftChannel, rightChannel, disabled } = group;
@@ -240,7 +256,7 @@ function InvalidPairGroupView({
   armed,
 }: {
   readonly group: Extract<ChannelGroup, { kind: 'invalid-pair' }>;
-  readonly viewProps: ReceiverViewProps;
+  readonly viewProps: ChannelActions;
   readonly armed: boolean;
 }) {
   const { source, peer, channel, peerChannel } = group;
@@ -294,7 +310,7 @@ function MonoGroupView({
   editable,
 }: {
   readonly group: Extract<ChannelGroup, { kind: 'mono' }>;
-  readonly viewProps: ReceiverViewProps;
+  readonly viewProps: ChannelActions;
   readonly armed: boolean;
   readonly editable: boolean;
 }) {
@@ -336,7 +352,7 @@ function ReceiverGroup({
   editable,
 }: {
   readonly group: ChannelGroup;
-  readonly viewProps: ReceiverViewProps;
+  readonly viewProps: ChannelActions;
   readonly armed: boolean;
   readonly editable: boolean;
 }) {
@@ -386,6 +402,14 @@ export function ReceiverView(props: ReceiverViewProps) {
     () => new Map(catalog.map(source => [source.sourceId, source])),
     [catalog],
   );
+  // Explicitly forward only the metering and edit callbacks the channel strips consume.
+  const channelActions: ChannelActions = {
+    meters: props.meters,
+    onChannelGainChange: props.onChannelGainChange,
+    onChannelMuteChange: props.onChannelMuteChange,
+    onChannelPanChange: props.onChannelPanChange,
+    onPairBalanceChange: props.onPairBalanceChange,
+  };
   // Present channels as ordered units: each valid reciprocal pair becomes ONE group (two member
   // strips plus a single shared balance); everything else stays a standalone strip. Adjacency is
   // never used to infer a pair — only authoritative reciprocal `stereoPair`/`stereoSide` metadata.
@@ -474,7 +498,7 @@ export function ReceiverView(props: ReceiverViewProps) {
           <ReceiverGroup
             key={groupKey(group)}
             group={group}
-            viewProps={props}
+            viewProps={channelActions}
             armed={armed}
             editable={editable}
           />

@@ -4,8 +4,8 @@ export interface PanControlProps {
   readonly label: string;
   /** Controlled normalized position: -1 = full left, 0 = center, 1 = full right. */
   readonly value: number;
-  onChange(value: number): void;
-  onReset(): void;
+  readonly onChange: (value: number) => void;
+  readonly onReset: () => void;
   readonly disabled?: boolean;
   /** Complete accessible name including source/pair and purpose, e.g. "Keys balance". */
   readonly fullLabel?: string;

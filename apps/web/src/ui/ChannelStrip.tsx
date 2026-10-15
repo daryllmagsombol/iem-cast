@@ -31,8 +31,8 @@ export interface ChannelStripPan {
 
 export interface ChannelStripProps {
   readonly state: ChannelStripState;
-  onGainChange(db: number): void;
-  onMuteChange(muted: boolean): void;
+  readonly onGainChange: (db: number) => void;
+  readonly onMuteChange: (muted: boolean) => void;
   /** Optional mono pan control rendered after gain. Pair balance is not set here. */
   readonly pan?: ChannelStripPan;
   /** Optional stereo-link description, e.g. "Linked stereo pair". */

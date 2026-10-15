@@ -24,7 +24,7 @@ export interface SourcesViewProps {
    * The parent uses it to avoid implying unsaved edits are applied (e.g. disabling Start). Purely
    * additive: the component works unchanged when the prop is absent.
    */
-  onUnsavedChange?(hasUnsaved: boolean): void;
+  readonly onUnsavedChange?: (hasUnsaved: boolean) => void;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed' | 'uncertain' | 'conflict';
@@ -46,8 +46,8 @@ interface DefaultEntry {
 
 /** True when a source and its peer form a reciprocal left/right stereo pair. */
 function isReciprocalPair(source: SourceInfo, peer: SourceInfo | undefined): peer is SourceInfo {
+  if (peer === undefined) return false;
   return (
-    peer !== undefined &&
     peer.stereoPair === source.sourceId &&
     source.stereoSide !== null &&
     peer.stereoSide !== null &&
@@ -923,7 +923,7 @@ function SaveState({
 }: {
   readonly state: SaveStatus;
   readonly message?: string;
-  onRetry(): void;
+  readonly onRetry: () => void;
   readonly onReload?: () => void;
 }) {
   if (state === 'saving') {
