@@ -16,12 +16,22 @@ import type {
   AudioMediaPort,
   JitterBufferPreference,
   JitterBufferPreferenceStatus,
+  JitterBufferTargetProperty,
 } from '../receiver-ports';
 import { buildJitterBufferPreference } from './diagnostics';
 import type { BrowserMusicianSignaling } from './signaling';
 
 /** How long to wait for a live ICE/DTLS connection before failing honestly. */
 const CONNECTION_TIMEOUT_MS = 30_000;
+
+/**
+ * A receiver that may expose either buffer-target preference: `jitterBufferTarget` (milliseconds)
+ * or the seconds-valued `playoutDelayHint` fallback.
+ */
+type BufferTargetReceiver = RTCRtpReceiver & {
+  jitterBufferTarget?: number;
+  playoutDelayHint?: number;
+};
 
 /** Injectable environment seams; production uses the browser globals. */
 export interface MediaDeps {
@@ -65,6 +75,8 @@ export function createBrowserMediaPort(
   let readiness: Promise<void> | null = null;
   let cancelReadiness: (() => void) | null = null;
   let muted = true;
+  // Whether the audio sink has actually started; the buffer target only applies once it is playing.
+  let playing = false;
   let unsubscribe: (() => void) | null = null;
   // Raw feature-detect/assignment outcome for the current receiver; reset with the connection.
   let jitterStatus: JitterBufferPreferenceStatus | undefined;
@@ -111,6 +123,8 @@ export function createBrowserMediaPort(
       audio.pause();
       audio.srcObject = null;
     }
+    // Playback stopped, so the buffer target can no longer take effect until play() succeeds again.
+    playing = false;
     // A new connection gets a new receiver; the old preference outcome no longer applies.
     jitterStatus = undefined;
     readiness = null;
@@ -134,6 +148,89 @@ export function createBrowserMediaPort(
             sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
           };
     void pc.addIceCandidate(init).catch(() => undefined);
+  }
+
+  /**
+   * Whether `property` is present on `receiver`, or `undefined` when the feature-detect itself
+   * threw. `in` checks presence without invoking a getter; only a `Proxy` `has` trap can throw.
+   */
+  function detectProperty(receiver: object, property: string): boolean | undefined {
+    try {
+      return property in receiver;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Assign one buffer-target property and record exactly what was observable. `value` is in the
+   * property's own unit (`jitterBufferTarget` ms; `playoutDelayHint` seconds). Assignment not
+   * throwing means only that the browser accepted the preference, never that the actual buffer is
+   * the requested value or that latency dropped.
+   */
+  function assignBufferTarget(
+    receiver: BufferTargetReceiver,
+    property: JitterBufferTargetProperty,
+    requestedMs: number,
+    value: number,
+  ): boolean {
+    try {
+      if (property === 'jitterBufferTarget') receiver.jitterBufferTarget = value;
+      else receiver.playoutDelayHint = value;
+      jitterStatus = { supported: true, requestedMs, accepted: true, property };
+      return true;
+    } catch {
+      jitterStatus = { supported: true, requestedMs, accepted: false, property };
+      return false;
+    }
+  }
+
+  /**
+   * Apply the requested target to the observed receiver. `jitterBufferTarget` (ms) is preferred;
+   * the seconds-valued `playoutDelayHint` is the fallback for browsers that lack it. Never invents
+   * a capability claim: no receiver, or a throwing `has` trap, records `undefined` (surfacing as
+   * `'Unavailable'`), while a receiver that genuinely lacks both properties records `'Unsupported'`.
+   */
+  function applyBufferTarget(ms: number): boolean {
+    const receiver = transceiver?.receiver as BufferTargetReceiver | undefined;
+    if (!receiver) {
+      // Nothing was observed: make no capability claim (`jitterStatus` stays undefined).
+      jitterStatus = undefined;
+      return false;
+    }
+    const hasJitterTarget = detectProperty(receiver, 'jitterBufferTarget');
+    if (hasJitterTarget === undefined) {
+      // A throwing `has` trap is an unknown capability, not an observed absence.
+      jitterStatus = undefined;
+      return false;
+    }
+    if (hasJitterTarget) {
+      return assignBufferTarget(receiver, 'jitterBufferTarget', ms, ms);
+    }
+    const hasPlayoutHint = detectProperty(receiver, 'playoutDelayHint');
+    if (hasPlayoutHint === undefined) {
+      jitterStatus = undefined;
+      return false;
+    }
+    if (!hasPlayoutHint) {
+      // The receiver exists and genuinely lacks both properties: that IS an observed absence.
+      jitterStatus = { supported: false, requestedMs: ms, accepted: false, property: null };
+      return false;
+    }
+    // `playoutDelayHint` is seconds, so the millisecond request is converted.
+    return assignBufferTarget(receiver, 'playoutDelayHint', ms, ms / 1000);
+  }
+
+  /**
+   * Re-assert the last requested target once the sink is playing. Bounded and idempotent: a no-op
+   * unless a target was requested, a supported property is present, and playback has started. Safe
+   * to call at most once per diagnostics refresh — there is no internal retry loop.
+   */
+  function reassertBufferTarget(): boolean {
+    if (!playing || jitterStatus?.supported !== true || jitterStatus.requestedMs === null) {
+      return false;
+    }
+    return applyBufferTarget(jitterStatus.requestedMs);
   }
 
   return {
@@ -220,47 +317,20 @@ export function createBrowserMediaPort(
     },
 
     async setJitterBufferTargetMs(ms: number): Promise<boolean> {
-      const receiver = transceiver?.receiver as
-        | (RTCRtpReceiver & { jitterBufferTarget?: number })
-        | undefined;
-      // No receiver observed yet: make no capability claim. `jitterStatus` stays undefined so the
-      // outcome surfaces as `'Unavailable'`, never an invented `'Unsupported'`.
-      if (!receiver) {
-        jitterStatus = undefined;
-        return false;
-      }
-      // Feature-detect the instance. `'jitterBufferTarget' in receiver` checks presence and does
-      // NOT invoke a getter; only a `Proxy` `has` trap (or a revoked/hostile proxy) can throw here.
-      // A throwing trap is an unknown capability, not an observed absence, so it must not become
-      // an `'Unsupported'` claim either.
-      let supported: boolean;
-      try {
-        supported = 'jitterBufferTarget' in receiver;
-      } catch {
-        jitterStatus = undefined;
-        return false;
-      }
-      if (!supported) {
-        // The receiver exists and genuinely lacks the property: that IS an observed absence.
-        jitterStatus = { supported: false, requestedMs: ms, accepted: false };
-        return false;
-      }
-      try {
-        receiver.jitterBufferTarget = ms;
-        // Assignment not throwing means only that the browser accepted the preference, never that
-        // the actual buffer is `ms` or that latency dropped.
-        jitterStatus = { supported: true, requestedMs: ms, accepted: true };
-        return true;
-      } catch {
-        jitterStatus = { supported: true, requestedMs: ms, accepted: false };
-        return false;
-      }
+      return applyBufferTarget(ms);
+    },
+
+    reassertJitterBufferTarget(): boolean {
+      return reassertBufferTarget();
     },
 
     async play(): Promise<void> {
       const element = ensureAudioElement();
       element.muted = muted;
       await element.play();
+      // The receiver-buffer target only takes effect while the sink is playing; re-assert now.
+      playing = true;
+      reassertBufferTarget();
     },
 
     stop(): void {

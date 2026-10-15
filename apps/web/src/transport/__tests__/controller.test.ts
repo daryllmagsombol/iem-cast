@@ -768,6 +768,27 @@ describe('receiver controller diagnostics composition', () => {
     }
   });
 
+  test('re-asserts the buffer target at most once per diagnostics refresh', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ports } = diagnosticsPorts({ samples: [sample()] });
+      const reassert = vi.fn(() => true);
+      (ports.media as AudioMediaPort).reassertJitterBufferTarget = reassert;
+      const controller = createReceiverController(ports);
+      await controller.connect();
+      // No refresh has run yet, so nothing was re-asserted.
+      expect(reassert).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(reassert).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      // Exactly one bounded re-assert per refresh — never more.
+      expect(reassert).toHaveBeenCalledTimes(2);
+      controller.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('a valid 152 ms target delay is reported independently of RTT, never as end-to-end', async () => {
     vi.useFakeTimers();
     try {

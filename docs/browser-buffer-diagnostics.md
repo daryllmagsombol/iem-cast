@@ -42,23 +42,27 @@ absent raw fields stay **absent** (`undefined`), never `0`.
 
 `jitterBufferTarget` is a **preference, not a cap** (MDN: it must be a positive value ≤ 4000 ms and
 only *influences* the user agent; the actual target varies with the UA's own limits and may change
-at any time; readback does not reflect the UA's actual target).
+at any time; readback does not reflect the UA's actual target). Browsers that lack it (older
+Chrome/Safari) get the seconds-valued `playoutDelayHint` fallback; the millisecond request is
+converted. Both are preferences: the request only takes effect while the audio sink is playing, so
+the port re-asserts it after `play()` succeeds and at most once per diagnostics refresh.
 
 | `state` | Meaning |
 | --- | --- |
 | `'Not requested'` | A supported receiver was never asked (before `setJitterBufferTargetMs`). |
 | `'Accepted'` | The assignment did not throw. **Never** proof of the actual buffer or lower latency. |
-| `'Unsupported'` | A receiver **was observed** and genuinely lacked a `jitterBufferTarget` property. |
+| `'Unsupported'` | A receiver **was observed** and genuinely lacked both `jitterBufferTarget` and `playoutDelayHint`. |
 | `'Rejected'` | The property exists on a supported receiver but the assignment threw. |
 | `'Unavailable'` | No capability was observed: the port exposed no status accessor, no receiver existed, or the feature-detect itself could not be evaluated. No capability claim is made. |
 
-The feature-detect uses `'jitterBufferTarget' in receiver`, which checks property presence and
-does **not** invoke a getter; only a `Proxy` `has` trap could throw there. A throwing `has` trap is
-an **unknown** capability, not an observed absence, so it also surfaces as `'Unavailable'` — never
-an invented `'Unsupported'`. `'Unsupported'` is reserved for a receiver that was actually observed
-without the property. This distinguishes unsupported from unknown/error without inventing an
-`'Unsupported'` claim when nothing was observed. `requested_ms` is the millisecond value last
-requested, or `null` when nothing was observed.
+The feature-detect uses `'jitterBufferTarget' in receiver` (falling back to
+`'playoutDelayHint' in receiver`), which checks property presence and does **not** invoke a getter;
+only a `Proxy` `has` trap could throw there. A throwing `has` trap is an **unknown** capability, not
+an observed absence, so it also surfaces as `'Unavailable'` — never an invented `'Unsupported'`.
+`'Unsupported'` is reserved for a receiver that was actually observed without either property. This
+distinguishes unsupported from unknown/error without inventing an `'Unsupported'` claim when nothing
+was observed. `requested_ms` is the millisecond value last requested, or `null` when nothing was
+observed.
 
 ## Limitations
 
