@@ -226,6 +226,7 @@ mod tests {
             physical_index: 0,
             source_id: source(1),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         }]
     }
@@ -243,6 +244,7 @@ mod tests {
                 source_id: source(1),
                 gain_db,
                 muted: false,
+                pan: 0.0,
             }]),
             master_db: 0.0,
             master_muted: false,

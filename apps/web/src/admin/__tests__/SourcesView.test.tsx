@@ -25,6 +25,8 @@ const twoChannelSources: SourceInfo[] = [
     authorized: true,
     available: true,
     stereoPair: null,
+    stereoSide: null,
+    defaultPan: 0,
   },
   {
     sourceId: '01010101-0101-4101-8101-010101010101',
@@ -34,6 +36,8 @@ const twoChannelSources: SourceInfo[] = [
     authorized: true,
     available: true,
     stereoPair: null,
+    stereoSide: null,
+    defaultPan: 0,
   },
 ];
 

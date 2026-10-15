@@ -156,6 +156,10 @@ counter_newtype! {
     /// Revision of the interleaved-index-to-source channel map.
     ChannelMapRevision
 }
+counter_newtype! {
+    /// Monotonic operator source-settings (defaults/pairing) revision, persisted with `ConfigV2`.
+    SettingsRevision
+}
 
 /// A capture frame count serialized as a decimal string constrained to the `u32` range.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

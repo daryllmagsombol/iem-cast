@@ -19,6 +19,10 @@ test-results
 playwright-report
 *.png.tmp
 
+# Coverage output (SonarQube lcov producers)
+apps/web/coverage
+rust-coverage
+
 # Local tooling state
 .serena
 .DS_Store

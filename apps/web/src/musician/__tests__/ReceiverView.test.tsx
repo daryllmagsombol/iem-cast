@@ -14,6 +14,8 @@ const catalog: SourceInfo[] = [
     authorized: true,
     available: true,
     stereoPair: null,
+    stereoSide: null,
+    defaultPan: 0,
   },
 ];
 
@@ -50,6 +52,8 @@ test('receiver_keeps_master_stop_available_while_listening', () => {
       onMasterGainChange={() => {}}
       onChannelGainChange={() => {}}
       onChannelMuteChange={() => {}}
+      onChannelPanChange={() => {}}
+      onPairBalanceChange={() => {}}
       onStop={() => {}}
       diagnostics={diagnostics}
       meters={{}}
@@ -73,6 +77,8 @@ test('disconnection_error_is_visible_without_an_unconfirmed_silence_claim', () =
       onMasterGainChange={() => {}}
       onChannelGainChange={() => {}}
       onChannelMuteChange={() => {}}
+      onChannelPanChange={() => {}}
+      onPairBalanceChange={() => {}}
       onStop={() => {}}
       diagnostics={diagnostics}
       meters={{}}
@@ -97,6 +103,8 @@ test('missing_telemetry_meters_render_unavailable', () => {
       onMasterGainChange={() => {}}
       onChannelGainChange={() => {}}
       onChannelMuteChange={() => {}}
+      onChannelPanChange={() => {}}
+      onPairBalanceChange={() => {}}
       onStop={() => {}}
       diagnostics={diagnostics}
       meters={{}}

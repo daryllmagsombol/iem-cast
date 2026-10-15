@@ -66,22 +66,34 @@ const rawCatalog = {
       sourceId: '33333333-3333-4333-8333-333333333333',
       physicalIndex: 6,
       label: 'Lead vocal',
+      role: 'inputChannel',
       available: true,
       availableToMusicians: true,
+      stereoPair: null,
+      stereoSide: null,
+      defaultPan: 0.35,
     },
     {
       sourceId: '44444444-4444-4444-8444-444444444444',
       physicalIndex: 22,
       label: 'Master L/R',
+      role: 'masterLr',
       available: true,
       availableToMusicians: false,
+      stereoPair: null,
+      stereoSide: null,
+      defaultPan: 0,
     },
     {
       sourceId: '55555555-5555-4555-8555-555555555555',
       physicalIndex: 7,
       label: 'Unplugged but authorized',
+      role: 'inputChannel',
       available: false,
       availableToMusicians: true,
+      stereoPair: '66666666-6666-4666-8666-666666666666',
+      stereoSide: 'left',
+      defaultPan: -0.5,
     },
   ],
 };
@@ -123,15 +135,19 @@ describe('sourceCatalog', () => {
         authorized: true,
         available: true,
         stereoPair: null,
+        stereoSide: null,
+        defaultPan: 0.35,
       },
       {
         sourceId: '44444444-4444-4444-8444-444444444444',
         physicalIndex: 22,
         label: 'Master L/R',
-        role: 'inputChannel',
+        role: 'masterLr',
         authorized: false,
         available: false,
         stereoPair: null,
+        stereoSide: null,
+        defaultPan: 0,
       },
       {
         sourceId: '55555555-5555-4555-8555-555555555555',
@@ -140,7 +156,9 @@ describe('sourceCatalog', () => {
         role: 'inputChannel',
         authorized: true,
         available: false,
-        stereoPair: null,
+        stereoPair: '66666666-6666-4666-8666-666666666666',
+        stereoSide: 'left',
+        defaultPan: -0.5,
       },
     ]);
   });
@@ -275,6 +293,94 @@ describe('isOperatorShell', () => {
       throw new Error('no window');
     });
     expect(isOperatorShell()).toBe(false);
+  });
+});
+
+/** Serialized `bridge::SourceSettings` from the three source-settings commands. */
+const rawSettings = {
+  deviceId: 'dev-f32',
+  inputChannels: 2,
+  settingsRevision: '42',
+  bindingStatus: 'new',
+  durabilityUncertain: true,
+  catalog: rawCatalog,
+};
+
+describe('source settings commands', () => {
+  test('readSourceSettings takes no windowLabel and decodes truthful flags', async () => {
+    invokeMock.mockResolvedValueOnce(rawSettings);
+    const settings = await createTauriHostBridge().readSourceSettings('dev-f32');
+
+    // The new commands authorize the actual injected caller natively; no frontend identity is sent.
+    expect(invokeMock).toHaveBeenCalledWith('read_source_settings', { deviceId: 'dev-f32' });
+    expect(settings).toEqual({
+      deviceId: 'dev-f32',
+      inputChannels: 2,
+      settingsRevision: '42',
+      bindingStatus: 'new',
+      durabilityUncertain: true,
+      catalog: expect.objectContaining({ catalogRevision: '34' }),
+    });
+  });
+
+  test('saveSourceDefaults sends an explicit false replaceBinding by default and passes an explicit true', async () => {
+    invokeMock.mockResolvedValue(rawSettings);
+    const bridge = createTauriHostBridge();
+    const defaults = [{ sourceId: '33333333-3333-4333-8333-333333333333', pan: -0.5 }];
+
+    await bridge.saveSourceDefaults('dev-f32', '42', defaults);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'save_source_defaults', {
+      deviceId: 'dev-f32',
+      baseSettingsRevision: '42',
+      sourceDefaults: defaults,
+      replaceBinding: false,
+    });
+
+    await bridge.saveSourceDefaults('dev-f32', '42', defaults, true);
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'save_source_defaults', {
+      deviceId: 'dev-f32',
+      baseSettingsRevision: '42',
+      sourceDefaults: defaults,
+      replaceBinding: true,
+    });
+  });
+
+  test('saveSourceLinks sends the complete pair set and an explicit replaceBinding', async () => {
+    invokeMock.mockResolvedValue(rawSettings);
+    const pairs = [{ leftSourceId: 'l', rightSourceId: 'r' }];
+
+    await createTauriHostBridge().saveSourceLinks('dev-f32', '42', pairs, true);
+
+    expect(invokeMock).toHaveBeenCalledWith('save_source_links', {
+      deviceId: 'dev-f32',
+      baseSettingsRevision: '42',
+      pairs,
+      replaceBinding: true,
+    });
+  });
+
+  test('an unknown bindingStatus is a host contract violation, never coerced', async () => {
+    invokeMock.mockResolvedValueOnce({ ...rawSettings, bindingStatus: 'mystery' });
+    await expect(createTauriHostBridge().readSourceSettings('dev-f32')).rejects.toThrow(/bindingStatus/);
+  });
+
+  test('a legacy source payload without configured metadata falls back to additive defaults', async () => {
+    invokeMock.mockResolvedValueOnce({
+      ...rawSettings,
+      catalog: {
+        catalogRevision: '34',
+        sources: [
+          { sourceId: 'legacy', physicalIndex: 0, label: 'Legacy', available: true, availableToMusicians: true },
+        ],
+      },
+    });
+    const settings = await createTauriHostBridge().readSourceSettings('dev-f32');
+    expect(settings.catalog.sources[0]).toMatchObject({
+      role: 'inputChannel',
+      stereoPair: null,
+      stereoSide: null,
+      defaultPan: 0,
+    });
   });
 });
 

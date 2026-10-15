@@ -40,10 +40,12 @@ impl Clock for TestClock {
 #[derive(Default)]
 struct RecordingDsp {
     disarms: Mutex<Vec<(SessionEpoch, SafetyGeneration)>>,
+    installs: Mutex<Vec<MixSnapshot>>,
 }
 
 impl DspControl for RecordingDsp {
-    fn install_snapshot(&self, _snapshot: MixSnapshot) -> Result<(), ControlError> {
+    fn install_snapshot(&self, snapshot: MixSnapshot) -> Result<(), ControlError> {
+        self.installs.lock().expect("dsp").push(snapshot);
         Ok(())
     }
 
@@ -79,6 +81,8 @@ fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: true,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
             SourceInfo {
                 source_id: unavailable_source(),
@@ -88,6 +92,8 @@ fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: false,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
         ],
     }
@@ -135,6 +141,7 @@ fn patch_gain_only() -> MixPatch {
             source_id: shared_source(),
             gain_db: -3.0,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -149,6 +156,7 @@ fn patch_unmute_channel() -> MixPatch {
             source_id: shared_source(),
             gain_db: -3.0,
             muted: false,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -163,6 +171,7 @@ fn patch_mute_channel() -> MixPatch {
             source_id: shared_source(),
             gain_db: -12.0,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -380,6 +389,7 @@ fn unavailable_source_is_forbidden() {
             source_id: unavailable_source(),
             gain_db: -3.0,
             muted: true,
+            pan: 0.0,
         }]),
         ..patch_gain_only()
     };
@@ -397,10 +407,36 @@ fn nonfinite_gain_is_rejected() {
             source_id: shared_source(),
             gain_db: f32::NAN,
             muted: true,
+            pan: 0.0,
         }]),
         ..patch_gain_only()
     };
     assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+}
+
+#[test]
+fn canonicalize_pan_rejects_nonfinite_and_clamps_finite() {
+    use crate::control::revisions::canonicalize_pan;
+
+    assert_eq!(canonicalize_pan(f32::NAN), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(f32::INFINITY), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(f32::NEG_INFINITY), Err(ControlError::Internal));
+    assert_eq!(canonicalize_pan(-2.0), Ok(-1.0));
+    assert_eq!(canonicalize_pan(5.0), Ok(1.0));
+    assert_eq!(canonicalize_pan(0.35), Ok(0.35));
+}
+
+#[test]
+fn silent_source_gain_is_center_and_muted() {
+    assert_eq!(
+        SourceGain::SILENT,
+        SourceGain {
+            source_id: SourceId::from_bytes([0; 16]),
+            gain_db: 0.0,
+            muted: true,
+            pan: 0.0,
+        }
+    );
 }
 
 #[test]
@@ -449,4 +485,307 @@ fn idempotent_ack_cache_replays_without_advancing_revision() {
 fn duration_helper_is_used() {
     // Keep the Duration import meaningful for the clock helper.
     let _ = Duration::from_secs(0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Linked stereo pair validation (Task 2)
+//
+// A linked pair is a single atomic edit: both members present, equal canonical pan, both
+// authorized+available together. An invalid/incomplete pair is a rejection at the control
+// boundary, never a silently degraded mono source. These use their own explicit pair catalog so
+// the existing single-source fixtures are untouched.
+// ---------------------------------------------------------------------------------------------
+
+fn pair_left() -> SourceId {
+    SourceId::from_bytes([0x41; 16])
+}
+
+fn pair_right() -> SourceId {
+    SourceId::from_bytes([0x42; 16])
+}
+
+fn pair_source_info(
+    source_id: SourceId,
+    physical_index: u16,
+    peer: SourceId,
+    side: crate::contract::StereoSide,
+    available: bool,
+) -> SourceInfo {
+    SourceInfo {
+        source_id,
+        physical_index,
+        label: format!("{source_id}"),
+        role: SourceRole::InputChannel,
+        authorized: true,
+        available,
+        stereo_pair: Some(peer),
+        stereo_side: Some(side),
+        default_pan: 0.0,
+    }
+}
+
+/// A catalog whose only pair is `pair_left`/`pair_right` (reciprocal, opposite sides). `left_avail`
+/// and `right_avail` let a test make one side unavailable.
+fn pair_catalog_with(left_avail: bool, right_avail: bool) -> CatalogSnapshot {
+    use crate::contract::StereoSide;
+    CatalogSnapshot {
+        catalog_revision: CatalogRevision(1),
+        sources: vec![
+            pair_source_info(pair_left(), 3, pair_right(), StereoSide::Left, left_avail),
+            pair_source_info(pair_right(), 1, pair_left(), StereoSide::Right, right_avail),
+        ],
+    }
+}
+
+fn pair_actor_with(left_avail: bool, right_avail: bool) -> ControlActor {
+    ControlActor::new(
+        TestClock::new(),
+        Arc::new(RecordingDsp::default()),
+        pair_catalog_with(left_avail, right_avail),
+        HostEpoch::from_bytes([0x11; 16]),
+        audio_epoch(),
+    )
+}
+
+/// A pair actor plus a handle to its recording DSP, so installs can be counted.
+fn pair_actor_and_dsp(left_avail: bool, right_avail: bool) -> (ControlActor, Arc<RecordingDsp>) {
+    let dsp = Arc::new(RecordingDsp::default());
+    let actor = ControlActor::new(
+        TestClock::new(),
+        dsp.clone(),
+        pair_catalog_with(left_avail, right_avail),
+        HostEpoch::from_bytes([0x11; 16]),
+        audio_epoch(),
+    );
+    (actor, dsp)
+}
+
+fn pair_gain(source_id: SourceId, gain_db: f32, pan: f32) -> SourceGain {
+    SourceGain {
+        source_id,
+        gain_db,
+        muted: true,
+        pan,
+    }
+}
+
+fn pair_patch(sources: &[SourceGain]) -> MixPatch {
+    MixPatch {
+        base_revision: MixRevision(0),
+        catalog_revision: CatalogRevision(1),
+        sources: SourceGainMatrix::from_slice(sources),
+        master_db: -6.0,
+        master_muted: true,
+    }
+}
+
+#[test]
+fn linked_pair_unequal_pan_is_rejected() {
+    let mut a = pair_actor_with(true, true);
+    let patch = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.5),
+        pair_gain(pair_right(), -6.0, -0.5),
+    ]);
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+}
+
+#[test]
+fn linked_pair_equal_pan_with_independent_gain_and_mute_is_accepted() {
+    let mut a = pair_actor_with(true, true);
+    // Accept a fully-muted pair first (mute is always allowed while unarmed).
+    let both_muted = pair_patch(&[
+        pair_gain(pair_left(), -3.0, -0.25),
+        pair_gain(pair_right(), -12.0, -0.25),
+    ]);
+    assert!(a.apply_patch(sess(), both_muted).is_ok(), "equal-pan pair with independent gains must pass");
+
+    // Arm so unmuting one member is permitted, then edit only that member's mute/gain.
+    let arm = listen_arm_with_gen(0);
+    assert!(a.arm(sess(), arm).is_ok());
+    // Confirm the pending arm so `armed` becomes true (the DSP ack path).
+    let confirmed = AudioEvent::ArmApplied {
+        context: crate::contract::SessionContext {
+            session_epoch: sess(),
+            audio_epoch: audio_epoch(),
+            safety_generation: SafetyGeneration(1),
+        },
+        arm_nonce: arm.arm_nonce,
+    };
+    assert!(a.on_audio_event(confirmed).is_some());
+    let mut left = pair_gain(pair_left(), -6.0, -0.25);
+    left.muted = false; // independent mute: left unmuted, right stays muted
+    let edited = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[left, pair_gain(pair_right(), -12.0, -0.25)])
+    };
+    assert!(a.apply_patch(sess(), edited).is_ok(), "independent mute on a linked pair must be allowed");
+}
+
+#[test]
+fn linked_pair_pan_equality_compares_canonicalized_values() {
+    // 1.5 and 2.0 both canonicalize to 1.0, so they are equal; -0.5 differs.
+    let mut a = pair_actor_with(true, true);
+    let accepted = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 1.5),
+        pair_gain(pair_right(), -3.0, 2.0),
+    ]);
+    assert!(a.apply_patch(sess(), accepted).is_ok(), "pan must be clamped before comparison");
+
+    let mut b = pair_actor_with(true, true);
+    let rejected = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 1.5),
+        pair_gain(pair_right(), -3.0, -0.5),
+    ]);
+    assert_eq!(b.apply_patch(sess(), rejected), Err(ControlError::Internal));
+}
+
+#[test]
+fn linked_pair_pan_equality_is_exact_not_tolerant() {
+    // A differing pair pan smaller than f32::EPSILON must still be rejected: the accepted pair state
+    // must carry one exact canonical value, not a tolerance-window match.
+    let mut a = pair_actor_with(true, true);
+    let patch = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.0),
+        pair_gain(pair_right(), -3.0, f32::EPSILON),
+    ]);
+    assert_eq!(
+        a.apply_patch(sess(), patch),
+        Err(ControlError::Internal),
+        "differing canonical pans (0.0 vs EPSILON) must be rejected exactly"
+    );
+
+    // After out-of-range clamping the two pans are bit-identical (both 1.0) and must be accepted;
+    // gains and mutes stay independent.
+    let mut b = pair_actor_with(true, true);
+    let clamped = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 5.0),
+        pair_gain(pair_right(), -12.0, 2.5),
+    ]);
+    let ack = b.apply_patch(sess(), clamped).expect("clamped pans are exactly equal");
+    assert_eq!(ack.accepted_revision, MixRevision(1));
+}
+
+#[test]
+fn linked_pair_member_absent_is_rejected_half_pair() {
+    let mut a = pair_actor_with(true, true);
+    // Only the left member is present.
+    let patch = pair_patch(&[pair_gain(pair_left(), -3.0, 0.0)]);
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+}
+
+#[test]
+fn unavailable_pair_member_is_fail_closed_together() {
+    // Right side unavailable: the whole pair is rejected, never degraded to a mono source.
+    let mut a = pair_actor_with(true, false);
+    let patch = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.0),
+        pair_gain(pair_right(), -3.0, 0.0),
+    ]);
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::SourceForbidden));
+}
+
+#[test]
+fn duplicate_source_id_in_patch_is_rejected() {
+    let mut a = control_actor();
+    let patch = MixPatch {
+        sources: SourceGainMatrix::from_slice(&[
+            pair_gain(shared_source(), -3.0, 0.0),
+            pair_gain(shared_source(), -9.0, 0.0),
+        ]),
+        ..patch_gain_only()
+    };
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+}
+
+#[test]
+fn stale_catalog_revision_is_rejected() {
+    let mut a = control_actor();
+    let patch = MixPatch {
+        catalog_revision: CatalogRevision(2), // actor catalog is revision 1
+        ..patch_gain_only()
+    };
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::RevisionConflict));
+}
+
+#[test]
+fn rejected_pair_does_not_advance_accepted_revision_or_cache() {
+    let (mut a, dsp) = pair_actor_and_dsp(true, true);
+    let patch = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.5),
+        pair_gain(pair_right(), -6.0, -0.5),
+    ]);
+    assert_eq!(a.apply_patch(sess(), patch), Err(ControlError::Internal));
+    // The rejected edit must not have changed accepted state: a valid patch still claims base 0.
+    let ok = pair_patch(&[
+        pair_gain(pair_left(), -3.0, 0.0),
+        pair_gain(pair_right(), -3.0, 0.0),
+    ]);
+    let ack = a.apply_patch(sess(), ok).expect("base revision must remain 0 after a rejection");
+    assert_eq!(ack.accepted_revision, MixRevision(1));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1, "only the accepted patch installs");
+}
+
+#[test]
+fn rejected_pair_preserves_seeded_accepted_snapshot_revision_and_ack_cache() {
+    // Seed real accepted state and an acknowledgement, then reject an unequal-pan pair, then verify
+    // the accepted snapshot, revision, DSP install count, and idempotent ack are all untouched.
+    let (mut a, dsp) = pair_actor_and_dsp(true, true);
+
+    let seed = pair_patch(&[
+        pair_gain(pair_left(), -3.0, -0.25),
+        pair_gain(pair_right(), -6.0, -0.25),
+    ]);
+    let seed_ack = a.apply_patch(sess(), seed).expect("seed accepted pair");
+    assert_eq!(seed_ack.accepted_revision, MixRevision(1));
+    a.remember_ack(sess(), "req-1", seed_ack);
+
+    let rejected = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.5),
+            pair_gain(pair_right(), -6.0, -0.5),
+        ])
+    };
+    // A rejection may still consume the pre-existing rate-limit bookkeeping token; it must not
+    // change accepted state. Use the same session so bookkeeping is observable across calls.
+    assert_eq!(a.apply_patch(sess(), rejected), Err(ControlError::Internal));
+
+    // Accepted snapshot and revision are unchanged.
+    let accepted = a.accepted_snapshot(sess()).expect("accepted snapshot present");
+    assert_eq!(accepted.mix_revision, MixRevision(1));
+    assert_eq!(accepted.sources.as_slice()[0].pan, -0.25);
+    assert_eq!(accepted.sources.as_slice()[1].pan, -0.25);
+    assert_eq!(accepted.sources.as_slice()[0].gain_db, -3.0);
+    assert_eq!(accepted.sources.as_slice()[1].gain_db, -6.0);
+    // The DSP was only asked to install the seed; the rejection never reached it.
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1, "rejection must not install to the DSP");
+    // The earlier acknowledgement is still cached verbatim, and a retry of the rejected edit using
+    // the same base revision is still a rejection (revision did not advance).
+    assert_eq!(a.cached_ack(sess(), "req-1"), Some(seed_ack));
+    let retry = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.5),
+            pair_gain(pair_right(), -6.0, -0.5),
+        ])
+    };
+    assert_eq!(a.apply_patch(sess(), retry), Err(ControlError::Internal));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 1);
+
+    // A *valid* follow-up with the base revision the seed left behind (1) must be accepted as
+    // revision 2. This proves the rejected edits (which fail at pair validation, before revision
+    // validation) did not corrupt the accepted counter, rather than only that a same-base retry
+    // still fails.
+    let valid = MixPatch {
+        base_revision: MixRevision(1),
+        ..pair_patch(&[
+            pair_gain(pair_left(), -3.0, 0.25),
+            pair_gain(pair_right(), -6.0, 0.25),
+        ])
+    };
+    let ack2 = a
+        .apply_patch(sess(), valid)
+        .expect("a valid follow-up at base revision 1 must be accepted");
+    assert_eq!(ack2.accepted_revision, MixRevision(2));
+    assert_eq!(dsp.installs.lock().unwrap().len(), 2, "the valid follow-up installs once");
 }

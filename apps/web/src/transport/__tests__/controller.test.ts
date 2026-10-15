@@ -18,7 +18,7 @@ function patchGain(db: number): MixPatch {
   return {
     baseRevision: counter('1'),
     catalogRevision: counter('1'),
-    sources: [{ sourceId: 'ch1', gainDb: db, muted: false }],
+    sources: [{ sourceId: 'ch1', gainDb: db, muted: false, pan: 0 }],
     masterDb: 0,
     masterMuted: false,
   };
@@ -30,7 +30,7 @@ const ack: MixAck = {
   canonicalSettings: {
     catalogRevision: counter('1'),
     mixRevision: counter('12'),
-    sources: [{ sourceId: 'ch1', gainDb: -9, muted: false }],
+    sources: [{ sourceId: 'ch1', gainDb: -9, muted: false, pan: 0 }],
     masterDb: 0,
     masterMuted: false,
   },
@@ -673,6 +673,234 @@ describe('receiver controller safety gate', () => {
     expect(sent.audioEpoch).toBe('audio-epoch-abc');
     // The arm must reference the revision the host just accepted, not an invented one.
     expect(sent.appliedRevision).toBe('12');
+  });
+});
+
+describe('receiver controller pan normalization and seeding', () => {
+  /** A `catalog.snapshot` with one authorized source carrying a committed default pan. */
+  function catalogWithDefault(defaultPan: number): ServerEvent {
+    return {
+      v: 1,
+      type: 'catalog.snapshot',
+      requestId: 'r',
+      hostEpoch: 'h',
+      sessionEpoch: 's',
+      payload: {
+        catalogRevision: '1',
+        sources: [
+          {
+            sourceId: 'ch1',
+            physicalIndex: 0,
+            label: 'Channel 1',
+            role: 'inputChannel',
+            authorized: true,
+            available: true,
+            stereoPair: null,
+            stereoSide: null,
+            defaultPan,
+          },
+        ],
+      },
+    } as unknown as ServerEvent;
+  }
+
+  function panPatch(pan: number, gainDb = -9): MixPatch {
+    return {
+      baseRevision: counter('1'),
+      catalogRevision: counter('1'),
+      sources: [{ sourceId: 'ch1', gainDb, muted: false, pan }],
+      masterDb: 0,
+      masterMuted: false,
+    };
+  }
+
+  test('arm bootstrap seeds the shared initialMix defaults (nonzero default pan)', async () => {
+    const { ports } = fakePorts({
+      gesture: true,
+      connectSnapshots: [sessionSnapshotEvent('audio-epoch-abc'), catalogWithDefault(0.35)],
+    });
+    const mixSpy = ports.signaling.requestMix as unknown as ReturnType<typeof vi.fn>;
+    const controller = createReceiverController(ports);
+
+    await controller.connect();
+    await expect(controller.arm()).resolves.toBeUndefined();
+
+    expect(mixSpy).toHaveBeenCalledTimes(1);
+    const patch = mixSpy.mock.calls[0][0] as { sources: { sourceId: string; gainDb: number; muted: boolean; pan: number }[] };
+    expect(patch.sources[0]).toMatchObject({ sourceId: 'ch1', gainDb: -60, muted: true, pan: 0.35 });
+    controller.disconnect();
+  });
+
+  test('outgoing legacy patch without pan is normalized to center before sending', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const send = ports.signaling.requestMix as unknown as ReturnType<typeof vi.fn>;
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    // A legacy caller omits pan; the boundary fills center rather than sending undefined.
+    await controller.requestMix({
+      baseRevision: counter('1'),
+      catalogRevision: counter('1'),
+      sources: [{ sourceId: 'ch1', gainDb: -9, muted: false } as never],
+      masterDb: 0,
+      masterMuted: false,
+    });
+    expect((send.mock.calls[0][0] as MixPatch).sources[0].pan).toBe(0);
+    controller.disconnect();
+  });
+
+  test('an explicit null/non-finite pan is rejected before any wire write', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const send = ports.signaling.requestMix as unknown as ReturnType<typeof vi.fn>;
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    await expect(controller.requestMix({
+      baseRevision: counter('1'),
+      catalogRevision: counter('1'),
+      sources: [{ sourceId: 'ch1', gainDb: -9, muted: false, pan: null } as never],
+      masterDb: 0,
+      masterMuted: false,
+    })).rejects.toThrow();
+    expect(send).not.toHaveBeenCalled();
+    controller.disconnect();
+  });
+
+  test('incoming accepted ack canonical pan is recorded verbatim', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(async patch => ({
+      acceptedRevision: counter('12'),
+      catalogRevision: patch.catalogRevision,
+      canonicalSettings: {
+        catalogRevision: patch.catalogRevision,
+        mixRevision: counter('12'),
+        sources: [{ sourceId: 'ch1', gainDb: -9, muted: false, pan: 0.4 }],
+        masterDb: 0,
+        masterMuted: false,
+      },
+    }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    await controller.requestMix(panPatch(0.4));
+    expect(controller.getSnapshot().accepted_mix?.sources[0].pan).toBe(0.4);
+    controller.disconnect();
+  });
+
+  test('a resolved legacy ack without pan carries a normalized numeric pan to the caller', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    // A legacy/partial ack omits `pan`. The snapshot is normalized, so the value handed back to
+    // `MusicianRoot` via `requestMix(...).then(...)` must be normalized too — otherwise its intent
+    // keeps `pan: undefined` while the applied echo normalizes to 0 and `Applied` never matches.
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(async patch => ({
+      acceptedRevision: counter('12'),
+      catalogRevision: patch.catalogRevision,
+      canonicalSettings: {
+        catalogRevision: patch.catalogRevision,
+        mixRevision: counter('12'),
+        sources: [{ sourceId: 'ch1', gainDb: -9, muted: false } as never],
+        masterDb: 0,
+        masterMuted: false,
+      },
+    }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const ack = await controller.requestMix(panPatch(0.4));
+    expect(ack.canonicalSettings.sources[0].pan).toBe(0);
+    // The resolved value must agree with the recorded accepted snapshot (single source of truth).
+    expect(ack.canonicalSettings).toEqual(controller.getSnapshot().accepted_mix);
+    controller.disconnect();
+  });
+
+  test('a same-session resume keeps its accepted pan even when the catalog default changes', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const accepted = { ...panPatch(0.7), mixRevision: counter('12') };
+    emit({ type: 'session.snapshot', sessionEpoch: 's', hostEpoch: 'h', payload: {
+      phase: 'ready-muted', context: { audioEpoch: 'a', safetyGeneration: '0' },
+      requestedMix: accepted, acceptedMix: accepted, appliedMix: null,
+    } } as unknown as ServerEvent);
+    // The host later projects a different default; the accepted mix must not be reseeded.
+    emit(catalogWithDefault(0.35));
+    expect(controller.getSnapshot().accepted_mix?.sources[0].pan).toBe(0.7);
+    controller.disconnect();
+  });
+
+  test('rapid queued gain and pan edits preserve the final pan and gain together', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    let first!: (ack: MixAck) => void;
+    const send = ports.signaling.requestMix as unknown as ReturnType<typeof vi.fn>;
+    send.mockImplementationOnce(() => new Promise(r => { first = r; }))
+      .mockImplementation(async patch => ({ acceptedRevision: counter('14'),
+        catalogRevision: patch.catalogRevision,
+        canonicalSettings: { ...patch, mixRevision: counter('14') } }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const one = controller.requestMix(panPatch(0.2, -9));
+    const two = controller.requestMix(panPatch(-0.5, -3));
+    expect(send).toHaveBeenCalledTimes(1);
+    first({ acceptedRevision: counter('13'), catalogRevision: counter('1'),
+      canonicalSettings: { ...panPatch(0.2, -9), mixRevision: counter('13') } });
+    await Promise.all([one, two]);
+    expect(send.mock.calls[1][0]).toMatchObject({
+      baseRevision: '13',
+      sources: [{ sourceId: 'ch1', gainDb: -3, muted: false, pan: -0.5 }],
+    });
+    controller.disconnect();
+  });
+
+  test('a rejected pan edit rolls the requested echo back to the accepted pan', async () => {
+    const { ports } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.requestMix).mockImplementation(async patch => ({
+      acceptedRevision: counter('12'),
+      catalogRevision: patch.catalogRevision,
+      canonicalSettings: { ...patch, mixRevision: counter('12') },
+    }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    await controller.requestMix(panPatch(0.4));
+    vi.mocked(ports.signaling.requestMix).mockRejectedValueOnce(new Error('Revision conflict'));
+    await expect(controller.requestMix(panPatch(-0.9))).rejects.toThrow('Revision conflict');
+    expect(controller.getSnapshot().requested_mix?.sources[0].pan).toBe(0.4);
+    controller.disconnect();
+  });
+
+  test('canceled pan edit cannot be restored by a stale ack after stop', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    vi.mocked(ports.signaling.requestMix).mockImplementation(async patch => ({
+      acceptedRevision: counter('12'),
+      catalogRevision: patch.catalogRevision,
+      canonicalSettings: { ...patch, mixRevision: counter('12') },
+    }));
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    await controller.requestMix(panPatch(0.4));
+    let release!: (ack: MixAck) => void;
+    vi.mocked(ports.signaling.requestMix).mockImplementationOnce(() => new Promise(r => { release = r; }));
+    const pending = controller.requestMix(panPatch(-0.9)).catch(() => undefined);
+    controller.stop();
+    const stopped = controller.getSnapshot();
+    release({ acceptedRevision: counter('99'), catalogRevision: counter('1'),
+      canonicalSettings: { ...panPatch(-0.9), mixRevision: counter('99') } });
+    await pending;
+    await new Promise(r => setTimeout(r, 0));
+    expect(controller.getSnapshot()).toEqual(stopped);
+    // A late `mix.ack` frame for the canceled request must not restore pan either.
+    emit({ type: 'mix.ack', requestId: 'old', payload: { acceptedRevision: counter('100'),
+      catalogRevision: counter('1'), canonicalSettings: { ...panPatch(-0.9), mixRevision: counter('100') } } } as unknown as ServerEvent);
+    expect(controller.getSnapshot().accepted_mix?.sources[0].pan).toBe(0.4);
+    controller.disconnect();
+  });
+
+  test('an accepted mix with an out-of-range pan is clamped on the incoming boundary', async () => {
+    const { ports, emit } = fakePorts({ connectSnapshots: [sessionSnapshotEvent('a')] });
+    const controller = createReceiverController(ports);
+    await controller.connect();
+    const raw = { ...panPatch(1.5), mixRevision: counter('12') };
+    emit({ type: 'session.snapshot', sessionEpoch: 's', hostEpoch: 'h', payload: {
+      phase: 'ready-muted', context: { audioEpoch: 'a', safetyGeneration: '0' },
+      requestedMix: raw, acceptedMix: raw, appliedMix: null,
+    } } as unknown as ServerEvent);
+    expect(controller.getSnapshot().accepted_mix?.sources[0].pan).toBe(1);
+    controller.disconnect();
   });
 });
 

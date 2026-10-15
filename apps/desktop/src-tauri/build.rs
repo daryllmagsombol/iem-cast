@@ -20,6 +20,9 @@ fn main() {
             "list_output_devices",
             "start_monitor",
             "stop_monitor",
+            "read_source_settings",
+            "save_source_defaults",
+            "save_source_links",
         ])),
     )
     .expect("failed to run tauri-build");

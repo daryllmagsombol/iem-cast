@@ -12,6 +12,9 @@ import type {
   DeviceInfo,
   InterfaceInfo,
   SourceInfo,
+  SourceLinkPair,
+  SourcePanDefault,
+  SourceSettings,
   StartHostRequest,
   StartHostResult,
 } from '../protocol';
@@ -65,6 +68,32 @@ export interface HostBridge {
   sourceCatalog(deviceId: string | null): Promise<SourceInfo[]>;
   setAvailableSources(ids: string[]): Promise<CatalogSnapshot>;
   setSourceLabel(id: string, label: string): Promise<CatalogSnapshot>;
+  /**
+   * Read the committed source-settings view for the selected device. Read prepares/reuses the
+   * in-memory preview without writes; `settingsRevision` is the committed save base.
+   */
+  readSourceSettings(deviceId: string): Promise<SourceSettings>;
+  /**
+   * Save the **complete** default vector for the device against a base settings revision. This must
+   * not install a mix or change routing; `replaceBinding` defaults to `false` and only an explicit
+   * `true` (stopped host) may replace an incompatible binding.
+   */
+  saveSourceDefaults(
+    deviceId: string,
+    baseSettingsRevision: string,
+    sourceDefaults: SourcePanDefault[],
+    replaceBinding?: boolean,
+  ): Promise<SourceSettings>;
+  /**
+   * Replace the complete pair set atomically. Requires a stopped host; resets affected defaults to
+   * center and advances the catalog/routing binding. `replaceBinding` defaults to `false`.
+   */
+  saveSourceLinks(
+    deviceId: string,
+    baseSettingsRevision: string,
+    pairs: SourceLinkPair[],
+    replaceBinding?: boolean,
+  ): Promise<SourceSettings>;
   issuePairingCredential(): Promise<PairingCredential>;
   /** Enumerate the host machine's output devices for the local monitor. */
   listOutputDevices(): Promise<OutputDeviceInfo[]>;

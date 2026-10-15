@@ -3,7 +3,7 @@
 //! These tests exercise the real HTTP boundary functions, not `ControlActor` directly, so the
 //! server-boundary authorization claims are actually under test.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::contract::{
@@ -132,6 +132,8 @@ pub fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: true,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
             SourceInfo {
                 source_id: unavailable_source(),
@@ -141,6 +143,8 @@ pub fn test_catalog() -> CatalogSnapshot {
                 authorized: true,
                 available: false,
                 stereo_pair: None,
+                stereo_side: None,
+                default_pan: 0.0,
             },
         ],
     }
@@ -177,6 +181,7 @@ pub fn patch_source_gain(source_id: SourceId, gain_db: f32) -> MixPatch {
             source_id,
             gain_db,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
@@ -661,6 +666,123 @@ fn connect_session_pushes_session_and_catalog_snapshots_in_order() {
     );
     assert_eq!(messages[0]["payload"]["phase"], "paired");
     assert!(messages[0]["payload"]["acceptedMix"].is_null());
+
+    assert_eq!(messages[1]["type"], "catalog.snapshot");
+    assert_eq!(messages[1]["payload"]["catalogRevision"], "1");
+    assert_eq!(messages[1]["payload"]["sources"].as_array().unwrap().len(), 2);
+}
+
+/// Find the default pan for `source` in a raw `catalog.snapshot` payload.
+fn payload_default_pan(payload: &serde_json::Value, source: SourceId) -> f32 {
+    let sources = payload["sources"].as_array().expect("sources array");
+    let entry = sources
+        .iter()
+        .find(|s| s["sourceId"] == source.to_string())
+        .expect("source present in catalog");
+    entry["defaultPan"].as_f64().expect("defaultPan is a number") as f32
+}
+
+#[test]
+fn initial_catalog_provider_tracks_a_live_cache_for_new_sessions_without_touching_existing_state() {
+    // The provider must read a *live* cache: a defaults-only change is visible to a NEW connection
+    // while an already-connected session receives nothing and the actor's routing catalog, revision,
+    // and accepted mix stay untouched. A constant provider cannot prove any of this.
+    let mut server = build_server_with_catalog();
+
+    // Install a cache-reading provider ONCE. The cache starts as the actor's catalog (same source
+    // ids, map, and revision); only a default pan is later changed.
+    let cache: Arc<RwLock<CatalogSnapshot>> = Arc::new(RwLock::new(server.catalog().clone()));
+    let cache_for_provider = Arc::clone(&cache);
+    let provider: crate::host::InitialCatalogProvider =
+        Arc::new(move || cache_for_provider.read().expect("catalog cache").clone());
+    server.set_initial_catalog_provider(provider);
+
+    // Listener A connects and establishes an accepted mix; drain its initial snapshots.
+    let session_a = test_session_a();
+    server
+        .control
+        .apply_patch(session_a, patch_source_gain(shared_source(), -3.0))
+        .expect("patch");
+    let (mut rx_a, _tx_a) = server.connect_session(session_a);
+    let a_initial = drain_all(&mut rx_a);
+    assert_eq!(a_initial.len(), 2, "A received its initial snapshots");
+
+    let accepted_before = server.control.accepted_snapshot(session_a);
+    let routing_revision_before = server.catalog().catalog_revision;
+
+    // Default pan A→B ONLY: the shared source's committed default moves while every source id, the
+    // map, and the catalog revision stay exactly the same.
+    {
+        let mut guard = cache.write().expect("catalog cache");
+        let entry = guard
+            .sources
+            .iter_mut()
+            .find(|s| s.source_id == shared_source())
+            .expect("shared source present");
+        assert_eq!(entry.default_pan, 0.0, "the cache starts from A's centered default");
+        entry.default_pan = 0.5;
+    }
+
+    // A NEW session (not an A reconnect) connects and reads the updated default from the provider.
+    let new_session = SessionEpoch::from_bytes([0x77; 16]);
+    assert_ne!(new_session, session_a);
+    let (mut rx_new, _tx_new) = server.connect_session(new_session);
+    let new_messages = drain_all(&mut rx_new);
+    assert_eq!(new_messages.len(), 2);
+    assert_eq!(new_messages[1]["type"], "catalog.snapshot");
+
+    let catalog_payload = &new_messages[1]["payload"];
+    // Same source ids, map, and revision (1) — only the default pan changed.
+    assert_eq!(
+        catalog_payload["catalogRevision"],
+        routing_revision_before.get().to_string(),
+        "the fresh catalog keeps the same revision"
+    );
+    assert_eq!(
+        catalog_payload["sources"].as_array().unwrap().len(),
+        2,
+        "the same source map"
+    );
+    assert_eq!(
+        payload_default_pan(catalog_payload, shared_source()),
+        0.5,
+        "the NEW session reads the live cache's updated default pan"
+    );
+    assert_eq!(
+        payload_default_pan(catalog_payload, unavailable_source()),
+        0.0,
+        "an unchanged source keeps its default"
+    );
+    // Source identities are the same ids as the actor catalog (no re-mint).
+    let new_ids: Vec<String> = catalog_payload["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["sourceId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(new_ids.contains(&shared_source().to_string()));
+    assert!(new_ids.contains(&unavailable_source().to_string()));
+
+    // The existing session's registered outbound received NOTHING: a defaults-only cache change is
+    // not broadcast to musicians already connected.
+    assert!(
+        drain_all(&mut rx_a).is_empty(),
+        "existing listener A must not receive a broadcast on a defaults-only change"
+    );
+
+    // The actor's routing catalog revision and A's accepted mix are unchanged.
+    assert_eq!(server.catalog().catalog_revision, routing_revision_before);
+    assert_eq!(server.control.accepted_snapshot(session_a), accepted_before);
+}
+
+#[test]
+fn absent_initial_catalog_provider_preserves_the_static_fixture_catalog() {
+    // With no provider installed (the fixture default), a fresh connection still reads the static
+    // catalog exactly as before. This guards the `None` fallback.
+    let mut server = build_server_with_catalog();
+    let session = test_session_a();
+    let (mut rx, _tx) = server.connect_session(session);
+    let messages = drain_all(&mut rx);
 
     assert_eq!(messages[1]["type"], "catalog.snapshot");
     assert_eq!(messages[1]["payload"]["catalogRevision"], "1");

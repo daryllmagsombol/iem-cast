@@ -20,7 +20,9 @@ use crate::ids::{
 use crate::server::pairing::{PairStore, PairingCredential};
 use crate::server::protocol::ServerMessage;
 
-use super::revisions::{canonicalize_gain, RateLimiter, PATCH_BURST, PATCH_RATE_PER_SEC};
+use super::revisions::{
+    canonicalize_gain, canonicalize_pan, RateLimiter, PATCH_BURST, PATCH_RATE_PER_SEC,
+};
 
 /// Bounded number of accepted-patch acknowledgements retained for idempotency.
 const REQUEST_CACHE_LIMIT: usize = 64;
@@ -178,6 +180,75 @@ impl ControlActor {
         self.catalog.sources.iter().find(|s| s.source_id == source)
     }
 
+    /// Resolve and validate patch entries into canonical gains before mutating any state.
+    ///
+    /// Duplicate source ids in one patch are rejected as an inconsistent absolute mix, as are
+    /// forbidden/unavailable sources and non-canonical gain/pan values.
+    fn resolve_canonical_sources(&self, request: &MixPatch) -> Result<Vec<SourceGain>, ControlError> {
+        let mut canonical: Vec<SourceGain> = Vec::with_capacity(request.sources.len as usize);
+        for entry in request.sources.as_slice() {
+            // Duplicate source IDs in one patch are an inconsistent absolute mix: reject.
+            if canonical.iter().any(|g| g.source_id == entry.source_id) {
+                return Err(ControlError::Internal);
+            }
+            let info = self
+                .catalog_source(entry.source_id)
+                .ok_or(ControlError::SourceForbidden)?;
+            if !info.authorized || !info.available {
+                return Err(ControlError::SourceForbidden);
+            }
+            let gain_db = canonicalize_gain(entry.gain_db)?;
+            let pan = canonicalize_pan(entry.pan)?;
+            canonical.push(SourceGain {
+                source_id: entry.source_id,
+                gain_db,
+                muted: entry.muted,
+                pan,
+            });
+        }
+        Ok(canonical)
+    }
+
+    /// Linked-pair integrity: validate the catalog's reciprocal metadata and require the patch to
+    /// carry the pair as a unit with one canonical pan. Any inconsistent or half pair is rejected
+    /// wholesale, never routed as a silently degraded mono source.
+    fn validate_pair_integrity(&self, canonical: &[SourceGain]) -> Result<(), ControlError> {
+        for entry in canonical {
+            let info = self
+                .catalog_source(entry.source_id)
+                .ok_or(ControlError::SourceForbidden)?;
+            let Some(peer_id) = info.stereo_pair else {
+                // An unpaired source must carry no side.
+                if info.stereo_side.is_some() {
+                    return Err(ControlError::Internal);
+                }
+                continue;
+            };
+            // A pair member present without its reciprocal peer is an incomplete (half) pair.
+            let peer = canonical
+                .iter()
+                .find(|g| g.source_id == peer_id)
+                .ok_or(ControlError::Internal)?;
+            let peer_info = self
+                .catalog_source(peer_id)
+                .ok_or(ControlError::SourceForbidden)?;
+            let reciprocal = peer_info.stereo_pair == Some(entry.source_id)
+                && peer_info.role == info.role
+                && info.stereo_side.is_some()
+                && peer_info.stereo_side.is_some()
+                && info.stereo_side != peer_info.stereo_side;
+            if !reciprocal {
+                return Err(ControlError::Internal);
+            }
+            // Both members must carry the exact same canonical pan (compare after clamping): one
+            // atomic pair edit has one shared balance value, not a tolerance-window match.
+            if entry.pan != peer.pan {
+                return Err(ControlError::Internal);
+            }
+        }
+        Ok(())
+    }
+
     /// Apply an absolute mix patch for an authenticated session.
     ///
     /// Rejects stale base revisions, forbidden sources, and unmutes while unarmed. Mute and gain
@@ -200,22 +271,15 @@ impl ControlActor {
         }
 
         // Resolve and validate entries before mutating any state.
-        let mut canonical: Vec<SourceGain> = Vec::with_capacity(request.sources.len as usize);
-        let mut unmute_forbidden = false;
-        for entry in request.sources.as_slice() {
-            let info = self
-                .catalog_source(entry.source_id)
-                .ok_or(ControlError::SourceForbidden)?;
-            if !info.authorized || !info.available {
-                return Err(ControlError::SourceForbidden);
-            }
-            let gain_db = canonicalize_gain(entry.gain_db)?;
-            canonical.push(SourceGain {
-                source_id: entry.source_id,
-                gain_db,
-                muted: entry.muted,
-            });
+        let canonical = self.resolve_canonical_sources(&request)?;
+        // The patch must target the catalog revision the actor currently serves.
+        if request.catalog_revision != catalog_revision {
+            return Err(ControlError::RevisionConflict);
         }
+        // Linked-pair integrity: validate the catalog's reciprocal metadata and require the patch
+        // to carry the pair as a unit with one canonical pan. Any inconsistent or half pair is
+        // rejected wholesale, never routed as a silently degraded mono source.
+        self.validate_pair_integrity(&canonical)?;
         let master_db = canonicalize_gain(request.master_db)?;
 
         // Validate and build the snapshot under a scoped borrow, then release it before the DSP
@@ -226,20 +290,7 @@ impl ControlActor {
                 return Err(ControlError::RevisionConflict);
             }
 
-            for entry in &canonical {
-                let previously_muted = state
-                    .previous_muted
-                    .get(&entry.source_id)
-                    .copied()
-                    .unwrap_or(true);
-                if !entry.muted && previously_muted && !state.armed {
-                    unmute_forbidden = true;
-                }
-            }
-            if !request.master_muted && state.previous_master_muted && !state.armed {
-                unmute_forbidden = true;
-            }
-            if unmute_forbidden {
+            if unmute_forbidden(state, &canonical, &request) {
                 return Err(ControlError::UnarmedUnmuteForbidden);
             }
 
@@ -425,4 +476,19 @@ impl ControlActor {
             state.cache.pop_front();
         }
     }
+}
+
+/// True when the patch would unmute a currently muted source (or the master) while disarmed.
+fn unmute_forbidden(state: &SessionState, canonical: &[SourceGain], request: &MixPatch) -> bool {
+    for entry in canonical {
+        let previously_muted = state
+            .previous_muted
+            .get(&entry.source_id)
+            .copied()
+            .unwrap_or(true);
+        if !entry.muted && previously_muted && !state.armed {
+            return true;
+        }
+    }
+    !request.master_muted && state.previous_master_muted && !state.armed
 }

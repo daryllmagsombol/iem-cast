@@ -5,9 +5,13 @@
  * may import this module; the LAN musician bundle must never reach it (musicians go through
  * `receiver-ports.ts`).
  *
- * The Rust commands take the caller's window label as their first argument, which the shell
+ * The legacy Rust commands take the caller's window label as their first argument, which the shell
  * verifies against the operator window. We read it from the current Tauri window rather than
  * hard-coding it, so a mislabelled window is rejected by the host instead of trusted here.
+ *
+ * The new source-settings commands (`read_source_settings`/`save_source_defaults`/
+ * `save_source_links`) instead authorize the **actual injected caller window** natively and take no
+ * frontend `windowLabel`, so no identity is passed from here for them.
  */
 
 import { invoke, isTauri } from '@tauri-apps/api/core';
@@ -15,14 +19,19 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 
 import type { HostBridge, HostDefaults, OutputDeviceInfo, PairingCredential } from './contracts';
 import type {
+  BindingStatus,
   CatalogSnapshot,
   CounterString,
   DeviceInfo,
   InterfaceInfo,
   SampleFormat,
   SourceInfo,
+  SourceLinkPair,
+  SourcePanDefault,
+  SourceSettings,
   StartHostRequest,
   StartHostResult,
+  StereoSide,
 } from '../protocol';
 
 /** Raw shapes returned by the Rust commands (camelCase). */
@@ -43,15 +52,32 @@ interface RawSourceInfo {
   sourceId: string;
   physicalIndex: number;
   label: string;
+  /** Configured role (`inputChannel`/`masterLr`); legacy payloads may omit it. */
+  role?: string;
   /** Physical presence reported by the capture backend. */
   available: boolean;
   /** Operator cast flag: whether the source is published to musicians. */
   availableToMusicians: boolean;
+  /** Configured reciprocal stereo peer, when linked (legacy payloads omit it). */
+  stereoPair?: string | null;
+  /** Configured side (`left`/`right`), when linked (legacy payloads omit it). */
+  stereoSide?: string | null;
+  /** Configured default pan (legacy payloads omit it → center). */
+  defaultPan?: number;
 }
 
 interface RawCatalogSnapshot {
   catalogRevision: string;
   sources: RawSourceInfo[];
+}
+
+interface RawSourceSettings {
+  deviceId: string;
+  inputChannels: number;
+  settingsRevision: string;
+  bindingStatus: string;
+  durabilityUncertain: boolean;
+  catalog: RawCatalogSnapshot;
 }
 
 interface RawStartHostResult {
@@ -121,24 +147,34 @@ function toDevice(raw: RawDeviceInfo): DeviceInfo {
 }
 
 /**
- * Map the reduced bridge source onto the full contract source.
+ * Map the bridge source onto the full contract source.
  *
- * The Rust bridge omits `role`, `authorized`, and `stereoPair`; it reports physical presence
- * (`available`) and the operator cast flag (`availableToMusicians`). We do not invent the omitted
- * fields: `available` reflects the physical flag AND the cast flag, and authorization is the
- * explicit cast flag only (conservative — never assumed from physical presence). Role and stereo
- * pairing are not inferred from hardware, so they keep the contract defaults.
+ * The Rust bridge reports physical presence (`available`) and the operator cast flag
+ * (`availableToMusicians`). Authorization is the explicit cast flag only (conservative — never
+ * assumed from physical presence); `available` reflects the physical flag AND the cast flag.
+ *
+ * Configured metadata (`role`, `stereoPair`, `stereoSide`, `defaultPan`) is carried **verbatim**
+ * from the committed/prepared projection, so a real map is never reported as hardcoded mono. Only
+ * when a legacy payload omits a field do we fall back to the additive contract default
+ * (`inputChannel` / `null` / `null` / `0`) — never a fabricated pairing or side.
  */
 function toSource(raw: RawSourceInfo): SourceInfo {
   const castEnabled = raw.availableToMusicians === true;
+  const role = raw.role === 'masterLr' ? 'masterLr' : 'inputChannel';
+  const stereoSide: StereoSide | null =
+    raw.stereoSide === 'left' || raw.stereoSide === 'right' ? raw.stereoSide : null;
   return {
     sourceId: raw.sourceId,
     physicalIndex: raw.physicalIndex,
     label: raw.label,
-    role: 'inputChannel',
+    role,
     authorized: castEnabled,
     available: raw.available === true && castEnabled,
-    stereoPair: null,
+    stereoPair: typeof raw.stereoPair === 'string' ? raw.stereoPair : null,
+    stereoSide,
+    defaultPan: typeof raw.defaultPan === 'number' && Number.isFinite(raw.defaultPan)
+      ? Math.min(1, Math.max(-1, raw.defaultPan))
+      : 0,
   };
 }
 
@@ -151,6 +187,27 @@ function toCatalog(raw: RawCatalogSnapshot): CatalogSnapshot {
   return {
     catalogRevision: raw.catalogRevision as CounterString,
     sources: raw.sources.map(toSource),
+  };
+}
+
+/** Map the host binding status onto the frozen union; an unknown value is a contract violation. */
+function toBindingStatus(raw: string): BindingStatus {
+  if (raw === 'saved' || raw === 'new' || raw === 'replacement' || raw === 'legacy') return raw;
+  throw new Error(`unknown bindingStatus from host: ${raw}`);
+}
+
+/**
+ * Decode the host `SourceSettings` verbatim into the frozen contract, preserving the truthful
+ * `bindingStatus` and `durabilityUncertain` flags rather than inferring an ordinary save.
+ */
+function toSourceSettings(raw: RawSourceSettings): SourceSettings {
+  return {
+    deviceId: raw.deviceId,
+    inputChannels: raw.inputChannels,
+    settingsRevision: raw.settingsRevision as CounterString,
+    bindingStatus: toBindingStatus(raw.bindingStatus),
+    durabilityUncertain: raw.durabilityUncertain === true,
+    catalog: toCatalog(raw.catalog),
   };
 }
 
@@ -243,6 +300,44 @@ export function createTauriHostBridge(): HostBridge {
         label: labelText,
       });
       return toCatalog(raw);
+    },
+
+    async readSourceSettings(deviceId: string) {
+      // The new commands authorize the ACTUAL injected caller window natively, so they take no
+      // frontend `windowLabel` argument: sending one would be identity the host must not trust.
+      const raw = await callInvoke<RawSourceSettings>('read_source_settings', { deviceId });
+      return toSourceSettings(raw);
+    },
+
+    async saveSourceDefaults(
+      deviceId: string,
+      baseSettingsRevision: string,
+      sourceDefaults: SourcePanDefault[],
+      replaceBinding = false,
+    ) {
+      const raw = await callInvoke<RawSourceSettings>('save_source_defaults', {
+        deviceId,
+        baseSettingsRevision,
+        sourceDefaults,
+        // Explicit false by default; only an explicit `true` asks the host to replace a binding.
+        replaceBinding,
+      });
+      return toSourceSettings(raw);
+    },
+
+    async saveSourceLinks(
+      deviceId: string,
+      baseSettingsRevision: string,
+      pairs: SourceLinkPair[],
+      replaceBinding = false,
+    ) {
+      const raw = await callInvoke<RawSourceSettings>('save_source_links', {
+        deviceId,
+        baseSettingsRevision,
+        pairs,
+        replaceBinding,
+      });
+      return toSourceSettings(raw);
     },
 
     async issuePairingCredential() {

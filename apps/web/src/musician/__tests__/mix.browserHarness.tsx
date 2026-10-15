@@ -21,7 +21,7 @@ export async function mountMixReceiver() {
         push('session.snapshot', { phase: 'ready-muted', context: { audioEpoch: 'browser-audio' } });
         push('catalog.snapshot', { catalogRevision: '1', sources: [{ sourceId: 'vocal',
           label: 'Lead vocal', physicalIndex: 0, available: true, authorized: true,
-          role: 'inputChannel', stereoPair: null }] });
+          role: 'inputChannel', stereoPair: null, stereoSide: null, defaultPan: 0 }] });
       },
       requestMix: patch => {
         calls.push(patch);

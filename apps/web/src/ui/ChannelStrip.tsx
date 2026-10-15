@@ -1,6 +1,7 @@
 import { useId } from 'react';
 import { DigitalMeter } from './DigitalMeter';
 import { GainControl } from './GainControl';
+import { PanControl } from './PanControl';
 
 export interface ChannelStripState {
   sourceId: string;
@@ -11,28 +12,46 @@ export interface ChannelStripState {
   appliedMuted?: boolean;
   pending?: boolean;
   accepted?: boolean;
+  /** Normalized `[-1, 1]` pan/position for this source; used only when a pan slot is supplied. */
+  pan?: number;
+}
+
+/** Mono source pan. A linked pair uses ONE group-level balance owned by the caller, not this slot. */
+export interface ChannelStripPan {
+  /** Visible short label, e.g. "Pan". */
+  label: string;
+  /** Normalized `[-1, 1]` value. */
+  value: number;
+  /** Complete accessible name including the source, e.g. "Lead vocal pan". */
+  fullLabel: string;
+  onChange(value: number): void;
+  onReset(): void;
+  disabled?: boolean;
 }
 
 export interface ChannelStripProps {
-  state: ChannelStripState;
-  onGainChange(db: number): void;
-  onMuteChange(muted: boolean): void;
+  readonly state: ChannelStripState;
+  readonly onGainChange: (db: number) => void;
+  readonly onMuteChange: (muted: boolean) => void;
+  /** Optional mono pan control rendered after gain. Pair balance is not set here. */
+  readonly pan?: ChannelStripPan;
   /** Optional stereo-link description, e.g. "Linked stereo pair". */
-  linkLabel?: string;
+  readonly linkLabel?: string;
   /** Optional digital peak in dBFS; `undefined` shows Unavailable. */
-  meterValueDbfs?: number;
+  readonly meterValueDbfs?: number;
   /** Full accessible name when the visible label is ellipsized. */
-  fullLabel?: string;
+  readonly fullLabel?: string;
   /** Adds SIMULATED badges (Pages demo only). */
-  simulated?: boolean;
-  disabled?: boolean;
-  canUnmute?: boolean;
+  readonly simulated?: boolean;
+  readonly disabled?: boolean;
+  readonly canUnmute?: boolean;
 }
 
 export function ChannelStrip({
   state,
   onGainChange,
   onMuteChange,
+  pan,
   linkLabel,
   meterValueDbfs,
   fullLabel,
@@ -69,6 +88,17 @@ export function ChannelStrip({
         simulated={simulated}
         disabled={disabled}
       />
+
+      {pan ? (
+        <PanControl
+          label={pan.label}
+          value={pan.value}
+          fullLabel={pan.fullLabel}
+          onChange={pan.onChange}
+          onReset={pan.onReset}
+          disabled={disabled || pan.disabled}
+        />
+      ) : null}
 
       <div className="flex flex-col gap-1">
         <p className="font-mono text-caption tabular-nums text-text">

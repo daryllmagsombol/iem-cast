@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::ids::{
     ArmNonce, AudioEpoch, CatalogRevision, ChannelMapRevision, HostEpoch, MixRevision, RequestId,
-    SafetyGeneration, SessionEpoch, SourceId, AUDIO_SLOT_SAMPLES, BOUNDED_PACKET_BYTES,
-    MAX_SOURCES, STEREO_PCM_SAMPLES,
+    SafetyGeneration, SessionEpoch, SettingsRevision, SourceId, AUDIO_SLOT_SAMPLES,
+    BOUNDED_PACKET_BYTES, MAX_SOURCES, STEREO_PCM_SAMPLES,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -146,6 +146,14 @@ pub enum SourceRole {
     MasterLr,
 }
 
+/// Which side of an explicitly linked stereo pair a source occupies.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StereoSide {
+    Left,
+    Right,
+}
+
 /// Maps an interleaved physical index to a stable source identity and role.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +161,8 @@ pub struct ChannelMapEntry {
     pub physical_index: u16,
     pub source_id: SourceId,
     pub stereo_pair: Option<SourceId>,
+    #[serde(default)]
+    pub stereo_side: Option<StereoSide>,
     pub role: SourceRole,
 }
 
@@ -167,8 +177,33 @@ pub struct Config {
     pub labels: Vec<(SourceId, String)>,
 }
 
+/// A per-source default pan/balance entry in the [`ConfigV2`] `sourceDefaults` vector.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePanDefault {
+    pub source_id: SourceId,
+    pub pan: f32,
+}
+
+/// The current (v2) persisted configuration shape.
+///
+/// [`Config`] (v1) remains the legacy decode target and is kept unchanged; migration between the
+/// two is explicit. Floats (`sourceDefaults[].pan`) mean this type keeps `PartialEq` but not `Eq`.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigV2 {
+    pub version: u32,
+    pub device_id: Option<String>,
+    pub selected_interface: Option<String>,
+    pub input_channels: Option<u16>,
+    pub settings_revision: SettingsRevision,
+    pub channel_map: Vec<ChannelMapEntry>,
+    pub labels: Vec<(SourceId, String)>,
+    pub source_defaults: Vec<SourcePanDefault>,
+}
+
 /// Catalog view of one source as shown to the operator.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceInfo {
     pub source_id: SourceId,
@@ -178,6 +213,10 @@ pub struct SourceInfo {
     pub authorized: bool,
     pub available: bool,
     pub stereo_pair: Option<SourceId>,
+    #[serde(default)]
+    pub stereo_side: Option<StereoSide>,
+    #[serde(default)]
+    pub default_pan: f32,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -191,6 +230,10 @@ pub struct SourceGain {
     pub source_id: SourceId,
     pub gain_db: f32,
     pub muted: bool,
+    /// Pan/balance position in `[-1.0, 1.0]`. `#[serde(default)]` decodes an omitted pan as
+    /// `0.0` (center); an explicit `null` remains a decode error.
+    #[serde(default)]
+    pub pan: f32,
 }
 
 impl SourceGain {
@@ -199,6 +242,7 @@ impl SourceGain {
         source_id: SourceId(Uuid::nil()),
         gain_db: 0.0,
         muted: true,
+        pan: 0.0,
     };
 }
 

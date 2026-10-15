@@ -68,6 +68,10 @@ pub struct HostServer {
     assets: Arc<dyn AssetProvider>,
     /// The versioned source catalog, sent to a listener as an initial `catalog.snapshot`.
     catalog: CatalogSnapshot,
+    /// Optional per-connection initial-catalog provider. When `Some`, a **fresh** connection is sent
+    /// the provider's current snapshot instead of the static `catalog`; the static catalog still
+    /// backs actor validation and routing. `None` preserves the static behavior.
+    initial_catalog_provider: Option<crate::host::InitialCatalogProvider>,
     /// Per-authenticated-session outbound push channels (unsolicited server messages).
     outbound: HashMap<SessionEpoch, mpsc::Sender<String>>,
     /// Bounded receiver for [`AudioEvent`]s published by the DSP bridge.
@@ -147,9 +151,23 @@ impl HostServer {
             hub,
             assets,
             catalog,
+            initial_catalog_provider: None,
             outbound: HashMap::new(),
             audio_events: None,
         }
+    }
+
+    /// Install a per-connection initial-catalog provider.
+    ///
+    /// When set, a **freshly connected** session is sent the provider's current snapshot instead of
+    /// the static `catalog`. The provider is expected to read a small committed-projection cache
+    /// (never the native/store mutexes) so a defaults-only save is visible to new connections without
+    /// broadcasting to existing musicians or advancing the actor's routing catalog revision.
+    pub fn set_initial_catalog_provider(
+        &mut self,
+        provider: crate::host::InitialCatalogProvider,
+    ) {
+        self.initial_catalog_provider = Some(provider);
     }
 
     /// Install the receiver for [`AudioEvent`]s published by the DSP bridge.
@@ -271,11 +289,19 @@ impl HostServer {
     }
 
     /// Build the initial snapshots pushed immediately after a socket upgrade.
+    ///
+    /// The `catalog.snapshot` is taken from the installed provider when present, so a fresh
+    /// connection reads the current committed-projection template. The session snapshot and the
+    /// actor's routing catalog (including its revision) are unchanged, and nothing is broadcast.
     pub fn initial_snapshots(&self, session: SessionEpoch) -> Vec<String> {
         let host_epoch = self.control.host_epoch();
         let session_snapshot = ServerMessage::SessionSnapshot(self.session_snapshot(session))
             .to_envelope_json(host_epoch, RequestId(String::new()));
-        let catalog_snapshot = ServerMessage::CatalogSnapshot(self.catalog.clone())
+        let catalog = match &self.initial_catalog_provider {
+            Some(provider) => provider(),
+            None => self.catalog.clone(),
+        };
+        let catalog_snapshot = ServerMessage::CatalogSnapshot(catalog)
             .to_envelope_json(host_epoch, RequestId(String::new()));
         vec![session_snapshot, catalog_snapshot]
     }

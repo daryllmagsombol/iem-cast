@@ -29,8 +29,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use crate::audio::engine::MAX_SESSIONS;
 use crate::capture::service::{CaptureBackend, SystemCaptureBackend};
 use crate::contract::{
-    AssetProvider, AudioEvent, CaptureFault, CatalogSnapshot, ChannelMapEntry, Clock, ControlError,
-    InterruptReason, MixSnapshot, SourceInfo, SourceRole, StartHostRequest, SystemClock,
+    AssetProvider, AudioEvent, CaptureFault, CatalogSnapshot, ChannelMapEntry, Clock, ConfigV2,
+    ControlError, InterruptReason, MixSnapshot, SourceInfo, SourcePanDefault, SourceRole,
+    StartHostRequest, SystemClock,
 };
 use crate::control::actor::ControlActor;
 use crate::control::auth::{OriginPolicy, OsEntropy};
@@ -447,6 +448,15 @@ impl HostSession {
         self.socket.local_addr()
     }
 
+    /// The actual full input-channel count the started capture stream is configured for.
+    ///
+    /// This forwards the real runtime's getter (the count the built stream negotiated), so a
+    /// composition can compare it against the verified binding after capture has actually started
+    /// instead of re-running a preflight probe. There is no preflight echo here.
+    pub fn configured_channels(&self) -> u16 {
+        self.runtime.configured_channels()
+    }
+
     /// Stop capture, stop the media pump, and join cleanly. Idempotent.
     pub fn stop(&mut self) {
         // Wake the pump so it observes the stop flag promptly. The guard is dropped before stopping
@@ -536,6 +546,14 @@ impl Drop for HostServerHandle {
     }
 }
 
+/// A provider for the catalog snapshot pushed to a **freshly connected** session.
+///
+/// The composition installs a closure that reads a small committed-projection cache (never the
+/// native/store mutexes) so a defaults-only save changes what a new connection reads without
+/// broadcasting to existing musicians or advancing the running routing catalog revision. The static
+/// actor catalog remains unchanged.
+pub type InitialCatalogProvider = Arc<dyn Fn() -> CatalogSnapshot + Send + Sync>;
+
 /// The composition inputs for [`HostSession::start_server`], so callers do not pass a long
 /// positional argument list.
 pub struct ServerConfig {
@@ -549,6 +567,10 @@ pub struct ServerConfig {
     pub assets: Arc<dyn AssetProvider>,
     /// The versioned source catalog the actor validates patches against.
     pub catalog: CatalogSnapshot,
+    /// Optional per-connection initial-catalog provider. `None` preserves the previous behavior:
+    /// every fresh connection is sent the static `catalog`. When `Some`, a fresh connection is sent
+    /// the provider's current snapshot instead (the actor's validation catalog is not changed).
+    pub initial_catalog_provider: Option<InitialCatalogProvider>,
 }
 
 impl HostSession {
@@ -579,6 +601,7 @@ impl HostSession {
             origin,
             assets,
             catalog,
+            initial_catalog_provider,
         } = bundle;
         // `tls` paths are only needed to load `config`; `start_server` already validated them.
         let _ = tls;
@@ -623,6 +646,12 @@ impl HostSession {
             catalog,
         );
         plane.set_audio_events(audio_rx);
+        // A per-connection provider lets a fresh phone see the current committed template without
+        // changing the actor's static validation/routing catalog. `None` preserves the old static
+        // behavior.
+        if let Some(provider) = initial_catalog_provider {
+            plane.set_initial_catalog_provider(provider);
+        }
         // Keep the authoritative server reachable from the returned handle so the operator can
         // mint fresh pairing credentials against the SAME actor the router serves. Without this
         // the actor would be unreachable and credential minting could only be faked.
@@ -767,8 +796,24 @@ fn with_static_assets(router: Router, assets: Arc<dyn AssetProvider>) -> Router 
 }
 
 /// Build a draft catalog directly from a channel map (used by the standalone `serve` binary).
+///
+/// Kept source-compatible for existing callers: every source defaults to center pan. Use
+/// [`catalog_from_channel_map_with_defaults`] or [`catalog_from_config`] to project committed
+/// defaults.
 pub fn catalog_from_channel_map(
     channel_map: &[ChannelMapEntry],
+    revision: CatalogRevision,
+) -> CatalogSnapshot {
+    catalog_from_channel_map_with_defaults(channel_map, &[], revision)
+}
+
+/// Build a catalog from a channel map plus committed per-source defaults.
+///
+/// The default pan is looked up by source id; a source without a committed default (e.g. a fresh
+/// map with no defaults vector) falls back to center. Role/pair/side are carried verbatim.
+pub fn catalog_from_channel_map_with_defaults(
+    channel_map: &[ChannelMapEntry],
+    source_defaults: &[SourcePanDefault],
     revision: CatalogRevision,
 ) -> CatalogSnapshot {
     let sources = channel_map
@@ -782,6 +827,54 @@ pub fn catalog_from_channel_map(
             authorized: true,
             available: true,
             stereo_pair: entry.stereo_pair,
+            stereo_side: entry.stereo_side,
+            default_pan: source_defaults
+                .iter()
+                .find(|default| default.source_id == entry.source_id)
+                .map(|default| default.pan)
+                .unwrap_or(0.0),
+        })
+        .collect();
+    CatalogSnapshot {
+        catalog_revision: revision,
+        sources,
+    }
+}
+
+/// Project a committed [`ConfigV2`] into the operator/phone catalog.
+///
+/// Labels committed with the config are used when present, falling back to the deterministic
+/// "Channel N" name. A source with no committed default is centered; role/pair/side come from the
+/// committed map. This is projection only: it never broadcasts or advances any live revision, so a
+/// defaults-only save changes what a **fresh** connection reads without touching existing sessions.
+pub fn catalog_from_config(config: &ConfigV2, revision: CatalogRevision) -> CatalogSnapshot {
+    let sources = config
+        .channel_map
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let label = config
+                .labels
+                .iter()
+                .find(|(id, _)| *id == entry.source_id)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| format!("Channel {}", index + 1));
+            SourceInfo {
+                source_id: entry.source_id,
+                physical_index: entry.physical_index,
+                label,
+                role: entry.role,
+                authorized: true,
+                available: true,
+                stereo_pair: entry.stereo_pair,
+                stereo_side: entry.stereo_side,
+                default_pan: config
+                    .source_defaults
+                    .iter()
+                    .find(|default| default.source_id == entry.source_id)
+                    .map(|default| default.pan)
+                    .unwrap_or(0.0),
+            }
         })
         .collect();
     CatalogSnapshot {
@@ -884,6 +977,7 @@ pub fn default_channel_map(channels: u16) -> Vec<ChannelMapEntry> {
             physical_index: index,
             source_id: SourceId::from_bytes([index as u8; 16]),
             stereo_pair: None,
+            stereo_side: None,
             role: SourceRole::InputChannel,
         })
         .collect()
@@ -1224,6 +1318,84 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map[1].physical_index, 1);
         assert_eq!(map[1].role, SourceRole::InputChannel);
+        assert_eq!(map[1].stereo_side, None);
+        assert_eq!(map[1].stereo_pair, None);
+    }
+
+    #[test]
+    fn catalog_from_config_projects_committed_defaults_and_labels() {
+        // A committed default projects into a fresh catalog; a source without one stays centered.
+        let config = ConfigV2 {
+            version: crate::config::CONFIG_VERSION,
+            device_id: Some("dev".to_string()),
+            selected_interface: None,
+            input_channels: Some(2),
+            settings_revision: crate::ids::SettingsRevision(3),
+            channel_map: vec![
+                ChannelMapEntry {
+                    physical_index: 0,
+                    source_id: SourceId::from_bytes([0x11; 16]),
+                    stereo_pair: None,
+                    stereo_side: None,
+                    role: SourceRole::InputChannel,
+                },
+                ChannelMapEntry {
+                    physical_index: 1,
+                    source_id: SourceId::from_bytes([0x22; 16]),
+                    stereo_pair: None,
+                    stereo_side: None,
+                    role: SourceRole::InputChannel,
+                },
+            ],
+            labels: vec![(SourceId::from_bytes([0x11; 16]), "Kick".to_string())],
+            source_defaults: vec![SourcePanDefault {
+                source_id: SourceId::from_bytes([0x11; 16]),
+                pan: 0.35,
+            }],
+        };
+
+        let catalog = catalog_from_config(&config, CatalogRevision(0));
+        assert_eq!(catalog.catalog_revision, CatalogRevision(0));
+        assert_eq!(catalog.sources[0].label, "Kick");
+        assert_eq!(catalog.sources[0].default_pan, 0.35);
+        // No committed default for source 2: centered, and the deterministic label is retained.
+        assert_eq!(catalog.sources[1].default_pan, 0.0);
+        assert_eq!(catalog.sources[1].label, "Channel 2");
+    }
+
+    #[test]
+    fn host_session_forwards_the_actual_configured_channel_count() {
+        // The composition must compare the *actual started* capture layout, not a discovery max or
+        // the drafted map. Build the fake stream with 3 channels but a 2-entry channel map, so a
+        // `channel_map.len()` implementation would return 2 and fail here.
+        let backend = PushingBackend {
+            channels: 3,
+            frames: 128,
+            blocks: 0,
+        };
+        let draft_map = default_channel_map(2);
+        assert_eq!(
+            draft_map.len(),
+            2,
+            "the draft map deliberately differs from the actual configured count"
+        );
+
+        let session = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            draft_map,
+        )
+        .expect("host session starts");
+
+        assert_eq!(
+            session.configured_channels(),
+            3,
+            "the accessor must forward the real runtime getter, not the map length"
+        );
+
+        drop(session);
     }
 
     #[test]
@@ -1258,6 +1430,7 @@ mod tests {
                 source_id: SourceId::from_bytes([0x11; 16]),
                 gain_db: -6.0,
                 muted: true,
+                pan: 0.0,
             }]),
             master_db: 0.0,
             master_muted: true,
@@ -1567,6 +1740,7 @@ mod tests {
             origin: OriginPolicy::new(vec!["https://localhost".to_string()]),
             assets: Arc::new(OneAsset),
             catalog: catalog_from_channel_map(&default_channel_map(1), CatalogRevision(0)),
+            initial_catalog_provider: None,
         };
 
         let server = session

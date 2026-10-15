@@ -26,7 +26,7 @@ export function mountDiagnostics() {
     root.render(
       <ReceiverView
         phase="ready-muted"
-        catalog={[{ sourceId: 'fixture-source', physicalIndex: 0, label, role: 'inputChannel', available: true, authorized: true, stereoPair: null }]}
+        catalog={[{ sourceId: 'fixture-source', physicalIndex: 0, label, role: 'inputChannel', available: true, authorized: true, stereoPair: null, stereoSide: null, defaultPan: 0 }]}
         channels={[{ sourceId: 'fixture-source', label, requestedDb: -12, muted: true }]}
         masterRequestedDb={-18}
         masterMuted
@@ -34,6 +34,8 @@ export function mountDiagnostics() {
         onMasterGainChange={() => {}}
         onChannelGainChange={() => {}}
         onChannelMuteChange={() => {}}
+        onChannelPanChange={() => {}}
+        onPairBalanceChange={() => {}}
         onStop={() => {}}
         diagnostics={{ ...snapshot, ...overrides }}
         meters={{}}

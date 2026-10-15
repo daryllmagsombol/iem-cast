@@ -52,6 +52,9 @@ export type SampleFormat = 'F32' | 'I16' | 'U16';
 /** Source role in the mix. */
 export type SourceRole = 'inputChannel' | 'masterLr';
 
+/** Which side of an explicitly linked stereo pair a source occupies. */
+export type StereoSide = 'left' | 'right';
+
 export interface DeviceInfo {
   deviceId: string;
   name: string;
@@ -83,11 +86,53 @@ export interface SourceInfo {
   authorized: boolean;
   available: boolean;
   stereoPair: SourceId | null;
+  /** Side within an explicitly linked stereo pair; `null` when unpaired (legacy decodes as null). */
+  stereoSide: StereoSide | null;
+  /** Committed default pan/balance in `[-1, 1]`; absent legacy input decodes as `0` (center). */
+  defaultPan: number;
 }
 
 export interface CatalogSnapshot {
   catalogRevision: CounterString;
   sources: SourceInfo[];
+}
+
+/**
+ * Which binding state a {@link SourceSettings} view describes.
+ *
+ * `saved` is a committed profile matching the selected device/layout; `new` is a fresh prepared
+ * candidate; `replacement` is a committed profile for a different device/layout that needs explicit
+ * consent; `legacy` is a migrated profile whose layout is unresolved. The UI distinguishes an
+ * unsaved preview from an installed profile from this, never by comparing revisions.
+ */
+export type BindingStatus = 'saved' | 'new' | 'replacement' | 'legacy';
+
+/** One per-source default pan/balance entry in a save payload. */
+export interface SourcePanDefault {
+  sourceId: string;
+  pan: number;
+}
+
+/** One explicit left/right stereo link in a save payload. */
+export interface SourceLinkPair {
+  leftSourceId: string;
+  rightSourceId: string;
+}
+
+/**
+ * The source-settings view for a selected device (operator-only).
+ *
+ * `settingsRevision` always denotes the **committed save base** (not a saved draft).
+ * `durabilityUncertain` is `true` only for an installed view whose restart durability was not
+ * confirmed, so the UI must not report ordinary success.
+ */
+export interface SourceSettings {
+  deviceId: string;
+  inputChannels: number;
+  settingsRevision: CounterString;
+  bindingStatus: BindingStatus;
+  durabilityUncertain: boolean;
+  catalog: CatalogSnapshot;
 }
 
 export interface StartHostRequest {
@@ -113,6 +158,12 @@ export interface SourceGain {
   sourceId: SourceId;
   gainDb: number;
   muted: boolean;
+  /**
+   * Pan/balance position in the canonical `[-1, 1]` range. Legacy incoming snapshots may omit it,
+   * in which case `normalizeSourceGain` fills center (`0`); the rest of the app can treat it as
+   * always present and finite.
+   */
+  pan: number;
 }
 
 /**

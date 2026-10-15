@@ -242,22 +242,55 @@ config loading (`OPENCODE_DISABLE_PROJECT_CONFIG=true`) rather than trusting it.
 
 ## Coverage
 
-No coverage report is configured. Evidence: the repository's current scripts and
-lockfiles contain no coverage tooling — `apps/web` runs `vitest` without a coverage
-provider installed, and no Rust coverage tool is pinned. Inventing LCOV paths would
-produce a broken or misleading scan, so `sonar-project.properties` omits them.
+Coverage is wired into the SonarQube scan. Two independent producers emit
+**LCOV**, both referenced by `sonar-project.properties`:
 
-To add coverage later:
+| Producer | Command | Report | Job |
+|---|---|---|---|
+| Web (TS/React) | `npm run test:coverage --workspace apps/web` (Vitest v8 provider) | `apps/web/coverage/lcov.info` | `sonarqube` (ubuntu-latest) |
+| Rust workspace | `cargo llvm-cov --workspace --locked --lcov --output-path rust-coverage/lcov.info` (cargo-llvm-cov) | `rust-coverage/lcov.info` | `rust-coverage` (macos-15) |
 
-1. Add the tooling (a vitest coverage provider for `apps/web`; a pinned Rust coverage
-   tool).
-2. Generate a report in `tests.yml` (or `sonarqube.yml`) after the existing steps.
-3. Only then add real paths to `sonar-project.properties`:
-   - `sonar.javascript.lcov.reportPaths=apps/web/coverage/lcov.info`
-   - `sonar.rust.lcov.reportPaths=lcov.info` (or `sonar.rust.cobertura.reportPaths=cobertura.xml`)
+`sonarqube.yml` therefore has two jobs:
 
-SonarQube's Rust analyzer supports LCOV and Cobertura import; verify against your
-server version.
+- **`rust-coverage`** — `macos-15`, because the workspace's Tauri desktop crate has
+  macOS-only native dependencies (same reason as the `rust` job in `tests.yml`). It
+  builds the web bundles first (the desktop crate embeds `apps/web/dist/musician` and
+  a test asserts the join page is present), installs Rust `1.90` + `llvm-tools-preview`,
+  installs cargo-llvm-cov via `taiki-e/install-action@cargo-llvm-cov`, runs
+  `cargo llvm-cov … --lcov`, and uploads `rust-coverage/lcov.info` as the
+  `rust-coverage-lcov` artifact.
+- **`sonarqube`** — `needs: rust-coverage`. After `npm ci` it runs the web coverage
+  (`npm run test:coverage --workspace apps/web`), downloads the Rust artifact into
+  `rust-coverage/`, then scans. Coverage generation is gated on the same credential
+  check as the scan, so a skipped scan (fork PR / unconfigured repo) does not run the
+  suites. `-Dsonar.qualitygate.wait=true` is unchanged.
+
+### Report paths are repo-relative (required)
+
+SonarQube resolves each LCOV `SF:` path against `sonar.projectBaseDir` (the repo
+root). Vitest's lcov reporter defaults to paths like `SF:src/...`, which then resolve
+to nothing and report **0%** coverage. `apps/web/vitest.config.ts` therefore sets the
+lcov reporter's `projectRoot` to the monorepo root
+(`fileURLToPath(new URL('../..', import.meta.url))`), so entries are repo-relative
+(`SF:apps/web/src/...`). Removing that override silently reverts to 0%. The Rust
+report is generated from the repo root, so its paths are already repo-relative.
+
+### `sonar-project.properties`
+
+```
+sonar.javascript.lcov.reportPaths=apps/web/coverage/lcov.info
+sonar.rust.lcov.reportPaths=rust-coverage/lcov.info
+```
+
+`sonar.javascript.lcov.reportPaths` covers TypeScript too; the
+`sonar.typescript.lcov.reportPaths` property is deprecated and must not be added.
+
+### Server-side Rust import support
+
+Importing Rust LCOV is supported by SonarQube Community Build **25.5+** (it is not
+part of older releases). Verify the server version before relying on the Rust
+coverage condition on the quality gate; on an older server the web report is still
+imported, but the `sonar.rust.lcov.reportPaths` import is ignored.
 
 ## Local verification
 
@@ -267,6 +300,7 @@ Performed in the authoring environment (macOS, Node 24.20.0, Cargo/rustc 1.90.0)
 |---|---|
 | `npm ci --dry-run --ignore-scripts` | Passed (lockfile consistent) |
 | `npm test` | Passed (23 files, 159 tests) |
+| `npm run test:coverage --workspace apps/web` | Passed; emitted `apps/web/coverage/lcov.info` with repo-relative `SF:apps/web/src/...` paths |
 | `npm run build:web` | Passed (typecheck + admin/musician builds) |
 | `node apps/web/src/musician/__tests__/mix.browser.mjs` (from `apps/web`) | Passed |
 | `cargo test --workspace --locked` | Passed (8 suites) |
@@ -274,7 +308,10 @@ Performed in the authoring environment (macOS, Node 24.20.0, Cargo/rustc 1.90.0)
 
 What cannot be validated locally: an actual GitHub Actions run, an actual SonarQube
 scan/quality-gate result, and an actual AI review comment. None of these should be
-reported as passing until they run green in CI with credentials configured.
+reported as passing until they run green in CI with credentials configured. The Rust
+coverage command (`cargo llvm-cov`) was **not** run locally (the tool is not installed
+in the authoring environment); the `rust-coverage` job and its artifact handoff are
+verified only by inspection plus `actionlint`, not by an actual run.
 
 ## Publishing
 

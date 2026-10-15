@@ -6,6 +6,9 @@ import type {
   HostBridge,
   InterfaceInfo,
   SourceInfo,
+  SourceLinkPair,
+  SourcePanDefault,
+  SourceSettings,
   StartHostRequest,
   StartHostResult,
 } from '../../protocol';
@@ -75,6 +78,40 @@ export function fakeBridge(credential: PairingCredential): FakeBridge {
     sourceCatalog: async (_deviceId: string | null): Promise<SourceInfo[]> => [],
     setAvailableSources: async (): Promise<CatalogSnapshot> => catalog,
     setSourceLabel: async (): Promise<CatalogSnapshot> => catalog,
+    readSourceSettings: async (_deviceId: string): Promise<SourceSettings> => ({
+      deviceId: '',
+      inputChannels: 0,
+      settingsRevision: '0' as SourceSettings['settingsRevision'],
+      bindingStatus: 'new',
+      durabilityUncertain: false,
+      catalog,
+    }),
+    saveSourceDefaults: async (
+      _deviceId: string,
+      _baseSettingsRevision: string,
+      _sourceDefaults: SourcePanDefault[],
+      _replaceBinding?: boolean,
+    ): Promise<SourceSettings> => ({
+      deviceId: '',
+      inputChannels: 0,
+      settingsRevision: '0' as SourceSettings['settingsRevision'],
+      bindingStatus: 'new',
+      durabilityUncertain: false,
+      catalog,
+    }),
+    saveSourceLinks: async (
+      _deviceId: string,
+      _baseSettingsRevision: string,
+      _pairs: SourceLinkPair[],
+      _replaceBinding?: boolean,
+    ): Promise<SourceSettings> => ({
+      deviceId: '',
+      inputChannels: 0,
+      settingsRevision: '0' as SourceSettings['settingsRevision'],
+      bindingStatus: 'new',
+      durabilityUncertain: false,
+      catalog,
+    }),
     issuePairingCredential: async (): Promise<PairingCredential> => {
       bridge.issueCalls += 1;
       // Deliberately redacted: never log the one-use fragment token from joinUrl.

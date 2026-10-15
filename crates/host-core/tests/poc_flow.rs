@@ -81,6 +81,8 @@ fn catalog() -> CatalogSnapshot {
             authorized: true,
             available: true,
             stereo_pair: None,
+            stereo_side: None,
+            default_pan: 0.0,
         }],
     }
 }
@@ -111,6 +113,7 @@ fn patch(gain_db: f32) -> MixPatch {
             source_id: source(),
             gain_db,
             muted: true,
+            pan: 0.0,
         }]),
         master_db: -6.0,
         master_muted: true,
