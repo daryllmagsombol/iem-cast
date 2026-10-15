@@ -22,7 +22,11 @@ mod tests;
 /// guarantee.
 pub const BUS_HEADROOM_DB: f32 = -6.0;
 
-/// Frames per codec frame (initial 2.5 ms at 48 kHz).
+/// Frames per codec frame (2.5 ms at 48 kHz).
+///
+/// 2.5 ms (120 frames) is the latency-first default: it keeps the per-frame fill latency minimal.
+/// A 5 ms frame (240 frames) would add ~2.5 ms of fill latency, which fights the low-latency goal,
+/// so it is intentionally not chosen here.
 pub const CODEC_FRAME_FRAMES: u32 = 120;
 
 /// Maximum number of 120-frame frames one 256-frame input block can produce.

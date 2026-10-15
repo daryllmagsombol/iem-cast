@@ -2,8 +2,8 @@
 //!
 //! One worker per active listener (max 2 for the POC). Encoding is allocation-free: a reused
 //! interleaved input buffer (240 floats for 120 stereo frames) feeds a reused fixed output buffer;
-//! `encode_vec` is never used. Initial mode is 48 kHz stereo low-delay at 128 kbps with DTX and
-//! inband FEC disabled.
+//! `encode_vec` is never used. Initial mode is 48 kHz stereo low-delay (CELT-only) at 256 kbps
+//! with DTX and inband FEC disabled and an expected packet loss of 2%.
 
 use std::time::Instant;
 
@@ -29,10 +29,21 @@ impl OpusWorker {
     pub fn new() -> Result<Self, EncodeFault> {
         let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::LowDelay)
             .map_err(|_| EncodeFault::EncoderInit)?;
+        // 256 kbps rather than the RFC 6716 64-128 kbps "sweet spot": that range assumes 20 ms
+        // frames, whereas 2.5 ms frames have less coding gain, so a higher bitrate is needed for
+        // equivalent stereo-music quality.
         encoder
-            .set_bitrate(Bitrate::Bits(128_000))
+            .set_bitrate(Bitrate::Bits(256_000))
+            .map_err(|_| EncodeFault::EncoderInit)?;
+        // LAN-appropriate expected packet loss (2%). `set_packet_loss_perc` is provided by the
+        // locked `opus` 0.4.0 crate; in-band FEC itself remains unavailable because this encoder
+        // uses Application::LowDelay (OPUS_APPLICATION_RESTRICTED_LOWDELAY, CELT-only).
+        encoder
+            .set_packet_loss_perc(2)
             .map_err(|_| EncodeFault::EncoderInit)?;
         encoder.set_dtx(false).map_err(|_| EncodeFault::EncoderInit)?;
+        // In-band FEC only exists in the LPC/SILK layer; it is unavailable in the CELT-only
+        // restricted-lowdelay mode, so leaving it off is correct.
         encoder
             .set_inband_fec(false)
             .map_err(|_| EncodeFault::EncoderInit)?;
