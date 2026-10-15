@@ -60,143 +60,12 @@ impl RoutingPlan {
         let count = map.len();
         let mut invalid = vec![false; count];
 
-        // Duplicate source identities: every entry sharing an identity is ambiguous.
-        for i in 0..count {
-            if (0..count).any(|j| j != i && map[j].source_id == map[i].source_id) {
-                invalid[i] = true;
-            }
-        }
-        // Duplicate physical bindings: every entry on the shared index is ambiguous.
-        for i in 0..count {
-            if (0..count).any(|j| j != i && map[j].physical_index == map[i].physical_index) {
-                invalid[i] = true;
-            }
-        }
+        mark_duplicate_identities(map, &mut invalid);
+        mark_duplicate_physical_bindings(map, &mut invalid);
+        mark_base_link_validity(map, &mut invalid);
+        propagate_invalidity(map, &mut invalid);
 
-        // Unique peer lookup: `None` when the peer id is absent **or ambiguous** (multiple entries
-        // share it). An ambiguous match is an invalid link, never a first-match guess.
-        let peer_of = |i: usize| -> Option<usize> {
-            let peer_id = map[i].stereo_pair?;
-            let mut found: Option<usize> = None;
-            for (j, entry) in map.iter().enumerate() {
-                if j != i && entry.source_id == peer_id {
-                    if found.is_some() {
-                        return None; // ambiguous identity match
-                    }
-                    found = Some(j);
-                }
-            }
-            found
-        };
-
-        // Base link validity: an orphan side, an absent/ambiguous peer, or a non-reciprocal / role-
-        // mismatched / same-side link closes the endpoint(s) it implicates.
-        for i in 0..count {
-            match map[i].stereo_pair {
-                None => {
-                    if map[i].stereo_side.is_some() {
-                        invalid[i] = true;
-                    }
-                }
-                Some(_) => match peer_of(i) {
-                    Some(j) => {
-                        let peer = &map[j];
-                        let valid = peer.stereo_pair == Some(map[i].source_id)
-                            && peer.role == map[i].role
-                            && map[i].stereo_side.is_some()
-                            && peer.stereo_side.is_some()
-                            && map[i].stereo_side != peer.stereo_side;
-                        if !valid {
-                            invalid[i] = true;
-                            invalid[j] = true;
-                        }
-                    }
-                    None => invalid[i] = true,
-                },
-            }
-        }
-
-        // Propagate invalidity to a fixpoint through reciprocal partners. A conflicting incoming
-        // claim (e.g. C -> A alongside a valid reciprocal A <-> B) leaves A invalid; that must close
-        // B as well, not leave B audible. Bounded `n <= MAX_SOURCES`, no graph framework.
-        loop {
-            let mut changed = false;
-            for i in 0..count {
-                if map[i].stereo_pair.is_none() {
-                    continue;
-                }
-                match peer_of(i) {
-                    Some(j) => {
-                        if invalid[i] || invalid[j] {
-                            if !invalid[i] {
-                                invalid[i] = true;
-                                changed = true;
-                            }
-                            if !invalid[j] {
-                                invalid[j] = true;
-                                changed = true;
-                            }
-                        }
-                    }
-                    None => {
-                        if !invalid[i] {
-                            invalid[i] = true;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // Assign audible routes only to entries (and pair endpoints) that survived validation.
-        let mut routes = vec![Route::Silent; count];
-        let mut assigned: Vec<Option<u8>> = vec![None; count];
-        let mut group_anchor: Vec<SourceId> = Vec::with_capacity(count);
-
-        for (index, entry) in map.iter().enumerate() {
-            if invalid[index] {
-                continue;
-            }
-            // An unpaired legacy master keeps the parity split unchanged and ignores pan.
-            if entry.stereo_pair.is_none() && entry.role == SourceRole::MasterLr {
-                routes[index] = if entry.physical_index % 2 == 0 {
-                    Route::ParityLeft
-                } else {
-                    Route::ParityRight
-                };
-                continue;
-            }
-            match entry.stereo_pair {
-                None => {
-                    // Unpaired, no side: a mono pan source with its own shared ramp group.
-                    let group = group_anchor.len() as u8;
-                    group_anchor.push(entry.source_id);
-                    assigned[index] = Some(group);
-                    routes[index] = Route::MonoPan { group };
-                }
-                Some(_) => {
-                    if let Some(group) = assigned[index] {
-                        routes[index] = side_route(entry.stereo_side, group);
-                        continue;
-                    }
-                    // A validated pair has a unique in-map peer; require **both** endpoints valid
-                    // before assigning the shared group.
-                    let peer_index = peer_of(index)
-                        .expect("a valid pair entry has a unique in-map peer");
-                    if invalid[peer_index] {
-                        continue;
-                    }
-                    let group = group_anchor.len() as u8;
-                    group_anchor.push(entry.source_id);
-                    assigned[index] = Some(group);
-                    assigned[peer_index] = Some(group);
-                    routes[index] = side_route(entry.stereo_side, group);
-                }
-            }
-        }
+        let (routes, group_anchor) = assign_routes(map, &invalid);
 
         let entries = map
             .iter()
@@ -229,6 +98,165 @@ impl RoutingPlan {
     pub fn group_anchor(&self, group: usize) -> Option<SourceId> {
         self.group_anchor.get(group).copied()
     }
+}
+
+/// Unique peer lookup: `None` when the peer id is absent **or ambiguous** (multiple entries share
+/// it). An ambiguous match is an invalid link, never a first-match guess.
+#[inline]
+fn unique_peer_of(map: &[ChannelMapEntry], index: usize) -> Option<usize> {
+    let peer_id = map[index].stereo_pair?;
+    let mut found: Option<usize> = None;
+    for (j, entry) in map.iter().enumerate() {
+        if j != index && entry.source_id == peer_id {
+            if found.is_some() {
+                return None; // ambiguous identity match
+            }
+            found = Some(j);
+        }
+    }
+    found
+}
+
+/// Duplicate source identities: every entry sharing an identity is ambiguous.
+#[inline]
+fn mark_duplicate_identities(map: &[ChannelMapEntry], invalid: &mut [bool]) {
+    for i in 0..map.len() {
+        if (0..map.len()).any(|j| j != i && map[j].source_id == map[i].source_id) {
+            invalid[i] = true;
+        }
+    }
+}
+
+/// Duplicate physical bindings: every entry on the shared index is ambiguous.
+#[inline]
+fn mark_duplicate_physical_bindings(map: &[ChannelMapEntry], invalid: &mut [bool]) {
+    for i in 0..map.len() {
+        if (0..map.len()).any(|j| j != i && map[j].physical_index == map[i].physical_index) {
+            invalid[i] = true;
+        }
+    }
+}
+
+/// Base link validity: an orphan side, an absent/ambiguous peer, or a non-reciprocal / role-
+/// mismatched / same-side link closes the endpoint(s) it implicates.
+#[inline]
+fn mark_base_link_validity(map: &[ChannelMapEntry], invalid: &mut [bool]) {
+    for i in 0..map.len() {
+        match map[i].stereo_pair {
+            None => {
+                if map[i].stereo_side.is_some() {
+                    invalid[i] = true;
+                }
+            }
+            Some(_) => match unique_peer_of(map, i) {
+                Some(j) => {
+                    let peer = &map[j];
+                    let valid = peer.stereo_pair == Some(map[i].source_id)
+                        && peer.role == map[i].role
+                        && map[i].stereo_side.is_some()
+                        && peer.stereo_side.is_some()
+                        && map[i].stereo_side != peer.stereo_side;
+                    if !valid {
+                        invalid[i] = true;
+                        invalid[j] = true;
+                    }
+                }
+                None => invalid[i] = true,
+            },
+        }
+    }
+}
+
+/// Propagate invalidity to a fixpoint through reciprocal partners. A conflicting incoming claim
+/// (e.g. C -> A alongside a valid reciprocal A <-> B) leaves A invalid; that must close B as well,
+/// not leave B audible. Bounded `n <= MAX_SOURCES`, no graph framework.
+#[inline]
+fn propagate_invalidity(map: &[ChannelMapEntry], invalid: &mut [bool]) {
+    loop {
+        let mut changed = false;
+        for i in 0..map.len() {
+            if map[i].stereo_pair.is_none() {
+                continue;
+            }
+            match unique_peer_of(map, i) {
+                Some(j) => {
+                    if invalid[i] || invalid[j] {
+                        if !invalid[i] {
+                            invalid[i] = true;
+                            changed = true;
+                        }
+                        if !invalid[j] {
+                            invalid[j] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                None => {
+                    if !invalid[i] {
+                        invalid[i] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Assign audible routes only to entries (and pair endpoints) that survived validation, returning
+/// the per-entry routes and the shared pan/balance group anchors.
+#[inline]
+fn assign_routes(map: &[ChannelMapEntry], invalid: &[bool]) -> (Vec<Route>, Vec<SourceId>) {
+    let count = map.len();
+    let mut routes = vec![Route::Silent; count];
+    let mut assigned: Vec<Option<u8>> = vec![None; count];
+    let mut group_anchor: Vec<SourceId> = Vec::with_capacity(count);
+
+    for (index, entry) in map.iter().enumerate() {
+        if invalid[index] {
+            continue;
+        }
+        // An unpaired legacy master keeps the parity split unchanged and ignores pan.
+        if entry.stereo_pair.is_none() && entry.role == SourceRole::MasterLr {
+            routes[index] = if entry.physical_index % 2 == 0 {
+                Route::ParityLeft
+            } else {
+                Route::ParityRight
+            };
+            continue;
+        }
+        match entry.stereo_pair {
+            None => {
+                // Unpaired, no side: a mono pan source with its own shared ramp group.
+                let group = group_anchor.len() as u8;
+                group_anchor.push(entry.source_id);
+                assigned[index] = Some(group);
+                routes[index] = Route::MonoPan { group };
+            }
+            Some(_) => {
+                if let Some(group) = assigned[index] {
+                    routes[index] = side_route(entry.stereo_side, group);
+                    continue;
+                }
+                // A validated pair has a unique in-map peer; require **both** endpoints valid
+                // before assigning the shared group.
+                let peer_index =
+                    unique_peer_of(map, index).expect("a valid pair entry has a unique in-map peer");
+                if invalid[peer_index] {
+                    continue;
+                }
+                let group = group_anchor.len() as u8;
+                group_anchor.push(entry.source_id);
+                assigned[index] = Some(group);
+                assigned[peer_index] = Some(group);
+                routes[index] = side_route(entry.stereo_side, group);
+            }
+        }
+    }
+
+    (routes, group_anchor)
 }
 
 fn side_route(side: Option<StereoSide>, group: u8) -> Route {

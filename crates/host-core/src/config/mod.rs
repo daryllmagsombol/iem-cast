@@ -688,6 +688,15 @@ fn validate_legacy_load(config: &ConfigV2) -> Result<(), ConfigError> {
 /// Validate a configured channel map: unique ids and indices, reciprocal pairs with opposite sides
 /// and matching roles, and no dangling, self, or overlapping links.
 pub fn validate_source_map(map: &[ChannelMapEntry]) -> Result<(), ConfigError> {
+    validate_unique_bindings(map)?;
+    for entry in map {
+        validate_map_entry(map, entry)?;
+    }
+    Ok(())
+}
+
+/// Reject duplicate source ids and duplicate physical indices in a channel map.
+fn validate_unique_bindings(map: &[ChannelMapEntry]) -> Result<(), ConfigError> {
     let mut ids = HashSet::new();
     let mut indices = HashSet::new();
     for entry in map {
@@ -695,36 +704,42 @@ pub fn validate_source_map(map: &[ChannelMapEntry]) -> Result<(), ConfigError> {
             return Err(ConfigError::Corrupt);
         }
     }
-
-    for entry in map {
-        match (entry.stereo_pair, entry.stereo_side) {
-            // An explicit complete link.
-            (Some(peer), Some(side)) => {
-                if peer == entry.source_id {
-                    return Err(ConfigError::Corrupt);
-                }
-                let peer_entry = map
-                    .iter()
-                    .find(|candidate| candidate.source_id == peer)
-                    .ok_or(ConfigError::Corrupt)?;
-                if peer_entry.stereo_pair != Some(entry.source_id) {
-                    return Err(ConfigError::Corrupt);
-                }
-                match peer_entry.stereo_side {
-                    Some(peer_side) if peer_side != side => {}
-                    _ => return Err(ConfigError::Corrupt),
-                }
-                if peer_entry.role != entry.role {
-                    return Err(ConfigError::Corrupt);
-                }
-            }
-            // Unpaired.
-            (None, None) => {}
-            // A dangling peer or a side without a pair is unresolved/invalid.
-            _ => return Err(ConfigError::Corrupt),
-        }
-    }
     Ok(())
+}
+
+/// Validate one channel-map entry: a complete explicit link must be reciprocal with opposite sides
+/// and matching roles; an unpaired entry must carry neither a peer nor a side.
+fn validate_map_entry(
+    map: &[ChannelMapEntry],
+    entry: &ChannelMapEntry,
+) -> Result<(), ConfigError> {
+    match (entry.stereo_pair, entry.stereo_side) {
+        // An explicit complete link.
+        (Some(peer), Some(side)) => {
+            if peer == entry.source_id {
+                return Err(ConfigError::Corrupt);
+            }
+            let peer_entry = map
+                .iter()
+                .find(|candidate| candidate.source_id == peer)
+                .ok_or(ConfigError::Corrupt)?;
+            if peer_entry.stereo_pair != Some(entry.source_id) {
+                return Err(ConfigError::Corrupt);
+            }
+            match peer_entry.stereo_side {
+                Some(peer_side) if peer_side != side => {}
+                _ => return Err(ConfigError::Corrupt),
+            }
+            if peer_entry.role != entry.role {
+                return Err(ConfigError::Corrupt);
+            }
+            Ok(())
+        }
+        // Unpaired.
+        (None, None) => Ok(()),
+        // A dangling peer or a side without a pair is unresolved/invalid.
+        _ => Err(ConfigError::Corrupt),
+    }
 }
 
 /// Validate source defaults: exactly one per mapped source, finite, within `[-1, 1]`, and equal for

@@ -190,132 +190,176 @@ impl AudioEngine {
         // Resolve and validate targets before touching samples. An absent mapped source is parked
         // at the mute floor AND flagged so it contributes silence, never the old unmuted-unity
         // fallback.
-        let mut present = [false; MAX_SOURCES];
-        for (index, entry) in plan.entries().iter().enumerate() {
-            match resolve_gain(snapshot, entry.source_id) {
-                Some(gain) => {
-                    let db = validate_gain(gain.gain_db)?;
-                    let target_db = if gain.muted { MUTE_FLOOR_DB } else { db };
-                    state.ramps[index].set_target(target_db);
-                    present[index] = true;
-                }
-                None => {
-                    state.ramps[index].set_target(MUTE_FLOOR_DB);
-                }
-            }
-        }
-        // One pan/balance target per group, resolved from the group's representative source.
-        for (group, ramp) in state
-            .pan_ramps
-            .iter_mut()
-            .enumerate()
-            .take(plan.group_count())
-        {
-            let pan = plan
-                .group_anchor(group)
-                .and_then(|id| resolve_gain(snapshot, id))
-                .map(|gain| canonical_engine_pan(gain.pan))
-                .unwrap_or(0.0);
-            ramp.set_target(pan);
-        }
-        let master_db = validate_gain(snapshot.master_db)?;
-        let master_target = if snapshot.master_muted {
-            MUTE_FLOOR_DB
-        } else {
-            master_db
-        };
-        state.master_ramp.set_target(master_target);
+        let present = resolve_targets(state, plan, snapshot)?;
 
         // A new identity snaps to the installed targets instead of ramping from the old epoch.
         if identity_changed {
-            for ramp in state.ramps.iter_mut() {
-                ramp.snap();
-            }
-            for ramp in state.pan_ramps.iter_mut() {
-                ramp.snap();
-            }
-            state.master_ramp.snap();
+            snap_ramps(state);
         }
 
-        let channels = input.channel_count as usize;
-        let entries = plan.entries();
-        let groups = plan.group_count();
-        let mut produced = 0usize;
-
-        for frame in 0..input.frame_count {
-            if state.partial_frames == 0 {
-                state.partial_start = input.start_sample + frame as u64;
-            }
-
-            // Advance each shared group ramp exactly once per frame: a linked pair advances one
-            // shared position, not one per member.
-            let mut pan_values = [0.0f32; MAX_SOURCES];
-            for (group, value) in pan_values.iter_mut().enumerate().take(groups) {
-                *value = state.pan_ramps[group].next();
-            }
-
-            let mut left = 0f32;
-            let mut right = 0f32;
-
-            for (index, entry) in entries.iter().enumerate() {
-                let gain = gain_linear(state.ramps[index].next_db());
-                // Absent mapped source or structurally invalid entry: contribute silence.
-                if !present[index] {
-                    continue;
-                }
-                let physical = entry.physical_index as usize;
-                if physical >= channels {
-                    continue;
-                }
-                let sample = input.samples[frame as usize * channels + physical] * gain;
-                match entry.route {
-                    Route::Silent => {}
-                    Route::ParityLeft => left += sample,
-                    Route::ParityRight => right += sample,
-                    Route::MonoPan { group } => {
-                        let [l, r] = pan_coefficients(pan_values[group as usize]);
-                        left += sample * l;
-                        right += sample * r;
-                    }
-                    Route::PairLeft { group } => {
-                        let [l, _] = pan_coefficients(pan_values[group as usize]);
-                        left += sample * l;
-                    }
-                    Route::PairRight { group } => {
-                        let [_, r] = pan_coefficients(pan_values[group as usize]);
-                        right += sample * r;
-                    }
-                }
-            }
-
-            left *= headroom;
-            right *= headroom;
-
-            let master_gain = gain_linear(state.master_ramp.next_db());
-            let (limited_l, limited_r) =
-                state.limiter.process(left * master_gain, right * master_gain);
-
-            let idx = state.partial_frames as usize * 2;
-            state.partial[idx] = limited_l;
-            state.partial[idx + 1] = limited_r;
-            state.partial_frames += 1;
-
-            if state.partial_frames == CODEC_FRAME_FRAMES {
-                let mut sf = StereoFrame::zeroed(snapshot.context);
-                sf.start_sample = state.partial_start;
-                sf.frame_count = CODEC_FRAME_FRAMES;
-                sf.pcm.copy_from_slice(&state.partial);
-                out[produced] = sf;
-                produced += 1;
-                state.partial_frames = 0;
-                if produced == MAX_OUT_FRAMES_PER_BLOCK {
-                    break;
-                }
-            }
-        }
-
-        Ok(produced)
+        Ok(render_frames(
+            state, plan, input, snapshot, out, headroom, &present,
+        ))
     }
+}
+
+/// Resolve every ramp target (per-source gains, one pan per group, and master) and report which
+/// mapped indices are present. An absent mapped source is parked at the mute floor and flagged so
+/// it contributes silence, never the old unmuted-unity fallback.
+#[inline]
+fn resolve_targets(
+    state: &mut SessionState,
+    plan: &RoutingPlan,
+    snapshot: &MixSnapshot,
+) -> Result<[bool; MAX_SOURCES], AudioFault> {
+    let mut present = [false; MAX_SOURCES];
+    for (index, entry) in plan.entries().iter().enumerate() {
+        match resolve_gain(snapshot, entry.source_id) {
+            Some(gain) => {
+                let db = validate_gain(gain.gain_db)?;
+                let target_db = if gain.muted { MUTE_FLOOR_DB } else { db };
+                state.ramps[index].set_target(target_db);
+                present[index] = true;
+            }
+            None => {
+                state.ramps[index].set_target(MUTE_FLOOR_DB);
+            }
+        }
+    }
+    // One pan/balance target per group, resolved from the group's representative source.
+    for (group, ramp) in state.pan_ramps.iter_mut().enumerate().take(plan.group_count()) {
+        let pan = plan
+            .group_anchor(group)
+            .and_then(|id| resolve_gain(snapshot, id))
+            .map(|gain| canonical_engine_pan(gain.pan))
+            .unwrap_or(0.0);
+        ramp.set_target(pan);
+    }
+    let master_db = validate_gain(snapshot.master_db)?;
+    let master_target = if snapshot.master_muted {
+        MUTE_FLOOR_DB
+    } else {
+        master_db
+    };
+    state.master_ramp.set_target(master_target);
+    Ok(present)
+}
+
+/// Snap every ramp (per-source, per-group pan, and master) to its installed target.
+#[inline]
+fn snap_ramps(state: &mut SessionState) {
+    for ramp in state.ramps.iter_mut() {
+        ramp.snap();
+    }
+    for ramp in state.pan_ramps.iter_mut() {
+        ramp.snap();
+    }
+    state.master_ramp.snap();
+}
+
+/// Render up to [`MAX_OUT_FRAMES_PER_BLOCK`] codec frames, returning how many were produced.
+#[inline]
+fn render_frames(
+    state: &mut SessionState,
+    plan: &RoutingPlan,
+    input: &CaptureBlock,
+    snapshot: &MixSnapshot,
+    out: &mut [StereoFrame; MAX_OUT_FRAMES_PER_BLOCK],
+    headroom: f32,
+    present: &[bool; MAX_SOURCES],
+) -> usize {
+    let entries = plan.entries();
+    let groups = plan.group_count();
+    let mut produced = 0usize;
+
+    for frame in 0..input.frame_count {
+        if state.partial_frames == 0 {
+            state.partial_start = input.start_sample + frame as u64;
+        }
+
+        // Advance each shared group ramp exactly once per frame: a linked pair advances one shared
+        // position, not one per member.
+        let mut pan_values = [0.0f32; MAX_SOURCES];
+        for (group, value) in pan_values.iter_mut().enumerate().take(groups) {
+            *value = state.pan_ramps[group].next();
+        }
+
+        let (left, right) = mix_frame(state, entries, present, &pan_values, input, frame as usize);
+
+        let left = left * headroom;
+        let right = right * headroom;
+
+        let master_gain = gain_linear(state.master_ramp.next_db());
+        let (limited_l, limited_r) = state.limiter.process(left * master_gain, right * master_gain);
+
+        let idx = state.partial_frames as usize * 2;
+        state.partial[idx] = limited_l;
+        state.partial[idx + 1] = limited_r;
+        state.partial_frames += 1;
+
+        if state.partial_frames == CODEC_FRAME_FRAMES {
+            let mut sf = StereoFrame::zeroed(snapshot.context);
+            sf.start_sample = state.partial_start;
+            sf.frame_count = CODEC_FRAME_FRAMES;
+            sf.pcm.copy_from_slice(&state.partial);
+            out[produced] = sf;
+            produced += 1;
+            state.partial_frames = 0;
+            if produced == MAX_OUT_FRAMES_PER_BLOCK {
+                break;
+            }
+        }
+    }
+
+    produced
+}
+
+/// Mix one input frame into the stereo bus, advancing every source ramp exactly once.
+#[inline]
+fn mix_frame(
+    state: &mut SessionState,
+    entries: &[routing::RoutingEntry],
+    present: &[bool; MAX_SOURCES],
+    pan_values: &[f32; MAX_SOURCES],
+    input: &CaptureBlock,
+    frame: usize,
+) -> (f32, f32) {
+    let channels = input.channel_count as usize;
+    let mut left = 0f32;
+    let mut right = 0f32;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let gain = gain_linear(state.ramps[index].next_db());
+        // Absent mapped source or structurally invalid entry: contribute silence.
+        if !present[index] {
+            continue;
+        }
+        let physical = entry.physical_index as usize;
+        if physical >= channels {
+            continue;
+        }
+        let sample = input.samples[frame * channels + physical] * gain;
+        match entry.route {
+            Route::Silent => {}
+            Route::ParityLeft => left += sample,
+            Route::ParityRight => right += sample,
+            Route::MonoPan { group } => {
+                let [l, r] = pan_coefficients(pan_values[group as usize]);
+                left += sample * l;
+                right += sample * r;
+            }
+            Route::PairLeft { group } => {
+                let [l, _] = pan_coefficients(pan_values[group as usize]);
+                left += sample * l;
+            }
+            Route::PairRight { group } => {
+                let [_, r] = pan_coefficients(pan_values[group as usize]);
+                right += sample * r;
+            }
+        }
+    }
+
+    (left, right)
 }
 
 /// Clamp a snapshot pan to the canonical engine range; a non-finite value degrades to center.
