@@ -30,21 +30,21 @@ export interface ChannelStripPan {
 }
 
 export interface ChannelStripProps {
-  state: ChannelStripState;
+  readonly state: ChannelStripState;
   onGainChange(db: number): void;
   onMuteChange(muted: boolean): void;
   /** Optional mono pan control rendered after gain. Pair balance is not set here. */
-  pan?: ChannelStripPan;
+  readonly pan?: ChannelStripPan;
   /** Optional stereo-link description, e.g. "Linked stereo pair". */
-  linkLabel?: string;
+  readonly linkLabel?: string;
   /** Optional digital peak in dBFS; `undefined` shows Unavailable. */
-  meterValueDbfs?: number;
+  readonly meterValueDbfs?: number;
   /** Full accessible name when the visible label is ellipsized. */
-  fullLabel?: string;
+  readonly fullLabel?: string;
   /** Adds SIMULATED badges (Pages demo only). */
-  simulated?: boolean;
-  disabled?: boolean;
-  canUnmute?: boolean;
+  readonly simulated?: boolean;
+  readonly disabled?: boolean;
+  readonly canUnmute?: boolean;
 }
 
 export function ChannelStrip({

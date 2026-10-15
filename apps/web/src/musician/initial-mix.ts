@@ -128,7 +128,7 @@ export function initialMix(catalog: CatalogSnapshot): MixSnapshot {
     const peerId = source.stereoPair;
     if (!peerId) continue;
     const peer = byId.get(peerId);
-    if (!peer || peer.stereoPair !== source.sourceId) {
+    if (peer?.stereoPair !== source.sourceId) {
       nonReciprocal.add(source.sourceId);
       if (peer) nonReciprocal.add(peer.sourceId);
     }

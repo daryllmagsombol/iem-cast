@@ -269,8 +269,7 @@ function ConnectedMusician({ controller }: { controller: ReceiverController }) {
         const inDisplay = (memberId: string) => members.some(s => s.sourceId === memberId);
         if (
           peerId &&
-          peer &&
-          peer.stereoPair === id &&
+          peer?.stereoPair === id &&
           source?.role === peer.role &&
           source.available &&
           source.authorized &&

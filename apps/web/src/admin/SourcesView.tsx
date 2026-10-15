@@ -11,13 +11,13 @@ import { PanControl } from '../ui/PanControl';
 import { Button } from '../ui/Button';
 
 export interface SourcesViewProps {
-  bridge?: HostBridge;
-  device?: DeviceInfo | null;
+  readonly bridge?: HostBridge;
+  readonly device?: DeviceInfo | null;
   /**
    * The real host-running state, supplied by the parent. Defaults to `false` (stopped). This
    * component never infers whether the host is running: it only trusts the prop.
    */
-  hostRunning?: boolean;
+  readonly hostRunning?: boolean;
   /**
    * Reports whether this panel currently holds edits that are not yet committed: a draft that
    * differs from the committed defaults, or an uncertain/conflict/failed/consent-pending state.
@@ -44,6 +44,17 @@ interface DefaultEntry {
   disabled: boolean;
 }
 
+/** True when a source and its peer form a reciprocal left/right stereo pair. */
+function isReciprocalPair(source: SourceInfo, peer: SourceInfo | undefined): peer is SourceInfo {
+  return (
+    peer !== undefined &&
+    peer.stereoPair === source.sourceId &&
+    source.stereoSide !== null &&
+    peer.stereoSide !== null &&
+    source.stereoSide !== peer.stereoSide
+  );
+}
+
 /** Build the grouped entries: valid reciprocal pairs become one entry, the rest stay mono. */
 function buildEntries(sources: SourceInfo[]): DefaultEntry[] {
   const byId = new Map(sources.map(s => [s.sourceId, s]));
@@ -52,13 +63,7 @@ function buildEntries(sources: SourceInfo[]): DefaultEntry[] {
   for (const source of sources) {
     if (used.has(source.sourceId)) continue;
     const peer = source.stereoPair ? byId.get(source.stereoPair) : undefined;
-    const reciprocal = peer !== undefined && peer.stereoPair === source.sourceId;
-    const oppositeSides =
-      source.stereoSide !== null &&
-      peer !== undefined &&
-      peer.stereoSide !== null &&
-      source.stereoSide !== peer.stereoSide;
-    if (reciprocal && oppositeSides) {
+    if (isReciprocalPair(source, peer)) {
       used.add(source.sourceId);
       used.add(peer.sourceId);
       const left = source.stereoSide === 'left' ? source : peer;
@@ -72,7 +77,17 @@ function buildEntries(sources: SourceInfo[]): DefaultEntry[] {
         committed: left.defaultPan,
         disabled: false,
       });
-    } else if (source.stereoPair !== null) {
+    } else if (source.stereoPair === null) {
+      used.add(source.sourceId);
+      entries.push({
+        key: `mono:${source.sourceId}`,
+        kind: 'mono',
+        sourceIds: [source.sourceId],
+        labels: [source.label],
+        committed: source.defaultPan,
+        disabled: source.role === 'masterLr',
+      });
+    } else {
       // Pair metadata is present but unresolved (dangling peer, one-sided link, or no explicit
       // side). The host treats it as an unresolved link, so an editable mono "Default pan" here
       // would imply a save the host may reject: keep it truthful and non-editable instead.
@@ -85,16 +100,6 @@ function buildEntries(sources: SourceInfo[]): DefaultEntry[] {
         committed: source.defaultPan,
         disabled: true,
       });
-    } else {
-      used.add(source.sourceId);
-      entries.push({
-        key: `mono:${source.sourceId}`,
-        kind: 'mono',
-        sourceIds: [source.sourceId],
-        labels: [source.label],
-        committed: source.defaultPan,
-        disabled: source.role === 'masterLr',
-      });
     }
   }
   return entries;
@@ -105,6 +110,13 @@ function entryBySource(entries: DefaultEntry[]): Map<string, DefaultEntry> {
   const map = new Map<string, DefaultEntry>();
   for (const entry of entries) for (const id of entry.sourceIds) map.set(id, entry);
   return map;
+}
+
+/** Human label for an entry's kind, shown beside its sources. */
+function entryKindLabel(kind: DefaultEntry['kind']): string {
+  if (kind === 'pair') return 'Stereo pair';
+  if (kind === 'unresolved') return 'Unresolved link';
+  return 'Mono source';
 }
 
 /** The committed default for an entry from a settings view, normalized `[-1, 1]`. */
@@ -165,6 +177,53 @@ const RELOAD_CODES = new Set([
   'SOURCE_SETTINGS_DURABILITY_UNCERTAIN',
   'SOURCE_SETTINGS_REVISION_CONFLICT',
 ]);
+
+/** Map a successful link save to the status/message/reload state it implies. */
+function linkOutcome(durabilityUncertain: boolean): {
+  status: SaveStatus;
+  message: string | null;
+  reloadNeeded: boolean;
+} {
+  if (durabilityUncertain) {
+    return {
+      status: 'uncertain',
+      message: 'Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.',
+      reloadNeeded: true,
+    };
+  }
+  return { status: 'saved', message: null, reloadNeeded: false };
+}
+
+/** Map a link-save rejection to the status, message, and reload need it implies. */
+function linkFailure(error: unknown): { status: SaveStatus; message: string; reloadNeeded: boolean } {
+  const code = errorCode(error);
+  if (code === 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN') {
+    return {
+      status: 'uncertain',
+      message: 'Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.',
+      reloadNeeded: true,
+    };
+  }
+  if (code === 'SOURCE_SETTINGS_HOST_RUNNING') {
+    return {
+      status: 'idle',
+      message: 'Stop the host before replacing source settings.',
+      reloadNeeded: false,
+    };
+  }
+  if (RELOAD_CODES.has(code ?? '')) {
+    return {
+      status: 'conflict',
+      message: errorMessage(error, 'The saved links changed underneath this request. Reload before retrying.'),
+      reloadNeeded: true,
+    };
+  }
+  return {
+    status: 'failed',
+    message: errorMessage(error, 'Could not save the stereo links.'),
+    reloadNeeded: false,
+  };
+}
 
 function currentPairs(entries: DefaultEntry[]): SourceLinkPair[] {
   return entries
@@ -379,7 +438,8 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
           const entry = entriesRef.current.find(e => e.key === key);
           const resolved =
             entry !== undefined && draftsRef.current[key] === committedFor(entry, result);
-          next[key] = resolved ? (durable ? 'uncertain' : 'saved') : 'idle';
+          const committed: SaveStatus = durable ? 'uncertain' : 'saved';
+          next[key] = resolved ? committed : 'idle';
         }
         return next;
       });
@@ -550,35 +610,19 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
       setRightChoice('');
       linkIntentRef.current = null;
       replaceConfirmedRef.current = false;
-      if (result.durabilityUncertain) {
-        setLinkStatus('uncertain');
-        setLinkReloadNeeded(true);
-        setLinkMessage('Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.');
-      } else {
-        setLinkStatus('saved');
-        setLinkMessage(null);
-      }
+      const outcome = linkOutcome(result.durabilityUncertain);
+      setLinkStatus(outcome.status);
+      setLinkReloadNeeded(outcome.reloadNeeded);
+      setLinkMessage(outcome.message);
     } catch (error) {
       if (generation !== generationRef.current) return;
       // Keep the exact intended mutation so Retry replays it rather than the committed set.
       linkIntentRef.current = pairs;
       replaceConfirmedRef.current = false;
-      const code = errorCode(error);
-      if (code === 'SOURCE_SETTINGS_DURABILITY_UNCERTAIN') {
-        setLinkStatus('uncertain');
-        setLinkReloadNeeded(true);
-        setLinkMessage('Links were installed, but restart durability was not confirmed. Reload saved defaults before retrying.');
-      } else if (code === 'SOURCE_SETTINGS_HOST_RUNNING') {
-        setLinkStatus('idle');
-        setLinkMessage('Stop the host before replacing source settings.');
-      } else if (RELOAD_CODES.has(code ?? '')) {
-        setLinkStatus('conflict');
-        setLinkReloadNeeded(true);
-        setLinkMessage(errorMessage(error, 'The saved links changed underneath this request. Reload before retrying.'));
-      } else {
-        setLinkStatus('failed');
-        setLinkMessage(errorMessage(error, 'Could not save the stereo links.'));
-      }
+      const failure = linkFailure(error);
+      setLinkStatus(failure.status);
+      setLinkReloadNeeded(failure.reloadNeeded);
+      setLinkMessage(failure.message);
     }
   }
 
@@ -699,7 +743,7 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
           </p>
 
           {loadingSettings && (
-            <p role="status" className="text-text-secondary">Loading saved defaults…</p>
+            <output className="text-text-secondary">Loading saved defaults…</output>
           )}
 
           {!loadingSettings && loadError && (
@@ -744,11 +788,7 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
                       <div className="iem-row">
                         <span className="text-label">{entry.labels.join(' + ')}</span>
                         <span className="text-caption text-text-secondary">
-                          {entry.kind === 'pair'
-                            ? 'Stereo pair'
-                            : entry.kind === 'unresolved'
-                              ? 'Unresolved link'
-                              : 'Mono source'}
+                          {entryKindLabel(entry.kind)}
                         </span>
                       </div>
                       {entry.disabled ? (
@@ -790,7 +830,7 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
                 )}
                 <div className="iem-split">
                   <label className="iem-field">
-                    Left source
+                    <span>Left source</span>
                     <select
                       value={leftChoice}
                       disabled={!linkEnabled}
@@ -803,7 +843,7 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
                     </select>
                   </label>
                   <label className="iem-field">
-                    Right source
+                    <span>Right source</span>
                     <select
                       value={rightChoice}
                       disabled={!linkEnabled}
@@ -821,7 +861,7 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
                   <Button disabled={!linkEnabled} onClick={handleUnlink}>Unlink</Button>
                   <Button disabled={!linkEnabled} onClick={handleReverse}>Reverse</Button>
                 </div>
-                {linkMessage && <p role="status" className="text-caption text-text-secondary">{linkMessage}</p>}
+                {linkMessage && <output className="text-caption text-text-secondary">{linkMessage}</output>}
                 <SaveState
                   state={linkStatus}
                   message={undefined}
@@ -837,40 +877,40 @@ export function SourcesView({ bridge, device, hostRunning = false, onUnsavedChan
   );
 }
 
-function ProfileStatus({ settings }: { settings: SourceSettings }) {
+function ProfileStatus({ settings }: { readonly settings: SourceSettings }) {
   if (settings.durabilityUncertain) {
     return (
-      <p role="status" className="text-caption text-warning">
+      <output className="text-caption text-warning">
         Defaults were installed, but restart durability was not confirmed. Reload saved defaults
         before retrying.
-      </p>
+      </output>
     );
   }
   switch (settings.bindingStatus) {
     case 'saved':
       return (
-        <p role="status" className="text-caption text-success">
+        <output className="text-caption text-success">
           Saved profile is active for this device.
-        </p>
+        </output>
       );
     case 'new':
       return (
-        <p role="status" className="text-caption text-text-secondary">
+        <output className="text-caption text-text-secondary">
           Preview only — these defaults are not saved yet.
-        </p>
+        </output>
       );
     case 'replacement':
       return (
-        <p role="status" className="text-caption text-warning">
+        <output className="text-caption text-warning">
           This profile was saved for a different device or layout. Saving requires explicit
           confirmation.
-        </p>
+        </output>
       );
     case 'legacy':
       return (
-        <p role="status" className="text-caption text-warning">
+        <output className="text-caption text-warning">
           This profile was migrated from an earlier version and its channel layout is unresolved.
-        </p>
+        </output>
       );
   }
 }
@@ -881,21 +921,21 @@ function SaveState({
   onRetry,
   onReload,
 }: {
-  state: SaveStatus;
-  message?: string;
+  readonly state: SaveStatus;
+  readonly message?: string;
   onRetry(): void;
-  onReload?: () => void;
+  readonly onReload?: () => void;
 }) {
   if (state === 'saving') {
-    return <span role="status" className="text-caption text-text-secondary">Saving…</span>;
+    return <output className="text-caption text-text-secondary">Saving…</output>;
   }
   if (state === 'saved') {
-    return <span role="status" className="text-caption text-success">Saved</span>;
+    return <output className="text-caption text-success">Saved</output>;
   }
   if (state === 'uncertain') {
     return (
       <span className="flex flex-wrap items-center gap-2 text-caption text-warning">
-        <span role="status">{message ?? 'Installed, but restart durability was not confirmed.'}</span>
+        <output>{message ?? 'Installed, but restart durability was not confirmed.'}</output>
         <Button size="compact" onClick={onReload ?? onRetry}>Reload</Button>
       </span>
     );
@@ -903,9 +943,9 @@ function SaveState({
   if (state === 'conflict') {
     return (
       <span className="flex flex-wrap items-center gap-2 text-caption text-warning">
-        <span role="status">
+        <output>
           {message ?? 'The saved settings changed underneath this request. Reload before retrying.'}
-        </span>
+        </output>
         <Button size="compact" onClick={onReload ?? onRetry}>Reload</Button>
       </span>
     );
@@ -913,7 +953,7 @@ function SaveState({
   if (state === 'failed') {
     return (
       <span className="flex flex-wrap items-center gap-2 text-caption text-danger">
-        <span role="status">failed</span>
+        <output>failed</output>
         {message ? <span className="text-text-secondary">{message}</span> : null}
         <Button size="compact" onClick={onRetry}>Retry</Button>
       </span>

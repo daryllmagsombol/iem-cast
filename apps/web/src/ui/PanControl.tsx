@@ -1,14 +1,14 @@
 import { useId, type KeyboardEvent } from 'react';
 
 export interface PanControlProps {
-  label: string;
+  readonly label: string;
   /** Controlled normalized position: -1 = full left, 0 = center, 1 = full right. */
-  value: number;
+  readonly value: number;
   onChange(value: number): void;
   onReset(): void;
-  disabled?: boolean;
+  readonly disabled?: boolean;
   /** Complete accessible name including source/pair and purpose, e.g. "Keys balance". */
-  fullLabel?: string;
+  readonly fullLabel?: string;
 }
 
 function boundedPercent(value: number): number {

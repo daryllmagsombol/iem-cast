@@ -130,6 +130,29 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
     snapshot = { ...snapshot, master_local_muted: true, master_unmute_pending: false };
   }
 
+  /** Record an accepted mix (and drop a superseded local error) then notify listeners. */
+  function applyAcceptedMix(accepted: MixSnapshot): void {
+    snapshot = {
+      ...snapshot,
+      accepted_mix: accepted,
+      requested_mix: queuedMix ? snapshot.requested_mix : accepted,
+      error: snapshot.error === mixError ? null : snapshot.error,
+    };
+    mixError = null;
+    emit();
+  }
+
+  /** Record a mix rejection and roll the requested mix back to the last accepted one. */
+  function applyRejectedMix(error: unknown): void {
+    mixError = error instanceof Error ? error.message : 'The host could not accept this mix.';
+    snapshot = {
+      ...snapshot,
+      requested_mix: queuedMix ? snapshot.requested_mix : snapshot.accepted_mix,
+      error: mixError,
+    };
+    emit();
+  }
+
   // One wire request at a time. Queued patches are absolute desired settings, so the latest
   // replaces older queued settings, but every caller waits for that batch's acceptance.
   function sendQueuedMix(): void {
@@ -151,27 +174,14 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
           return;
         }
         const accepted = normalizeMixSnapshot(ack.canonicalSettings as never);
-        snapshot = {
-          ...snapshot,
-          accepted_mix: accepted,
-          requested_mix: queuedMix ? snapshot.requested_mix : accepted,
-          error: snapshot.error === mixError ? null : snapshot.error,
-        };
-        mixError = null;
-        emit();
+        applyAcceptedMix(accepted);
         // Resolve waiters with the SAME normalized canonical value recorded as `accepted_mix`, so a
         // legacy/partial ack that omits `pan` cannot hand the caller a raw `pan: undefined` (which
         // would never match the normalized applied echo).
         for (const waiter of batch.waiters) waiter.resolve({ ...ack, canonicalSettings: accepted });
       } catch (error) {
         if (batch.canceled || batch.signal.aborted) return;
-        mixError = error instanceof Error ? error.message : 'The host could not accept this mix.';
-        snapshot = {
-          ...snapshot,
-          requested_mix: queuedMix ? snapshot.requested_mix : snapshot.accepted_mix,
-          error: mixError,
-        };
-        emit();
+        applyRejectedMix(error);
         for (const waiter of batch.waiters) waiter.reject(error);
       } finally {
         mixFlight = null;
@@ -197,99 +207,116 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
     while (mixFlight) await mixFlight;
   }
 
+  /** Normalize-free catalog push: boundary normalization for legacy payloads. */
+  function applyCatalogSnapshot(payload: ReceiverSnapshot['catalog']): void {
+    // Normalize at the incoming boundary so `defaultPan`/`stereoSide`/`stereoPair` are always
+    // present (legacy payloads omit them) before the UI or the seed builder reads them.
+    snapshot = { ...snapshot, catalog: normalizeCatalog(payload) };
+    emit();
+  }
+
+  /** Apply a `session.snapshot`, including the lifecycle/epoch updates it carries. */
+  function applySessionSnapshot(
+    key: string | null,
+    payload: {
+      phase: ListenerPhase;
+      context?: { audioEpoch?: string; safetyGeneration?: string };
+      requestedMix: MixSnapshot | null;
+      acceptedMix: MixSnapshot | null;
+      appliedMix: MixSnapshot | null;
+    },
+  ): void {
+    if (key && sessionKey && key !== sessionKey) {
+      invalidateLifecycle();
+      currentGeneration = null;
+      hostAudioEpoch = null;
+    }
+    if (key) sessionKey = key;
+    // The host's real audio epoch arrives here; arming must send exactly this value.
+    if (typeof payload.context?.audioEpoch === 'string') {
+      hostAudioEpoch = payload.context.audioEpoch;
+    }
+    if (typeof payload.context?.safetyGeneration === 'string') {
+      currentGeneration = payload.context.safetyGeneration;
+    }
+    // Normalize legacy/partial incoming mixes once, so `pan` is always a finite canonical number
+    // everywhere downstream (including the accepted-resume comparison).
+    const incoming = (mix: MixSnapshot | null | undefined): MixSnapshot | null =>
+      mix == null ? null : normalizeMixSnapshot(mix as never);
+    snapshot = {
+      ...snapshot,
+      // Host authority is not local playback permission. Only a live confirmed attempt can put
+      // this lifecycle into armed, including when a snapshot arrives after a timeout.
+      phase: payload.phase === 'armed' && (currentArmNonce === null || pendingArm !== null)
+        ? snapshot.phase : payload.phase,
+      requested_mix: payload.requestedMix === undefined ? snapshot.requested_mix : incoming(payload.requestedMix),
+      accepted_mix: payload.acceptedMix === undefined ? snapshot.accepted_mix : incoming(payload.acceptedMix),
+      applied_mix: payload.appliedMix === undefined ? snapshot.applied_mix : incoming(payload.appliedMix),
+    };
+    emit();
+  }
+
+  /** Record a `mix.ack`. Accepted only; the gate is untouched. */
+  function applyMixAck(event: ServerEvent): void {
+    if (!activeMix || activeMix.canceled || activeMix.signal.aborted ||
+      event.requestId !== activeMix.requestId) return;
+    const payload = event.payload as MixAck;
+    if (snapshot.accepted_mix && BigInt(payload.acceptedRevision) < BigInt(snapshot.accepted_mix.mixRevision)) return;
+    snapshot = {
+      ...snapshot,
+      // Canonicalize the accepted snapshot's pan on the incoming boundary.
+      accepted_mix: normalizeMixSnapshot(payload.canonicalSettings as never),
+    };
+    emit();
+  }
+
+  /** Record a `mix.applied`. DSP-confirmed: display only, still never opens the gate. */
+  function applyMixApplied(payload: { settings: MixSnapshot }): void {
+    snapshot = { ...snapshot, applied_mix: normalizeMixSnapshot(payload.settings as never) };
+    emit();
+  }
+
+  /** Apply a `listen.armed` confirmation, updating authority and completing the pending attempt. */
+  function applyListenArmed(payload: {
+    armNonce: string;
+    safetyGeneration: CounterString;
+    audioEpoch?: string;
+  }): void {
+    // A scoped late confirmation may update host authority, but never grants permission.
+    if (lastSentArm && !lastSentArm.signal.aborted && lastSentArm.session === sessionKey &&
+      payload.armNonce === lastSentArm.nonce) {
+      if (currentGeneration === null || BigInt(payload.safetyGeneration) >= BigInt(currentGeneration)) {
+        currentGeneration = payload.safetyGeneration;
+        if (typeof payload.audioEpoch === 'string') hostAudioEpoch = payload.audioEpoch;
+      }
+    }
+    if (!pendingArm?.sent || payload.armNonce !== pendingArm.nonce ||
+      payload.armNonce !== currentArmNonce) return;
+    const attempt = pendingArm;
+    phase('armed');
+    finishArm(attempt);
+  }
+
   function handleEvent(event: ServerEvent): void {
     const key = typeof event.hostEpoch === 'string' && typeof event.sessionEpoch === 'string'
       ? `${event.hostEpoch}:${event.sessionEpoch}` : null;
     if (event.type !== 'session.snapshot' && key && sessionKey && key !== sessionKey) return;
     switch (eventType(event)) {
-      case 'catalog.snapshot': {
-        const payload = event.payload as ReceiverSnapshot['catalog'];
-        // Normalize at the incoming boundary so `defaultPan`/`stereoSide`/`stereoPair` are always
-        // present (legacy payloads omit them) before the UI or the seed builder reads them.
-        snapshot = { ...snapshot, catalog: normalizeCatalog(payload) };
-        emit();
+      case 'catalog.snapshot':
+        applyCatalogSnapshot(event.payload as ReceiverSnapshot['catalog']);
         break;
-      }
-      case 'session.snapshot': {
-        if (key && sessionKey && key !== sessionKey) {
-          invalidateLifecycle();
-          currentGeneration = null;
-          hostAudioEpoch = null;
-        }
-        if (key) sessionKey = key;
-        const payload = event.payload as {
-          phase: ListenerPhase;
-          context?: { audioEpoch?: string; safetyGeneration?: string };
-          requestedMix: MixSnapshot | null;
-          acceptedMix: MixSnapshot | null;
-          appliedMix: MixSnapshot | null;
-        };
-        // The host's real audio epoch arrives here; arming must send exactly this value.
-        if (typeof payload.context?.audioEpoch === 'string') {
-          hostAudioEpoch = payload.context.audioEpoch;
-        }
-        if (typeof payload.context?.safetyGeneration === 'string') {
-          currentGeneration = payload.context.safetyGeneration;
-        }
-        // Normalize legacy/partial incoming mixes once, so `pan` is always a finite canonical
-        // number everywhere downstream (including the accepted-resume comparison).
-        const incoming = (mix: MixSnapshot | null | undefined): MixSnapshot | null =>
-          mix == null ? null : normalizeMixSnapshot(mix as never);
-        snapshot = {
-          ...snapshot,
-          // Host authority is not local playback permission. Only a live confirmed attempt can
-          // put this lifecycle into armed, including when a snapshot arrives after a timeout.
-          phase: payload.phase === 'armed' && (currentArmNonce === null || pendingArm !== null)
-            ? snapshot.phase : payload.phase,
-          requested_mix: payload.requestedMix === undefined ? snapshot.requested_mix : incoming(payload.requestedMix),
-          accepted_mix: payload.acceptedMix === undefined ? snapshot.accepted_mix : incoming(payload.acceptedMix),
-          applied_mix: payload.appliedMix === undefined ? snapshot.applied_mix : incoming(payload.appliedMix),
-        };
-        emit();
+      case 'session.snapshot':
+        applySessionSnapshot(key, event.payload as Parameters<typeof applySessionSnapshot>[1]);
         break;
-      }
-      case 'mix.ack': {
-        // Accepted only. The gate is untouched.
-        if (!activeMix || activeMix.canceled || activeMix.signal.aborted ||
-          event.requestId !== activeMix.requestId) break;
-        const payload = event.payload as MixAck;
-        if (snapshot.accepted_mix && BigInt(payload.acceptedRevision) < BigInt(snapshot.accepted_mix.mixRevision)) break;
-        snapshot = {
-          ...snapshot,
-          // Canonicalize the accepted snapshot's pan on the incoming boundary.
-          accepted_mix: normalizeMixSnapshot(payload.canonicalSettings as never),
-        };
-        emit();
+      case 'mix.ack':
+        applyMixAck(event);
         break;
-      }
-      case 'mix.applied': {
-        // DSP-confirmed. Recorded for display; still never opens the gate.
-        const payload = event.payload as { settings: MixSnapshot };
-        snapshot = { ...snapshot, applied_mix: normalizeMixSnapshot(payload.settings as never) };
-        emit();
+      case 'mix.applied':
+        applyMixApplied(event.payload as { settings: MixSnapshot });
         break;
-      }
-      case 'listen.armed': {
-        const payload = event.payload as {
-          armNonce: string;
-          safetyGeneration: CounterString;
-          audioEpoch?: string;
-        };
-        // A scoped late confirmation may update host authority, but never grants permission.
-        if (lastSentArm && !lastSentArm.signal.aborted && lastSentArm.session === sessionKey &&
-          payload.armNonce === lastSentArm.nonce) {
-          if (currentGeneration === null || BigInt(payload.safetyGeneration) >= BigInt(currentGeneration)) {
-            currentGeneration = payload.safetyGeneration;
-            if (typeof payload.audioEpoch === 'string') hostAudioEpoch = payload.audioEpoch;
-          }
-        }
-        if (!pendingArm?.sent || payload.armNonce !== pendingArm.nonce ||
-          payload.armNonce !== currentArmNonce) break;
-        const attempt = pendingArm;
-        phase('armed');
-        finishArm(attempt);
+      case 'listen.armed':
+        applyListenArmed(event.payload as Parameters<typeof applyListenArmed>[0]);
         break;
-      }
       case 'error': {
         const payload = event.payload as { message?: string };
         setError(payload.message ?? 'Host error');

@@ -20,6 +20,55 @@ const steps = [
   'Pairing & local monitor',
 ];
 
+/** Environment line shown in the topbar. */
+function environmentText(hasBridge: boolean): string {
+  return hasBridge ? 'Desktop app · Native IPC available' : 'Browser · Native access unavailable';
+}
+
+/** Summary rows: capture state, join service, and phone audio readiness. */
+function summaryRows(device: DeviceInfo | null, hostRunning: boolean): [string, string][] {
+  return [
+    ['Capture', device ? `${device.name} · setup only` : 'Not confirmed'],
+    ['HTTPS join service', hostRunning ? 'Running' : 'Not running'],
+    ['Phone audio', hostRunning ? 'Ready for a listener' : 'Unavailable'],
+  ];
+}
+
+/** Host summary sentence for the current host-running state. */
+function hostSummaryText(hostRunning: boolean): string {
+  return hostRunning
+    ? 'Host is running. The join service is listening; no phone audio is connected until a listener pairs.'
+    : 'IPC availability is not a running capture, server, or audio connection. No operation is reported running.';
+}
+
+/** Why the host cannot be started, or `undefined` when it can. */
+function startExplanation(input: {
+  hasBridge: boolean;
+  hostRunning: boolean;
+  hasDevice: boolean;
+  sourceEditsUnsaved: boolean;
+  hasSelectedInterface: boolean;
+  pathsEntered: boolean;
+}): string | undefined {
+  if (!input.hasBridge) return 'Native host access is required.';
+  if (input.hostRunning) return 'The host is already running.';
+  if (!input.hasDevice) return 'Select a capture device first.';
+  if (input.sourceEditsUnsaved) return 'Save or reload your source default edits before starting.';
+  if (!input.hasSelectedInterface) return 'Select a network interface first.';
+  if (!input.pathsEntered) return 'Enter both a certificate path and a key path.';
+  return undefined;
+}
+
+/** Why the host cannot be stopped, or `undefined` when it can. */
+function stopExplanation(hostRunning: boolean): string | undefined {
+  return hostRunning ? undefined : 'No host is reported running.';
+}
+
+/** Placeholder text for the interface picker when no interfaces are reported. */
+function interfacePlaceholder(interfaceCount: number): string {
+  return interfaceCount ? 'Choose a reported interface' : 'Unavailable';
+}
+
 export function AdminRoot({ bridge }: AdminRootProps) {
   const [preview, setPreview] = useState(false);
   const [device, setDevice] = useState<DeviceInfo | null>(null);
@@ -139,7 +188,7 @@ export function AdminRoot({ bridge }: AdminRootProps) {
         </div>
         <div className="iem-row">
           <span className="iem-environment">
-            {bridge ? 'Desktop app · Native IPC available' : 'Browser · Native access unavailable'}
+            {environmentText(Boolean(bridge))}
           </span>
           <ThemeChoice />
         </div>
@@ -173,22 +222,14 @@ export function AdminRoot({ bridge }: AdminRootProps) {
           <section className="iem-panel iem-summary" aria-labelledby="host-summary">
             <h2 id="host-summary" className="text-section">Host summary</h2>
             <div className="iem-summary-grid">
-              {[
-                ['Capture', device ? `${device.name} · setup only` : 'Not confirmed'],
-                ['HTTPS join service', hostRunning ? 'Running' : 'Not running'],
-                ['Phone audio', hostRunning ? 'Ready for a listener' : 'Unavailable'],
-              ].map(([label, value]) => (
+              {summaryRows(device, hostRunning).map(([label, value]) => (
                 <div key={label}>
                   <p className="text-caption text-text-secondary">{label}</p>
                   <p className="text-label">{value}</p>
                 </div>
               ))}
             </div>
-            {hostRunning ? (
-              <p className="text-caption text-text-secondary">Host is running. The join service is listening; no phone audio is connected until a listener pairs.</p>
-            ) : (
-              <p className="text-caption text-text-secondary">IPC availability is not a running capture, server, or audio connection. No operation is reported running.</p>
-            )}
+            <p className="text-caption text-text-secondary">{hostSummaryText(hostRunning)}</p>
           </section>
           <section id="setup-1" className="iem-panel">
             <DeviceView bridge={bridge} onSelect={setDevice} />
@@ -212,7 +253,7 @@ export function AdminRoot({ bridge }: AdminRootProps) {
                 onChange={e => setInterfaceIp(e.target.value)}
               >
                 <option value="">
-                  {interfaces.length ? 'Choose a reported interface' : 'Unavailable'}
+                  {interfacePlaceholder(interfaces.length)}
                 </option>
                 {interfaces.map(i => (
                   <option key={`${i.name}-${i.ipAddress}`} value={i.ipAddress}>
@@ -265,21 +306,14 @@ export function AdminRoot({ bridge }: AdminRootProps) {
                 variant="primary"
                 disabled={!canStartHost}
                 pending={hostBusy && !hostRunning}
-                explanation={
-                  !bridge
-                    ? 'Native host access is required.'
-                    : hostRunning
-                      ? 'The host is already running.'
-                      : !device
-                        ? 'Select a capture device first.'
-                        : sourceEditsUnsaved
-                          ? 'Save or reload your source default edits before starting.'
-                          : !selectedInterface
-                            ? 'Select a network interface first.'
-                            : !pathsEntered
-                              ? 'Enter both a certificate path and a key path.'
-                              : undefined
-                }
+                explanation={startExplanation({
+                  hasBridge: Boolean(bridge),
+                  hostRunning,
+                  hasDevice: device !== null,
+                  sourceEditsUnsaved,
+                  hasSelectedInterface: selectedInterface !== null,
+                  pathsEntered,
+                })}
                 onClick={startHost}
               >
                 Start host
@@ -288,7 +322,7 @@ export function AdminRoot({ bridge }: AdminRootProps) {
                 variant="destructive"
                 disabled={!hostRunning || hostBusy}
                 pending={hostBusy && hostRunning}
-                explanation={!hostRunning ? 'No host is reported running.' : undefined}
+                explanation={stopExplanation(hostRunning)}
                 onClick={stopHost}
               >
                 Stop host
