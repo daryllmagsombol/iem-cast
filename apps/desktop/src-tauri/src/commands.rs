@@ -5,7 +5,7 @@
 //! catalog. The operator source catalog is read-only and derived from the selected device's real
 //! channel count, using the same mapping the running host publishes to phones.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use host_core::contract::{
     CaptureRequest as CoreCaptureRequest, InterfaceInfo as CoreInterfaceInfo,
@@ -226,6 +226,27 @@ pub fn host_defaults(window_label: String) -> Result<HostDefaults, IpcError> {
     })
 }
 
+/// The fresh-connection catalog provider for a running host.
+///
+/// Serves the committed-projection cache's current **content** (so a defaults-only save is visible
+/// to a freshly connected phone) while pinning `catalog_revision` to the running actor's routing
+/// revision. The actor validates every `mix.patch` against that pinned revision and never advances
+/// it mid-session (a defaults-only save changes no source id or pair), so serving the cache's own
+/// advancing settings revision would make a fresh phone's `mix.patch` fail with `RevisionConflict`.
+fn initial_catalog_provider(
+    projection: Arc<RwLock<host_core::contract::CatalogSnapshot>>,
+    pinned_revision: CatalogRevision,
+) -> host_core::host::InitialCatalogProvider {
+    Arc::new(move || match projection.read() {
+        Ok(guard) => {
+            let mut snapshot = guard.clone();
+            snapshot.catalog_revision = pinned_revision;
+            snapshot
+        }
+        Err(_) => catalog_from_channel_map(&[], pinned_revision),
+    })
+}
+
 /// Validate the operator-supplied TLS identity and start the local host session **and** its
 /// HTTPS/WSS control server.
 ///
@@ -331,19 +352,15 @@ pub fn start_host(
     // port is omitted from the origin, any other port is included.
     let bind = std::net::SocketAddr::new(interface_ip, port);
     let origin = OriginPolicy::new([control_origin(interface_ip, port)]);
-    // Build the static actor/server catalog from the SAME committed projection (defaults and
-    // settings revision) the fresh-connection provider serves. Otherwise a phone that patches
-    // against the provider's revision would be rejected by the actor's stale `RevisionConflict`
-    // check as soon as a defaults save advances the committed revision.
-    let catalog = catalog_from_config(&profile, CatalogRevision(profile.settings_revision.get()));
+    // The actor's routing catalog — and the revision every `mix.patch` is validated against — is
+    // pinned to the committed revision at start and never advances mid-session. Build the static
+    // server catalog from that same revision so a fresh phone's `mix.patch` matches the actor.
+    let pinned_revision = CatalogRevision(profile.settings_revision.get());
+    let catalog = catalog_from_config(&profile, pinned_revision);
     // The provider captures ONLY the committed-projection cache; it never touches the lifecycle or
-    // settings mutex, so a fresh connection cannot deadlock or block on the settings lock.
-    let provider: host_core::host::InitialCatalogProvider = Arc::new(move || {
-        projection
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|_| catalog_from_channel_map(&[], CatalogRevision(0)))
-    });
+    // settings mutex, so a fresh connection cannot deadlock or block on the settings lock. It serves
+    // the cache's updated content under the actor's pinned revision.
+    let provider = initial_catalog_provider(projection, pinned_revision);
     let config = ServerConfig {
         tls,
         bind,
@@ -1039,5 +1056,37 @@ mod tests {
             save_source_defaults_impl("other", &settings, &host, "dev", "0", &[], false)
                 .expect_err("must reject");
         assert_eq!(error.code, "WINDOW_FORBIDDEN");
+    }
+
+    #[test]
+    fn fresh_connection_provider_pins_the_actor_revision_across_a_defaults_only_save() {
+        // The running actor pins its routing catalog revision at start and `apply_patch` rejects any
+        // other. A defaults-only save advances the committed settings revision and rewrites the
+        // projection cache; the provider must serve the new CONTENT under the actor's pinned
+        // revision, or a fresh phone's `mix.patch` would fail with `RevisionConflict`.
+        let projection = Arc::new(RwLock::new(catalog_from_channel_map(
+            &default_channel_map(2),
+            CatalogRevision(7),
+        )));
+        let provider = initial_catalog_provider(Arc::clone(&projection), CatalogRevision(7));
+
+        // Simulate the mid-session defaults-only save: the cache revision advances and a default
+        // changes, but no source id or pair does.
+        {
+            let mut guard = projection.write().expect("projection cache");
+            guard.catalog_revision = CatalogRevision(8);
+            guard.sources[0].default_pan = 0.5;
+        }
+
+        let served = provider();
+        assert_eq!(
+            served.catalog_revision,
+            CatalogRevision(7),
+            "the served revision stays pinned to the actor's so a fresh patch is accepted"
+        );
+        assert!(
+            served.sources.iter().any(|s| s.default_pan == 0.5),
+            "but the updated defaults content is visible to a fresh connection"
+        );
     }
 }
