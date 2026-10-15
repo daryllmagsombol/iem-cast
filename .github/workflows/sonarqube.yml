@@ -70,6 +70,21 @@ jobs:
       - name: Rust coverage (workspace, locked, lcov)
         run: cargo llvm-cov --workspace --locked --lcov --output-path rust-coverage/lcov.info
 
+      # cargo-llvm-cov writes ABSOLUTE paths in the lcov `SF:` records. The scan
+      # job runs on linux/ubuntu (`/home/runner/...`) while this coverage job runs
+      # on macOS (`/Users/runner/...`), so every absolute path fails to resolve
+      # against `sonar.projectBaseDir` and SonarQube silently imports nothing for
+      # Rust. Rewrite the records to be repo-relative (as Vitest already emits) and
+      # fail loudly if any absolute path survives.
+      - name: Make Rust lcov paths repo-relative
+        run: |
+          perl -i -pe "s|^SF:\Q${GITHUB_WORKSPACE}\E/|SF:|" rust-coverage/lcov.info
+          if grep -q '^SF:/' rust-coverage/lcov.info; then
+            echo "::error::rust-coverage/lcov.info still contains absolute SF: paths; SonarQube would drop them."
+            exit 1
+          fi
+          echo "sample SF records:" && grep -m 3 '^SF:' rust-coverage/lcov.info
+
       # `if-no-files-found: error` fails the job if the report is missing, so
       # the scanner never silently scans without coverage.
       - name: Upload Rust lcov
