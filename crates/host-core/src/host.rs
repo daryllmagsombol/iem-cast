@@ -3,7 +3,9 @@
 //! [`HostSession`] is the missing composition the POC lacked: it starts the capture/DSP
 //! [`HostRuntime`] with an [`EncodedSink`] that routes each listener's encoded frames into a shared
 //! [`MediaHub`], binds the UDP socket the media sessions send on, and runs a small pump thread that
-//! feeds inbound datagrams into the hub, advances its timers, and emits its outbound datagrams.
+//! feeds inbound datagrams into the hub, advances its timers, and emits its outbound datagrams. The
+//! DSP sink wakes the pump through a condition variable whenever it stages a frame, so outbound
+//! media is not quantized by a fixed pump cadence.
 //!
 //! Scope and honesty: this composition owns capture and the media datagram path. It deliberately
 //! does **not** own the HTTPS/WSS control server; the server shares the same `MediaHub` through
@@ -13,7 +15,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -39,14 +41,70 @@ use crate::pipeline::ListenerOutput;
 use crate::runtime::{EncodedSink, HostRuntime};
 use crate::server::tls::TlsIdentity;
 use crate::server::HostServer;
-use crate::transport::{MediaHub, SelectedInterface};
+use crate::transport::{MediaHub, SelectedInterface, Transmit};
 
-/// How long the pump sleeps when no datagram is ready before re-checking timers and the stop flag.
-const PUMP_IDLE: Duration = Duration::from_millis(1);
+/// Upper bound on how long the pump blocks waiting for a wake-up when no session deadline is
+/// sooner.
+///
+/// This bounds inbound (RTCP/ICE) servicing during quiet periods; it does **not** pace the media
+/// path. Outbound frames wake the pump immediately via the hub's `Condvar`, and `str0m`'s own
+/// timeout deadline (captured per session) can shorten this wait further.
+const PUMP_MAX_WAIT: Duration = Duration::from_millis(5);
+/// Maximum inbound datagrams serviced in one lap before the pump advances timers and re-stages
+/// outbound work.
+///
+/// The media UDP port is unauthenticated, so a sustained inbound stream could otherwise park the
+/// pump in the drain loop indefinitely; this budget guarantees timers and the stop flag are checked
+/// at least every `PUMP_INBOUND_BUDGET` datagrams.
+const PUMP_INBOUND_BUDGET: usize = 64;
 /// Maximum inbound datagram accepted by the pump (a bounded RTP packet fits well within).
 const MAX_DATAGRAM_BYTES: usize = 2048;
 /// Bound on the DSP→server audio-event queue; overflow drops rather than stalling audio.
 const AUDIO_EVENT_QUEUE_CAPACITY: usize = 256;
+
+/// How long the pump should wait before its next lap.
+///
+/// Clamps `str0m`'s requested deadline to the `cap`: a deadline already in the past yields
+/// `Duration::ZERO` (work is immediately due), and an absent deadline falls back to the full cap so
+/// inbound datagrams are still serviced on a bounded cadence.
+fn pump_wait(deadline: Option<Instant>, now: Instant, cap: Duration) -> Duration {
+    deadline.map(|d| d.saturating_duration_since(now)).unwrap_or(cap).min(cap)
+}
+
+/// The wait the pump should use before its next lap.
+///
+/// When the inbound budget was exhausted there are probably more datagrams queued, so the pump must
+/// not sleep at all this lap (it still yields the CPU via the zero-duration condvar wait). Otherwise
+/// it waits on the deadline-clamped value from [`pump_wait`].
+fn pump_lap_wait(
+    inbound_exhausted: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+    cap: Duration,
+) -> Duration {
+    if inbound_exhausted {
+        Duration::ZERO
+    } else {
+        pump_wait(deadline, now, cap)
+    }
+}
+
+/// Whether a `recv_from` error is transient and safe to ignore for this lap.
+///
+/// A non-blocking, unconnected UDP socket can surface `Interrupted` (a signal) or a
+/// connection-family error (`ECONNREFUSED`/`ECONNRESET`/`ECONNABORTED`) derived from an ICMP
+/// port-unreachable after `send_to` to an unreachable ICE candidate. Neither means the socket is
+/// dead, so the pump stops draining this lap but keeps running rather than exiting.
+fn is_transient_recv_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+    )
+}
 
 /// Composition/lifecycle failure for [`HostSession`].
 #[derive(Debug, thiserror::Error)]
@@ -67,14 +125,30 @@ pub enum HostFault {
 /// This is the bridge from the DSP worker thread to the WebRTC sessions. It holds the same
 /// `Arc<Mutex<MediaHub>>` the server and the UDP pump hold, so a listener's frames reach its own
 /// session while the control plane negotiates that session on the WS socket.
+///
+/// `wake` **must** be the [`Condvar`] the pump waits on with **this same** `Mutex<MediaHub>`: a
+/// `Condvar` only pairs with one mutex, and notifying on a different one would either deadlock or
+/// silently miss the wake. Because the notify happens under the guard, an accepted frame cannot
+/// race the pump's decision to block (see [`pump_loop`]).
 struct MediaHubSink {
     hub: Arc<Mutex<MediaHub>>,
+    wake: Arc<Condvar>,
 }
 
 impl EncodedSink for MediaHubSink {
     fn on_block(&self, outputs: &[ListenerOutput; MAX_SESSIONS]) {
-        let mut hub = self.hub.lock().expect("media hub");
-        hub.write_block(outputs);
+        // Recover a poisoned lock so one panicking thread cannot kill the DSP worker for good; the
+        // hub's state is still usable (worst case, a stale slot) and the alternative is silence.
+        let mut hub = self
+            .hub
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if hub.write_block(outputs) {
+            // Notify while holding the hub guard: the pump checks for queued work and then waits
+            // under the *same* lock hold, so a notify taken without the lock could slip between the
+            // check and the wait and be lost. Notifying under the lock is intentional.
+            self.wake.notify_one();
+        }
     }
 }
 
@@ -243,6 +317,9 @@ pub struct HostSession {
     socket: UdpSocket,
     audio_epoch: AudioEpoch,
     stopped: Arc<AtomicBool>,
+    /// Paired with `hub`'s mutex; the DSP sink notifies it when a frame is staged so the pump does
+    /// not have to poll for outbound work.
+    wake: Arc<Condvar>,
     pump: Option<JoinHandle<()>>,
 }
 
@@ -271,8 +348,12 @@ impl HostSession {
         advertised.port = bound_port;
 
         let hub = Arc::new(Mutex::new(MediaHub::new(advertised)));
+        // One condition variable, paired with the hub mutex, shared by the DSP sink (producer) and
+        // the pump (consumer).
+        let wake = Arc::new(Condvar::new());
         let sink = MediaHubSink {
             hub: Arc::clone(&hub),
+            wake: Arc::clone(&wake),
         };
 
         let audio_epoch = crate::capture::next_audio_epoch(AudioEpoch(uuid::Uuid::nil()));
@@ -289,11 +370,12 @@ impl HostSession {
         let stopped = Arc::new(AtomicBool::new(false));
         let pump_hub = Arc::clone(&hub);
         let pump_stopped = Arc::clone(&stopped);
+        let pump_wake = Arc::clone(&wake);
         let pump_socket = socket.try_clone().map_err(HostFault::Socket)?;
         let pump = thread::Builder::new()
             .name("iem-media-pump".to_string())
             .spawn(move || {
-                pump_loop(pump_socket, pump_hub, pump_stopped);
+                pump_loop(pump_socket, pump_hub, pump_stopped, pump_wake);
             })
             .map_err(HostFault::Socket)?;
 
@@ -303,6 +385,7 @@ impl HostSession {
             socket,
             audio_epoch,
             stopped,
+            wake,
             pump: Some(pump),
         })
     }
@@ -366,7 +449,16 @@ impl HostSession {
 
     /// Stop capture, stop the media pump, and join cleanly. Idempotent.
     pub fn stop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
+        // Wake the pump so it observes the stop flag promptly. The guard is dropped before stopping
+        // the runtime or joining, so a wedged pump can never deadlock `stop` behind the hub lock.
+        {
+            let _guard = self
+                .hub
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.stopped.store(true, Ordering::Release);
+            self.wake.notify_all();
+        }
         self.runtime.stop();
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
@@ -701,48 +793,84 @@ pub fn catalog_from_channel_map(
 /// The media pump: move datagrams both ways and advance session timers.
 ///
 /// `str0m` is Sans-I/O, so the application must: drain outbound datagrams, feed inbound ones, and
-/// advance the clock. The loop is intentionally non-blocking so [`HostSession::stop`] can join it
-/// promptly; it is also bounded by `MAX_SESSIONS` work per datagram.
-fn pump_loop(socket: UdpSocket, hub: Arc<Mutex<MediaHub>>, stopped: Arc<AtomicBool>) {
-    let local = match socket.local_addr() {
-        Ok(addr) => addr,
-        Err(_) => return,
-    };
+/// advance the clock. The UDP socket stays **non-blocking** (see `HostSession::start`), so this loop
+/// never parks in a syscall and [`HostSession::stop`] can always join it.
+///
+/// The loop coalesces work into laps. Each lap services at most [`PUMP_INBOUND_BUDGET`] inbound
+/// datagrams so a flood on the unauthenticated UDP port cannot starve timers or outbound media, and
+/// treats transient socket errors as non-fatal. Between laps it blocks on `wake` (the same
+/// `Condvar` the DSP sink notifies while holding the hub guard) for at most the earliest session
+/// deadline, capped at [`PUMP_MAX_WAIT`] — or not at all when inbound work is still queued. The
+/// queue check and the wait share one continuous hub-lock hold, so an accepted frame cannot be lost
+/// between them.
+fn pump_loop(
+    socket: UdpSocket,
+    hub: Arc<Mutex<MediaHub>>,
+    stopped: Arc<AtomicBool>,
+    wake: Arc<Condvar>,
+) {
+    let Ok(local) = socket.local_addr() else { return };
     let mut buf = [0u8; MAX_DATAGRAM_BYTES];
+    let mut scratch: Vec<Transmit> = Vec::new();
 
-    while !stopped.load(Ordering::Acquire) {
-        // 1. Drain outbound datagrams and send them. The lock is released before any syscall.
-        let transmits = {
-            let mut guard = hub.lock().expect("media hub");
-            guard.take_transmits()
-        };
-        for transmit in transmits {
+    'pump: while !stopped.load(Ordering::Acquire) {
+        // 1. Send whatever the previous lap staged. Syscalls outside the hub lock.
+        for transmit in scratch.drain(..) {
             let _ = socket.send_to(&transmit.contents, transmit.destination);
         }
-
-        // 2. Feed one inbound datagram, if any, to every open slot. Datagrams that do not belong
-        //    to a session are ignored by that session rather than being sent to the wrong peer.
-        match socket.recv_from(&mut buf) {
-            Ok((len, source)) => {
-                let mut guard = hub.lock().expect("media hub");
-                for slot in 0..MAX_SESSIONS {
-                    if guard.session_at(slot).is_some() {
-                        let _ =
-                            guard.handle_datagram(slot, Instant::now(), source, local, &buf[..len]);
+        // 2. Service inbound datagrams for this lap, up to a fixed budget (socket stays
+        //    non-blocking). The budget bounds how long a sustained inbound stream can delay step 3,
+        //    so timers and outbound always advance; the stop flag is checked on every datagram so
+        //    `stop()` can wake and join promptly.
+        let mut budget = PUMP_INBOUND_BUDGET;
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                break 'pump;
+            }
+            if budget == 0 {
+                break;
+            }
+            match socket.recv_from(&mut buf) {
+                Ok((len, source)) => {
+                    budget -= 1;
+                    let now = Instant::now();
+                    let mut guard = hub
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for slot in 0..MAX_SESSIONS {
+                        if guard.session_at(slot).is_some() {
+                            let _ = guard.handle_datagram(slot, now, source, local, &buf[..len]);
+                        }
                     }
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // A signal or an ICMP-derived connection error is not fatal: stop draining this lap
+                // but keep the pump (and all outbound media) alive. A hard exit would silently kill
+                // every listener on a single stray error.
+                Err(ref e) if is_transient_recv_error(e) => break,
+                Err(_) => break 'pump,
             }
-            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
         }
-
-        // 3. Advance every session's timers on a deadline.
-        {
-            let mut guard = hub.lock().expect("media hub");
-            guard.tick(Instant::now());
+        // If the budget ran out there are probably more datagrams queued; do not sleep this lap.
+        let inbound_exhausted = budget == 0;
+        // 3. ONE continuous lock hold: advance timers, stage outbound, then either work
+        //    exists (drop guard, send next lap) or block. Queue check + wait share one lock
+        //    hold, so an on_block notify cannot be lost.
+        let now = Instant::now();
+        let mut guard = hub
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stopped.load(Ordering::Acquire) {
+            break;
         }
-
-        thread::sleep(PUMP_IDLE);
+        guard.tick(now);
+        guard.drain_transmits_into(&mut scratch);
+        if scratch.is_empty() {
+            let wait = pump_lap_wait(inbound_exhausted, guard.next_deadline(), now, PUMP_MAX_WAIT);
+            if wake.wait_timeout(guard, wait).is_err() {
+                break; // poisoned -> exit
+            }
+        }
     }
 }
 
@@ -962,8 +1090,10 @@ mod tests {
         let session = SessionEpoch::from_bytes([0x22; 16]);
         hub.lock().unwrap().open_slot(0, session).unwrap();
 
+        let wake = Arc::new(Condvar::new());
         let sink = MediaHubSink {
             hub: Arc::clone(&hub),
+            wake: Arc::clone(&wake),
         };
         let mut outputs: [ListenerOutput; MAX_SESSIONS] =
             std::array::from_fn(ListenerOutput::empty);
@@ -982,7 +1112,110 @@ mod tests {
 
         // No panic and no transmit while the gate is closed / the peer is not connected.
         sink.on_block(&outputs);
-        assert!(hub.lock().unwrap().take_transmits().is_empty());
+        let mut scratch = Vec::new();
+        hub.lock().unwrap().drain_transmits_into(&mut scratch);
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn pump_wait_clamps_deadlines_to_the_cap() {
+        let now = Instant::now();
+        let cap = Duration::from_millis(5);
+
+        // No deadline -> wait the full cap (bounded inbound servicing).
+        assert_eq!(pump_wait(None, now, cap), cap);
+        // A deadline already past -> zero (work is immediately due).
+        assert_eq!(
+            pump_wait(Some(now - Duration::from_millis(1)), now, cap),
+            Duration::ZERO
+        );
+        // A sooner deadline -> exactly that wait.
+        assert_eq!(
+            pump_wait(Some(now + Duration::from_millis(1)), now, cap),
+            Duration::from_millis(1)
+        );
+        // A far deadline -> clamped to the cap.
+        assert_eq!(
+            pump_wait(Some(now + Duration::from_secs(3600)), now, cap),
+            cap
+        );
+    }
+
+    #[test]
+    fn pump_lap_wait_forces_zero_when_the_inbound_budget_is_exhausted() {
+        let now = Instant::now();
+        let cap = Duration::from_millis(5);
+
+        // Budget exhausted -> never sleep, even with no deadline and a full cap.
+        assert_eq!(
+            pump_lap_wait(true, None, now, cap),
+            Duration::ZERO,
+            "an exhausted inbound budget must service the remaining datagrams immediately"
+        );
+        assert_eq!(
+            pump_lap_wait(true, Some(now - Duration::from_millis(1)), now, cap),
+            Duration::ZERO
+        );
+
+        // Budget not exhausted -> normal deadline-clamped behavior.
+        assert_eq!(pump_lap_wait(false, None, now, cap), cap);
+        assert_eq!(
+            pump_lap_wait(false, Some(now + Duration::from_millis(1)), now, cap),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn transient_socket_errors_do_not_kill_the_pump() {
+        use std::io::{Error, ErrorKind};
+
+        // A signal or an ICMP-derived connection error must be survivable.
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                is_transient_recv_error(&Error::new(kind, "transient")),
+                "{kind:?} must be treated as transient"
+            );
+        }
+
+        // Genuinely unexpected errors are not silently swallowed.
+        assert!(!is_transient_recv_error(&Error::new(
+            ErrorKind::InvalidData,
+            "bad"
+        )));
+    }
+
+    #[test]
+    fn host_session_stop_joins_without_riding_the_cap() {
+        // A started host with no media slot has no session deadline, so the pump would otherwise
+        // block for the full `PUMP_MAX_WAIT` before noticing the stop flag. `stop` must wake it
+        // through the condvar instead of waiting out that cap, and must not deadlock on the hub
+        // lock while joining.
+        let backend = PushingBackend {
+            channels: 1,
+            frames: 128,
+            blocks: 0,
+        };
+        let mut session = HostSession::start(
+            &backend,
+            valid_tls(),
+            loopback(),
+            start_request(),
+            default_channel_map(1),
+        )
+        .expect("host session starts");
+
+        let started = Instant::now();
+        session.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < PUMP_MAX_WAIT,
+            "stop must wake the pump rather than ride the {PUMP_MAX_WAIT:?} cap (took {elapsed:?})"
+        );
     }
 
     #[test]

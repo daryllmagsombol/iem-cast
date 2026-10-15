@@ -12,6 +12,7 @@
 //! session/epoch/generation does not match the armed context.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Instant;
 
 use str0m::change::SdpOffer;
@@ -63,6 +64,12 @@ pub struct MediaSession {
     limits: MdnsLimits,
     pending_transmits: Vec<Transmit>,
     pending_events: Vec<MediaEvent>,
+    /// The deadline `str0m` reported on the last `Output::Timeout`, captured by [`drain_outputs`].
+    ///
+    /// [`drain_outputs`] must remain the **sole** `poll_output` caller: this cached deadline goes
+    /// stale the moment anything else polls (or mutates without draining), which is why the pump
+    /// captures its wake deadline from here rather than polling itself.
+    next_timeout: Option<Instant>,
     connected: bool,
     failed: bool,
 }
@@ -84,6 +91,7 @@ impl MediaSession {
             limits: MdnsLimits::default(),
             pending_transmits: Vec::new(),
             pending_events: Vec::new(),
+            next_timeout: None,
             connected: false,
             failed: false,
         })
@@ -99,11 +107,15 @@ impl MediaSession {
         let _pt_value = negotiate_stereo(&parsed)?;
 
         let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| MediaFailureCode::NegotiationFailed)?;
-        let answer = self
-            .rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(|_| MediaFailureCode::NegotiationFailed)?;
+        let answer = match self.rtc.sdp_api().accept_offer(offer) {
+            Ok(answer) => answer,
+            Err(_) => {
+                // `accept_offer` mutates the RTC; a failure is not drained, so drop the stale
+                // deadline to avoid busy-spinning the pump.
+                self.invalidate_timeout();
+                return Err(MediaFailureCode::NegotiationFailed);
+            }
+        };
 
         // Drain outputs produced by the negotiation.
         self.drain_outputs()?;
@@ -139,18 +151,42 @@ impl MediaSession {
         let mid = self.mid.ok_or(MediaFailureCode::NegotiationFailed)?;
         let pt = self.pt.ok_or(MediaFailureCode::NegotiationFailed)?;
         let len = frame.packet.len as usize;
-        let data = frame.packet.bytes[..len].to_vec();
+        // Allocate exactly one `Arc<[u8]>` for the payload. This copies once into the shared buffer,
+        // replacing the previous `Vec` allocation plus the separate `Vec -> Arc` conversion copy
+        // (which copied again). It is not a borrow of the caller's packet buffer.
+        let data: Arc<[u8]> = Arc::from(&frame.packet.bytes[..len]);
         let frequency = Frequency::new(48_000).ok_or(MediaFailureCode::NegotiationFailed)?;
         let rtp_time = MediaTime::new(frame.start_sample, frequency);
 
         let Some(writer) = self.rtc.writer(mid) else {
             return Err(MediaFailureCode::NegotiationFailed);
         };
-        writer
-            .write(pt, Instant::now(), rtp_time, data)
-            .map_err(|_| MediaFailureCode::PeerDisconnected)?;
+        if writer.write(pt, Instant::now(), rtp_time, data).is_err() {
+            // `write` mutates the RTC; on failure we skip the drain, so clear the stale deadline.
+            self.invalidate_timeout();
+            return Err(MediaFailureCode::PeerDisconnected);
+        }
         self.drain_outputs()?;
         Ok(())
+    }
+
+    /// The deadline `str0m` wants the next [`handle_timeout`](Self::handle_timeout) at, as captured
+    /// by the most recent [`drain_outputs`].
+    ///
+    /// `None` until the first drain reports a timeout. Invalidated only by a later drain, so this is
+    /// meaningful only while [`drain_outputs`] is the sole `poll_output` caller.
+    pub(crate) fn next_timeout(&self) -> Option<Instant> {
+        self.next_timeout
+    }
+
+    /// Discard the cached deadline after a mutation that could not be drained.
+    ///
+    /// A mutation that fails and returns before `drain_outputs` leaves the previously captured
+    /// deadline in place. If that deadline is now in the past, `pump_wait` would return
+    /// `Duration::ZERO` on every lap and busy-spin the pump. Clearing it makes the pump fall back to
+    /// its bounded cap until the next successful drain re-captures a fresh deadline.
+    fn invalidate_timeout(&mut self) {
+        self.next_timeout = None;
     }
 
     /// Arm the session with the confirmed context. Until armed, the safety gate refuses frames.
@@ -173,23 +209,32 @@ impl MediaSession {
     ) -> Result<(), MediaFailureCode> {
         let receive = str0m::net::Receive::new(str0m::net::Protocol::Udp, source, destination, buf)
             .map_err(|_| MediaFailureCode::PeerDisconnected)?;
-        self.rtc
-            .handle_input(Input::Receive(now, receive))
-            .map_err(|_| MediaFailureCode::PeerDisconnected)?;
+        if self.rtc.handle_input(Input::Receive(now, receive)).is_err() {
+            // The failed input may have mutated the RTC without a drain; drop the stale deadline.
+            self.invalidate_timeout();
+            return Err(MediaFailureCode::PeerDisconnected);
+        }
         self.drain_outputs()
     }
 
     /// Feed a deadline so `str0m` can advance its own timers.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), MediaFailureCode> {
-        self.rtc
-            .handle_input(Input::Timeout(now))
-            .map_err(|_| MediaFailureCode::IceFailed)?;
+        if self.rtc.handle_input(Input::Timeout(now)).is_err() {
+            // The timeout that just came due is now stale. If we returned with the old (past)
+            // deadline cached, `pump_wait` would yield `Duration::ZERO` every lap and busy-spin the
+            // pump, so clear it and let the caller fall back to its bounded cap.
+            self.invalidate_timeout();
+            return Err(MediaFailureCode::IceFailed);
+        }
         self.drain_outputs()
     }
 
-    /// Take queued outbound datagrams for the application to send.
-    pub fn take_transmits(&mut self) -> Vec<Transmit> {
-        std::mem::take(&mut self.pending_transmits)
+    /// Drain queued outbound datagrams into `out`, appending to whatever `out` already holds.
+    ///
+    /// This preserves the destination's existing contents and reuses its capacity, so the caller
+    /// can keep one scratch `Vec<Transmit>` alive across laps instead of allocating a fresh one.
+    pub(crate) fn drain_transmits_into(&mut self, out: &mut Vec<Transmit>) {
+        out.append(&mut self.pending_transmits);
     }
 
     /// Take queued media events for the control plane.
@@ -209,20 +254,31 @@ impl MediaSession {
 
     /// Drain `poll_output()` until `Output::Timeout`, collecting transmits and events.
     ///
-    /// This is the single-mutation invariant: every mutation is followed by a full drain.
+    /// This is the single-mutation invariant: every mutation is followed by a full drain. It is also
+    /// the sole `poll_output` caller, so [`next_timeout`](Self::next_timeout) is only meaningful
+    /// between drains.
     fn drain_outputs(&mut self) -> Result<(), MediaFailureCode> {
+        // Invalidate the cached deadline up front: if this drain errors before reaching a Timeout,
+        // the old value must not survive as a stale past deadline. A successful drain re-captures it.
+        self.next_timeout = None;
         loop {
             let output = self
                 .rtc
                 .poll_output()
                 .map_err(|_| MediaFailureCode::PeerDisconnected)?;
             match output {
-                Output::Timeout(_) => return Ok(()),
+                Output::Timeout(t) => {
+                    // Capture the deadline while draining, so the pump can sleep until str0m next
+                    // needs a timeout instead of polling on a fixed cadence.
+                    self.next_timeout = Some(t);
+                    return Ok(());
+                }
                 Output::Transmit(t) => {
                     self.pending_transmits.push(Transmit {
                         source: t.source,
                         destination: t.destination,
-                        contents: t.contents.to_vec(),
+                        // `contents` is `DatagramSend(Vec<u8>)`; this is a move, not a copy.
+                        contents: t.contents.into(),
                     });
                 }
                 Output::Event(event) => self.handle_event(event),
@@ -349,6 +405,7 @@ mod tests {
         browser: &mut Rtc,
         now: Instant,
         browser_events: &mut Vec<Event>,
+        scratch: &mut Vec<Transmit>,
     ) {
         use str0m::net::{Protocol, Receive};
 
@@ -357,8 +414,10 @@ mod tests {
             .handle_input(Input::Timeout(now))
             .expect("browser timer");
 
-        // Host -> browser.
-        for t in host.take_transmits() {
+        // Host -> browser. Transmits drain into a caller-owned scratch vec, which the production
+        // pump reuses across laps.
+        host.drain_transmits_into(scratch);
+        for t in scratch.drain(..) {
             let receive = Receive::new(Protocol::Udp, t.source, t.destination, &t.contents)
                 .expect("host datagram parses");
             browser
@@ -443,9 +502,10 @@ mod tests {
         // Pump until both peers connect and the host has drained the sendonly MediaAdded.
         let mut now = Instant::now();
         let mut browser_events: Vec<Event> = Vec::new();
+        let mut scratch: Vec<Transmit> = Vec::new();
         for _ in 0..5_000 {
             now += Duration::from_millis(2);
-            pump_once(&mut host, &mut browser, now, &mut browser_events);
+            pump_once(&mut host, &mut browser, now, &mut browser_events, &mut scratch);
             if host.is_connected() && browser.is_connected() && host.mid.is_some() {
                 break;
             }
@@ -497,7 +557,7 @@ mod tests {
         // Flush the queued payload into a datagram and deliver it to the receiver.
         for _ in 0..200 {
             now += Duration::from_millis(2);
-            pump_once(&mut host, &mut browser, now, &mut browser_events);
+            pump_once(&mut host, &mut browser, now, &mut browser_events, &mut scratch);
             if browser_events
                 .iter()
                 .any(|e| matches!(e, Event::MediaData(_)))
@@ -521,6 +581,91 @@ mod tests {
         assert!(
             !media.data.is_empty(),
             "the delivered Opus frame must carry payload bytes"
+        );
+        // The delivered payload must be byte-identical to the frame we wrote: the single-allocation
+        // `Arc<[u8]>` on write and the moved `DatagramSend` on transmit must not alter the bytes.
+        let len = encoded.packet.len as usize;
+        assert_eq!(
+            &media.data[..],
+            &encoded.packet.bytes[..len],
+            "the delivered payload must exactly match the encoded Opus frame"
+        );
+    }
+
+    #[test]
+    fn a_drain_captures_str0m_next_timeout() {
+        // The pump sleeps on the deadline str0m reports instead of polling on a fixed cadence, so a
+        // completed drain must record it. Before any drain there is no deadline to honor.
+        let iface = SelectedInterface {
+            name: "en0".to_string(),
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10)),
+            prefix: 24,
+            port: 45123,
+        };
+        let mut session = MediaSession::new(SessionEpoch(uuid::Uuid::new_v4()), iface)
+            .expect("session is created");
+
+        assert!(
+            session.next_timeout().is_none(),
+            "no deadline may be reported before the first drain"
+        );
+
+        session
+            .handle_timeout(Instant::now())
+            .expect("a timer tick is accepted");
+
+        assert!(
+            session.next_timeout().is_some(),
+            "draining outputs must capture str0m's next timeout deadline"
+        );
+    }
+
+    #[test]
+    fn invalidating_a_stale_deadline_clears_it() {
+        // The error paths that follow a mutation without draining all call `invalidate_timeout`.
+        // Left stale, a past deadline makes `pump_wait` return `Duration::ZERO` every lap and
+        // busy-spin the pump; clearing it makes the pump fall back to its bounded cap.
+        let iface = SelectedInterface {
+            name: "en0".to_string(),
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10)),
+            prefix: 24,
+            port: 45123,
+        };
+        let mut session = MediaSession::new(SessionEpoch(uuid::Uuid::new_v4()), iface)
+            .expect("session is created");
+
+        session.next_timeout = Some(Instant::now() - std::time::Duration::from_secs(1));
+        session.invalidate_timeout();
+
+        assert!(
+            session.next_timeout().is_none(),
+            "a stale past deadline must be cleared after a failed mutation"
+        );
+    }
+
+    #[test]
+    fn a_successful_drain_refreshes_a_stale_deadline() {
+        // The other half of the invariant: a normal drain must replace a stale value with a fresh
+        // one, never leaving the old past deadline in place.
+        let iface = SelectedInterface {
+            name: "en0".to_string(),
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10)),
+            prefix: 24,
+            port: 45123,
+        };
+        let mut session = MediaSession::new(SessionEpoch(uuid::Uuid::new_v4()), iface)
+            .expect("session is created");
+
+        session.next_timeout = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let now = Instant::now();
+        session.handle_timeout(now).expect("timer tick");
+
+        let deadline = session
+            .next_timeout()
+            .expect("a successful drain re-captures a deadline");
+        assert!(
+            deadline >= now,
+            "the refreshed deadline must not still point into the past"
         );
     }
 }

@@ -157,13 +157,25 @@ impl MediaHub {
         }
     }
 
-    /// Drain every outbound datagram across all sessions.
-    pub fn take_transmits(&mut self) -> Vec<Transmit> {
-        let mut out = Vec::new();
+    /// The earliest deadline any occupied session wants the next timer tick at, if any.
+    ///
+    /// `None` when no slot is occupied. Sessions with no captured deadline are skipped.
+    pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter_map(|slot| slot.media.next_timeout())
+            .min()
+    }
+
+    /// Drain every outbound datagram across all sessions into `out`, appending to its contents.
+    ///
+    /// Reuses `out`'s capacity (and preserves anything already staged in it), so the caller can keep
+    /// one scratch buffer for the lifetime of the pump.
+    pub(crate) fn drain_transmits_into(&mut self, out: &mut Vec<Transmit>) {
         for slot in self.slots.iter_mut().filter_map(|s| s.as_mut()) {
-            out.extend(slot.media.take_transmits());
+            slot.media.drain_transmits_into(out);
         }
-        out
     }
 
     /// Whether a slot's peer is connected.
@@ -188,8 +200,12 @@ impl MediaHub {
 /// Frames are checked against each session's safety gate inside `write_packet`, so anything
 /// produced before a disarm is dropped rather than transmitted. Frames are also dropped when the
 /// block's session no longer matches the slot, so a reused slot can never inherit late frames.
+///
+/// Returns `true` when at least one frame was accepted by a session's writer (a frame was actually
+/// staged for transmission). A closed gate, a missing slot, or a disconnected peer yields `false`.
 impl MediaHub {
-    pub fn write_block(&mut self, outputs: &[ListenerOutput; MAX_SESSIONS]) {
+    pub fn write_block(&mut self, outputs: &[ListenerOutput; MAX_SESSIONS]) -> bool {
+        let mut wrote = false;
         for output in outputs.iter().filter(|o| o.count > 0) {
             let Some(slot_ref) = self.slots.get_mut(output.slot).and_then(|s| s.as_mut()) else {
                 continue;
@@ -199,9 +215,12 @@ impl MediaHub {
             }
             for frame in output.frames.iter().take(output.count) {
                 // A closed gate or a not-yet-connected peer is expected, not an error.
-                let _: Result<(), MediaFailureCode> = slot_ref.media.write_packet(frame);
+                if slot_ref.media.write_packet(frame).is_ok() {
+                    wrote = true;
+                }
             }
         }
+        wrote
     }
 
     /// Whether a candidate line may be handed to the session without escalation.
@@ -305,8 +324,85 @@ mod tests {
         };
         let mut outputs: [ListenerOutput; MAX_SESSIONS] = std::array::from_fn(ListenerOutput::empty);
         outputs[0] = output;
-        hub.write_block(&outputs);
-        assert!(hub.take_transmits().is_empty());
+        // A closed gate means nothing is accepted, so the pump is not woken.
+        assert!(!hub.write_block(&outputs));
+        let mut scratch = Vec::new();
+        hub.drain_transmits_into(&mut scratch);
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn write_block_reports_false_when_nothing_is_accepted() {
+        let mut hub = hub();
+        let s = session(1);
+        hub.open_slot(0, s).unwrap();
+
+        let frame = crate::contract::EncodedFrame::zeroed();
+        let mut outputs: [ListenerOutput; MAX_SESSIONS] = std::array::from_fn(ListenerOutput::empty);
+
+        // Missing slot (slot 2 is empty) -> false.
+        outputs[2] = ListenerOutput {
+            slot: 2,
+            session: s,
+            count: 1,
+            frames: [frame; crate::audio::MAX_OUT_FRAMES_PER_BLOCK],
+        };
+        assert!(!hub.write_block(&outputs));
+
+        // Session mismatch on an occupied slot -> false.
+        let mut mismatched: [ListenerOutput; MAX_SESSIONS] =
+            std::array::from_fn(ListenerOutput::empty);
+        mismatched[0] = ListenerOutput {
+            slot: 0,
+            session: session(2),
+            count: 1,
+            frames: [frame; crate::audio::MAX_OUT_FRAMES_PER_BLOCK],
+        };
+        assert!(!hub.write_block(&mismatched));
+
+        // Closed gate on the matching slot -> false.
+        outputs[0] = ListenerOutput {
+            slot: 0,
+            session: s,
+            count: 1,
+            frames: [frame; crate::audio::MAX_OUT_FRAMES_PER_BLOCK],
+        };
+        assert!(!hub.write_block(&outputs));
+    }
+
+    #[test]
+    fn drain_transmits_into_preserves_preexisting_scratch_contents() {
+        let mut hub = hub();
+        hub.open_slot(0, session(1)).unwrap();
+
+        let mut scratch: Vec<Transmit> = vec![Transmit {
+            source: "127.0.0.1:1".parse().unwrap(),
+            destination: "127.0.0.1:2".parse().unwrap(),
+            contents: vec![0xAB],
+        }];
+
+        // No queued transmits, but the caller's staged entry must survive the drain.
+        hub.drain_transmits_into(&mut scratch);
+        assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch[0].contents, vec![0xAB]);
+    }
+
+    #[test]
+    fn next_deadline_is_none_without_slots_and_some_after_tick() {
+        let mut hub = hub();
+        // No occupied slot -> no deadline to honor.
+        assert_eq!(hub.next_deadline(), None);
+
+        hub.open_slot(0, session(1)).unwrap();
+        let before = std::time::Instant::now();
+        hub.tick(before);
+
+        // A fresh session schedules a timeout, so the hub surfaces a deadline at or after the tick.
+        let deadline = hub.next_deadline().expect("an occupied slot schedules a timeout");
+        assert!(
+            deadline >= before,
+            "the deadline must not predate the tick that produced it"
+        );
     }
 
     #[test]
