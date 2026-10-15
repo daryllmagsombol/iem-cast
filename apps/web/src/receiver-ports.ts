@@ -38,9 +38,9 @@ export interface MusicianSignaling {
  * `jitterBufferTarget` is a **preference**, not a cap: `'Accepted'` only means the browser
  * accepted the assignment for later consideration — it never means the actual buffer is that
  * value or that latency is reduced. `'Unsupported'` is reserved for a receiver that was actually
- * observed without the property; a port with no status accessor, no receiver, or a feature-detect
- * that could not be evaluated reports `'Unavailable'` rather than inventing an `'Unsupported'`
- * claim.
+ * observed without either property; a port with no status accessor, no receiver, or a
+ * feature-detect that could not be evaluated reports `'Unavailable'` rather than inventing an
+ * `'Unsupported'` claim.
  */
 export type JitterBufferPreferenceState =
   | 'Not requested'
@@ -56,26 +56,47 @@ export interface JitterBufferPreference {
 }
 
 /**
+ * The receiver property a buffer-target request was carried on.
+ *
+ * `jitterBufferTarget` (milliseconds) is preferred; `playoutDelayHint` (seconds) is the fallback
+ * for browsers that lack the former (older Chrome/Safari). Both are preferences, not caps.
+ */
+export type JitterBufferTargetProperty = 'jitterBufferTarget' | 'playoutDelayHint';
+
+/**
  * Raw feature-detect/assignment outcome reported by the concrete media port.
  *
  * `undefined` (from the optional accessor) means the port did not expose the capability at all —
  * an older or fake port — and is surfaced as `'Unavailable'`, never an invented `'Unsupported'`.
- * `supported: false` is only set when a receiver was actually observed, so it maps to a real
- * `'Unsupported'`; no receiver, or an unevaluatable feature-detect, leaves the status `undefined`.
+ * `supported: false` is only set when a receiver was actually observed and lacked **both** the
+ * `jitterBufferTarget` and `playoutDelayHint` properties, so it maps to a real `'Unsupported'`; no
+ * receiver, or an unevaluatable feature-detect, leaves the status `undefined`.
  */
 export interface JitterBufferPreferenceStatus {
-  /** Whether the receiver actually exposed a `jitterBufferTarget` property. */
+  /** Whether the receiver exposed `jitterBufferTarget` or the `playoutDelayHint` fallback. */
   supported: boolean;
   /** The millisecond value last requested, or `null` before any request. */
   requestedMs: number | null;
   /** Whether the assignment did not throw. Never proof of the actual browser buffer. */
   accepted: boolean;
+  /**
+   * The property that carried the request, or `null` when neither was observed. Optional so older
+   * callers that only knew `jitterBufferTarget` remain valid; the browser port always sets it.
+   */
+  property?: JitterBufferTargetProperty | null;
 }
 
 /** Browser WebRTC receive-only audio plus media element control. */
 export interface AudioMediaPort {
   createRecvOnlyAudio(signal?: AbortSignal): Promise<void>;
   setJitterBufferTargetMs(ms: number): Promise<boolean>;
+  /**
+   * Optional bounded re-assert of the last requested buffer target, for callers that want the
+   * preference to take effect once the audio sink is actually playing. Concrete browser ports
+   * re-apply only when a request was made, a supported property is present, and the sink is
+   * playing; older/fake ports may omit it, in which case the call is simply skipped.
+   */
+  reassertJitterBufferTarget?(): boolean;
   play(): Promise<void>;
   stop(): void;
   mute(muted: boolean): void;

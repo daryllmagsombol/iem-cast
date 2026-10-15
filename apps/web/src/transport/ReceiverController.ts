@@ -309,6 +309,10 @@ export function createReceiverController(ports: ReceiverPorts): ReceiverControll
       if (signal.aborted) return;
       const pair = ports.stats.selectedCandidateRtt();
       const inbound = ports.stats.inbound();
+      // The buffer target only applies while the sink is playing, so re-assert the preference.
+      // The port no-ops unless a request was made, a supported property is present, and playback
+      // has started, keeping this to at most one re-assert per refresh with no busy spinning.
+      ports.media.reassertJitterBufferTarget?.();
       const rtt = computeNetworkRttMs(pair);
       // Each optional metric uses the same previous/current interval with its own guards, so a
       // missing target/minimum/concealment/packets field never erases a valid neighbour.
