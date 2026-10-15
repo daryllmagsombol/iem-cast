@@ -11,7 +11,10 @@ use host_core::contract::{
     CaptureRequest as CoreCaptureRequest, InterfaceInfo as CoreInterfaceInfo,
     StartHostRequest as CoreStartHostRequest,
 };
-use host_core::host::{catalog_from_channel_map, default_channel_map, HostServerHandle, HostSession, ServerConfig};
+use host_core::host::{
+    catalog_from_channel_map, catalog_from_config, default_channel_map, HostServerHandle,
+    HostSession, ServerConfig,
+};
 use host_core::ids::CatalogRevision;
 use host_core::server::{OriginPolicy, TlsIdentity};
 use host_core::transport::SelectedInterface;
@@ -328,7 +331,11 @@ pub fn start_host(
     // port is omitted from the origin, any other port is included.
     let bind = std::net::SocketAddr::new(interface_ip, port);
     let origin = OriginPolicy::new([control_origin(interface_ip, port)]);
-    let catalog = catalog_from_channel_map(&channel_map, CatalogRevision(0));
+    // Build the static actor/server catalog from the SAME committed projection (defaults and
+    // settings revision) the fresh-connection provider serves. Otherwise a phone that patches
+    // against the provider's revision would be rejected by the actor's stale `RevisionConflict`
+    // check as soon as a defaults save advances the committed revision.
+    let catalog = catalog_from_config(&profile, CatalogRevision(profile.settings_revision.get()));
     // The provider captures ONLY the committed-projection cache; it never touches the lifecycle or
     // settings mutex, so a fresh connection cannot deadlock or block on the settings lock.
     let provider: host_core::host::InitialCatalogProvider = Arc::new(move || {
